@@ -6,10 +6,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict
 
+# Bitboard helpers -----------------------------------------------------
+def _bit(x: int, y: int) -> int:
+    return 1 << (y * 8 + x)
+
+def _bit_to_coords(bb: int) -> Tuple[int, int]:
+    idx = (bb.bit_length() - 1)
+    return idx % 8, idx // 8
+
 from models.pieces import ChessPiece, ChessPieceType, WHITE, BLACK
 
 FILES = "abcdefgh"
 RANKS = "12345678"
+FILE_TO_IDX = {c: i for i, c in enumerate(FILES)}
+RANK_TO_IDX = {c: i for i, c in enumerate(RANKS)}
 
 
 @dataclass
@@ -28,6 +38,11 @@ class ChessBoard:
     def __init__(self) -> None:
         # 2‑D array: board[y][x]
         self.board: List[List[Optional[ChessPiece]]] = [[None for _ in range(8)] for _ in range(8)]
+        # bitboards[color][piece_type]
+        self.bitboards: Dict[str, Dict[ChessPieceType, int]] = {
+            WHITE: {t: 0 for t in ChessPieceType},
+            BLACK: {t: 0 for t in ChessPieceType},
+        }
         self.en_passant_target: Optional[Tuple[int, int]] = None
         self.castling_rights: Dict[str, Dict[str, bool]] = {
             WHITE: {"K": True, "Q": True},
@@ -50,6 +65,9 @@ class ChessBoard:
         for y in range(8):
             for x in range(8):
                 self.board[y][x] = None
+        for c in (WHITE, BLACK):
+            for t in ChessPieceType:
+                self.bitboards[c][t] = 0
 
         for x, piece_type in enumerate(order):
             self[ChessBoard.index_to_algebraic(x, 0)] = ChessPiece(piece_type, WHITE, (x, 0))
@@ -68,7 +86,7 @@ class ChessBoard:
     def algebraic_to_index(pos: str) -> Tuple[int, int]:
         if len(pos) != 2 or pos[0] not in FILES or pos[1] not in RANKS:
             raise ValueError(f"Invalid square: {pos}")
-        return FILES.index(pos[0]), int(pos[1]) - 1
+        return FILE_TO_IDX[pos[0]], RANK_TO_IDX[pos[1]]
 
     @staticmethod
     def index_to_algebraic(x: int, y: int) -> str:
@@ -83,9 +101,13 @@ class ChessBoard:
 
     def __setitem__(self, pos: str, piece: Optional[ChessPiece]):
         x, y = self.algebraic_to_index(pos)
+        old = self.board[y][x]
+        if old:
+            self.bitboards[old.color][old.type] &= ~_bit(x, y)
         self.board[y][x] = piece
         if piece:
             piece.position = (x, y)
+            self.bitboards[piece.color][piece.type] |= _bit(x, y)
 
     def move_piece_unchecked(self, start: str, end: str) -> None:
         piece = self[start]
@@ -137,7 +159,7 @@ class ChessBoard:
             if self.en_passant_target and (ex, ey) == self.en_passant_target and self.board[ey][ex] is None:
                 ep_capture_pos = (ex, ey - dir_y)
                 captured = self.board[ep_capture_pos[1]][ep_capture_pos[0]]
-                self.board[ep_capture_pos[1]][ep_capture_pos[0]] = None
+                self[ChessBoard.index_to_algebraic(*ep_capture_pos)] = None
             if abs(ey - sy) == 2:
                 self.en_passant_target = (sx, sy + dir_y)
             else:
@@ -213,7 +235,7 @@ class ChessBoard:
         if piece.type == ChessPieceType.PAWN:
             # capture the pawn if move is en-passant
             if self.en_passant_target and (ex, ey) == self.en_passant_target and self.board[ey][ex] is None:
-                self.board[ey - dir_y][ex] = None
+                self[ChessBoard.index_to_algebraic(ex, ey - dir_y)] = None
             # set new en-passant target after double push
             if abs(ey - sy) == 2:
                 self.en_passant_target = (sx, sy + dir_y)
@@ -240,6 +262,9 @@ class ChessBoard:
                 else:
                     # create a new ChessPiece with same attributes
                     new.board[y][x] = ChessPiece(p.type, p.color, p.position)
+        for c in (WHITE, BLACK):
+            for t in ChessPieceType:
+                new.bitboards[c][t] = self.bitboards[c][t]
         new.en_passant_target = (
             (self.en_passant_target[0], self.en_passant_target[1])
             if self.en_passant_target is not None
@@ -356,11 +381,10 @@ class ChessBoard:
 
     # ── Check & legality ────────────────────────────────────────────
     def _king_square(self, color: str) -> Optional[str]:
-        for y in range(8):
-            for x in range(8):
-                p = self.board[y][x]
-                if p and p.color == color and p.type == ChessPieceType.KING:
-                    return self.index_to_algebraic(x, y)
+        bb = self.bitboards[color][ChessPieceType.KING]
+        if bb:
+            x, y = _bit_to_coords(bb)
+            return self.index_to_algebraic(x, y)
         return None
 
     def in_check(self, color: str) -> bool:
@@ -376,8 +400,15 @@ class ChessBoard:
                         return True
         return False
 
-    def is_legal(self, start: str, end: str, color: str) -> bool:
-        if end not in self.pseudo_legal_moves(start):
+    def is_legal(self, start: str, end: str, color: str, *, assume_pseudo: bool = False) -> bool:
+        """Return True if the move is legal.
+
+        The ``assume_pseudo`` flag skips generation of pseudo legal moves and
+        assumes the caller already checked that ``end`` is a pseudo legal move
+        for ``start``.  ``all_legal_moves`` uses this to avoid redundant work
+        when iterating over every pseudo legal move on the board.
+        """
+        if not assume_pseudo and end not in self.pseudo_legal_moves(start):
             return False
 
         piece = self[start]
@@ -404,14 +435,17 @@ class ChessBoard:
 
     def all_legal_moves(self, color: str) -> Dict[str, List[str]]:
         res: Dict[str, List[str]] = {}
-        for y in range(8):
-            for x in range(8):
-                p = self.board[y][x]
-                if p and p.color == color:
-                    start = self.index_to_algebraic(x, y)
-                    ends = [e for e in self.pseudo_legal_moves(start) if self.is_legal(start, e, color)]
-                    if ends:
-                        res[start] = ends
+        for t in ChessPieceType:
+            bb = self.bitboards[color][t]
+            while bb:
+                lsb = bb & -bb
+                x, y = _bit_to_coords(lsb)
+                start = self.index_to_algebraic(x, y)
+                pseudo = self.pseudo_legal_moves(start)
+                ends = [e for e in pseudo if self.is_legal(start, e, color, assume_pseudo=True)]
+                if ends:
+                    res[start] = ends
+                bb &= bb - 1
         return res
 
     # ── ASCII board ─────────────────────────────────────────────────
