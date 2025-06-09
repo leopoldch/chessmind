@@ -46,6 +46,21 @@
     return pBr < pWr ? 'white' : 'black';
   };
 
+  /** Wait until detectColor() returns a value */
+  const waitForColor = async () => {
+    await waitForEl('#board');
+    return new Promise((resolve) => {
+      const color = detectColor();
+      if (color) return resolve(color);
+      const board = document.getElementById('board');
+      const obs = new MutationObserver(() => {
+        const c = detectColor();
+        if (c) { obs.disconnect(); resolve(c); }
+      });
+      obs.observe(board, { attributes: true, attributeFilter: ['style'] });
+    });
+  };
+
   /* ----------  OBSERVATION DES COUPS  ---------- */
 
   /** Retourne la liste plate des ½-coups dans l’ordre : ['d4','d5','c4',…] */
@@ -98,14 +113,28 @@
     ws.addEventListener('close', () => setTimeout(connectWS, 1000));
   };
 
+  /** Observe orientation changes and notify the server */
+  const watchOrientation = () => {
+    const board = document.getElementById('board');
+    if (!board) return;
+    new MutationObserver(() => {
+      const c = detectColor();
+      if (c && c !== myColor) {
+        myColor = c;
+        lastPlySent = 0;
+        send({ type: 'color', payload: myColor });
+      }
+    }).observe(board, { attributes: true, attributeFilter: ['style'] });
+  };
+
   /* ----------  INITIALISATION  ---------- */
 
   (async () => {
-    await waitForEl('#board');           // le plateau doit exister
-    myColor = detectColor();
+    myColor = await waitForColor();      // attend que la couleur soit détectable
     if (!myColor) return console.error('Impossible de déterminer la couleur.');
 
     connectWS();                         // et c’est parti !
+    watchOrientation();
   })();
 
 })();
