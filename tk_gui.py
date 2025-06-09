@@ -52,6 +52,7 @@ class ChessGUI:
 
         self.drag_item = None
         self.drag_start_square = ""
+        self.last_move: tuple[str, str] | None = None
 
         self.draw_board()
         self.draw_pieces()
@@ -93,7 +94,10 @@ class ChessGUI:
         self.canvas.delete("square")
         for y in range(8):
             for x in range(8):
+                square = ChessBoard.index_to_algebraic(x, y)
                 color = "#EEEED2" if (x + y) % 2 == 0 else "#769656"
+                if self.last_move and square in self.last_move:
+                    color = "#a8e6a3"
                 self.canvas.create_rectangle(
                     x * self.square_size,
                     (7 - y) * self.square_size,
@@ -151,9 +155,11 @@ class ChessGUI:
             return
         target_square = self.xy_to_square(event.x, event.y)
         if target_square:
-            self.game.make_move(
+            moved = self.game.make_move(
                 self.drag_start_square, target_square, self.ask_promotion
             )
+            if moved:
+                self.last_move = (self.drag_start_square, target_square)
             self.check_end_or_ai()
         self.canvas.delete(self.drag_item)
         self.drag_item = None
@@ -173,6 +179,7 @@ class ChessGUI:
         elif self.ai_mode and self.game.current_turn == self.ai_color:
             start, end = self.engine.best_move(self.game)
             self.game.make_move(start, end)
+            self.last_move = (start, end)
             if self.game.result:
                 if self.game.result == "draw":
                     messagebox.showinfo("Game Over", "Stalemate: draw")
@@ -180,8 +187,8 @@ class ChessGUI:
                     messagebox.showinfo(
                         "Game Over", f"{self.game.result.capitalize()} wins"
                     )
-            self.draw_board()
-            self.draw_pieces()
+        self.draw_board()
+        self.draw_pieces()
 
 
 if __name__ == "__main__":
