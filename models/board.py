@@ -379,6 +379,24 @@ class ChessBoard:
     def is_legal(self, start: str, end: str, color: str) -> bool:
         if end not in self.pseudo_legal_moves(start):
             return False
+
+        piece = self[start]
+        if piece and piece.type == ChessPieceType.KING:
+            sx, sy = self.algebraic_to_index(start)
+            ex, ey = self.algebraic_to_index(end)
+            if abs(ex - sx) == 2:
+                # Can't castle while in check
+                if self.in_check(color):
+                    return False
+                # Squares the king passes through must not be under attack
+                step = 1 if ex > sx else -1
+                interm = self.index_to_algebraic(sx + step, sy)
+                state = self.make_move_state(start, interm)
+                in_check = self.in_check(color)
+                self.unmake_move(state)
+                if in_check:
+                    return False
+
         state = self.make_move_state(start, end)
         illegal = self.in_check(color)
         self.unmake_move(state)
