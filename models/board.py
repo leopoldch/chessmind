@@ -1,8 +1,6 @@
 # ======================== file: chess_board.py ==========================
-"""ChessBoard: 8×8 board with legal‑move logic.
-
-Note: *no castling / no en‑passant yet* – those can be layered later.
-"""
+"""ChessBoard: 8×8 board with legal‑move logic including castling and
+en-passant."""
 from __future__ import annotations
 
 from typing import List, Optional, Tuple, Dict
@@ -19,6 +17,11 @@ class ChessBoard:
     def __init__(self) -> None:
         # 2‑D array: board[y][x]
         self.board: List[List[Optional[ChessPiece]]] = [[None for _ in range(8)] for _ in range(8)]
+        self.en_passant_target: Optional[Tuple[int, int]] = None
+        self.castling_rights: Dict[str, Dict[str, bool]] = {
+            WHITE: {"K": True, "Q": True},
+            BLACK: {"K": True, "Q": True},
+        }
 
     # ── Algebraic helpers ───────────────────────────────────────────
     @staticmethod
@@ -50,6 +53,57 @@ class ChessBoard:
             raise ValueError(f"No piece on {start}")
         self[end] = piece
         self[start] = None
+
+    def _apply_move(self, start: str, end: str) -> None:
+        piece = self[start]
+        if piece is None:
+            raise ValueError(f"No piece on {start}")
+        sx, sy = self.algebraic_to_index(start)
+        ex, ey = self.algebraic_to_index(end)
+        color = piece.color
+        dir_y = 1 if color == WHITE else -1
+
+        # Handle castling
+        if piece.type == ChessPieceType.KING and abs(ex - sx) == 2:
+            # move rook as well
+            if ex > sx:  # kingside
+                rook_start = self.index_to_algebraic(7, sy)
+                rook_end = self.index_to_algebraic(ex - 1, sy)
+            else:  # queenside
+                rook_start = self.index_to_algebraic(0, sy)
+                rook_end = self.index_to_algebraic(ex + 1, sy)
+            self.move_piece_unchecked(rook_start, rook_end)
+            self.castling_rights[color]["K"] = False
+            self.castling_rights[color]["Q"] = False
+        elif piece.type == ChessPieceType.ROOK:
+            if sx == 0:
+                self.castling_rights[color]["Q"] = False
+            elif sx == 7:
+                self.castling_rights[color]["K"] = False
+        elif piece.type == ChessPieceType.KING:
+            self.castling_rights[color]["K"] = False
+            self.castling_rights[color]["Q"] = False
+
+        # Handle en-passant capture
+        if piece.type == ChessPieceType.PAWN:
+            # capture the pawn if move is en-passant
+            if self.en_passant_target and (ex, ey) == self.en_passant_target and self.board[ey][ex] is None:
+                self.board[ey - dir_y][ex] = None
+            # set new en-passant target after double push
+            if abs(ey - sy) == 2:
+                self.en_passant_target = (sx, sy + dir_y)
+            else:
+                self.en_passant_target = None
+        else:
+            self.en_passant_target = None
+
+        self.move_piece_unchecked(start, end)
+
+    def move(self, start: str, end: str, color: str) -> bool:
+        if not self.is_legal(start, end, color):
+            return False
+        self._apply_move(start, end)
+        return True
 
     def clone(self) -> "ChessBoard":
         return copy.deepcopy(self)
@@ -103,7 +157,7 @@ class ChessBoard:
                            (0, 1), (0, -1), (1, 0), (-1, 0)]:
                 self._add_ray(x, y, dx, dy, color, moves)
 
-        elif p.type == ChessPieceType.KING:  # (no castling yet)
+        elif p.type == ChessPieceType.KING:
             for dx, dy in [(-1, -1), (-1, 0), (-1, 1),
                            (0, -1),          (0, 1),
                            (1, -1), (1, 0), (1, 1)]:
@@ -112,8 +166,27 @@ class ChessBoard:
                     tgt = self.board[ny][nx]
                     if tgt is None or tgt.color != color:
                         moves.append(self.index_to_algebraic(nx, ny))
+            rank = 0 if color == WHITE else 7
+            rights = self.castling_rights[color]
+            if rights["K"]:
+                if (
+                    self.board[rank][5] is None
+                    and self.board[rank][6] is None
+                    and (self.board[rank][7]
+                         and self.board[rank][7].color == color)
+                ):
+                    moves.append(self.index_to_algebraic(6, rank))
+            if rights["Q"]:
+                if (
+                    self.board[rank][1] is None
+                    and self.board[rank][2] is None
+                    and self.board[rank][3] is None
+                    and (self.board[rank][0]
+                         and self.board[rank][0].color == color)
+                ):
+                    moves.append(self.index_to_algebraic(2, rank))
 
-        elif p.type == ChessPieceType.PAWN:  # (no en‑passant yet)
+        elif p.type == ChessPieceType.PAWN:
             dir_y = 1 if color == WHITE else -1
             start_rank = 1 if color == WHITE else 6
             # forward push
@@ -127,6 +200,14 @@ class ChessBoard:
                 if self._inside(nx, ny):
                     tgt = self.board[ny][nx]
                     if tgt and tgt.color != color:
+                        moves.append(self.index_to_algebraic(nx, ny))
+                    elif (
+                        self.en_passant_target
+                        and (nx, ny) == self.en_passant_target
+                        and self.board[y][nx]
+                        and self.board[y][nx].color != color
+                        and self.board[y][nx].type == ChessPieceType.PAWN
+                    ):
                         moves.append(self.index_to_algebraic(nx, ny))
         return moves
 
@@ -156,7 +237,7 @@ class ChessBoard:
         if end not in self.pseudo_legal_moves(start):
             return False
         clone = self.clone()
-        clone.move_piece_unchecked(start, end)
+        clone._apply_move(start, end)
         return not clone.in_check(color)
 
     def all_legal_moves(self, color: str) -> Dict[str, List[str]]:
