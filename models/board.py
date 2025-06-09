@@ -23,6 +23,35 @@ class ChessBoard:
             BLACK: {"K": True, "Q": True},
         }
 
+    def setup_standard(self) -> None:
+        """Place the pieces in the standard chess starting position."""
+        order = [
+            ChessPieceType.ROOK,
+            ChessPieceType.KNIGHT,
+            ChessPieceType.BISHOP,
+            ChessPieceType.QUEEN,
+            ChessPieceType.KING,
+            ChessPieceType.BISHOP,
+            ChessPieceType.KNIGHT,
+            ChessPieceType.ROOK,
+        ]
+        # Clear board first
+        for y in range(8):
+            for x in range(8):
+                self.board[y][x] = None
+
+        for x, piece_type in enumerate(order):
+            self[ChessBoard.index_to_algebraic(x, 0)] = ChessPiece(piece_type, WHITE, (x, 0))
+            self[ChessBoard.index_to_algebraic(x, 7)] = ChessPiece(piece_type, BLACK, (x, 7))
+            self[ChessBoard.index_to_algebraic(x, 1)] = ChessPiece(ChessPieceType.PAWN, WHITE, (x, 1))
+            self[ChessBoard.index_to_algebraic(x, 6)] = ChessPiece(ChessPieceType.PAWN, BLACK, (x, 6))
+
+        self.castling_rights = {
+            WHITE: {"K": True, "Q": True},
+            BLACK: {"K": True, "Q": True},
+        }
+        self.en_passant_target = None
+
     # ── Algebraic helpers ───────────────────────────────────────────
     @staticmethod
     def algebraic_to_index(pos: str) -> Tuple[int, int]:

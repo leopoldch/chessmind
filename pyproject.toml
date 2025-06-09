@@ -6,7 +6,7 @@ authors = ["Leo C. <leopold@lchappuis.fr>"]
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.13"
+python = "^3.11"
 
 
 [build-system]

@@ -10,6 +10,7 @@ from pieces import WHITE, BLACK, ChessPiece
 class ChessGame:
     def __init__(self, current_turn: str = WHITE):
         self.board = ChessBoard()
+        self.board.setup_standard()
         self.current_turn = current_turn
         self.history: List[Tuple[str, str]] = []
 
