@@ -42,5 +42,6 @@ python ws_server.py
 ```
 
 The client should send "white" or "black" to choose the AI color. Then send moves
-in algebraic format like `e2e4`. After each move, the server responds with the
-AI's move in the same format.
+either in coordinate format like `e2e4` or in standard algebraic notation (e.g.
+`Nf3`, `O-O`). The server replies with the engine's move using coordinate
+notation.

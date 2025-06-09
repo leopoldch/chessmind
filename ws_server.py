@@ -3,13 +3,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Tuple
+from typing import Optional
 
 import websockets
-import chess
 
 from models.game import ChessGame
-from models.pieces import WHITE, BLACK
+from models.pieces import WHITE, BLACK, ChessPieceType
+from san import parse_san
 from engine import Engine
 
 
@@ -17,7 +17,6 @@ async def handle_client(ws: websockets.WebSocketServerProtocol) -> None:
     """Handle a single WebSocket connection."""
     game = ChessGame()
     engine = Engine()
-    parse_board = chess.Board()
 
     # Expect first message to indicate AI color ("white" or "black")
     try:
@@ -29,7 +28,6 @@ async def handle_client(ws: websockets.WebSocketServerProtocol) -> None:
     if ai_color == WHITE:
         start, end = engine.best_move(game)
         game.make_move(start, end)
-        parse_board.push(chess.Move.from_uci(start + end))
         try:
             await ws.send(start + end)
         except websockets.ConnectionClosed:
@@ -42,17 +40,14 @@ async def handle_client(ws: websockets.WebSocketServerProtocol) -> None:
             break
         if len(msg) >= 4 and msg[0] in "abcdefgh" and msg[2] in "12345678":
             opp_move = (msg[:2], msg[2:4])
+            promo: Optional[ChessPieceType] = None
         else:
             try:
-                san_move = parse_board.parse_san(msg)
+                start_sq, end_sq, promo = parse_san(game, msg, BLACK if ai_color == WHITE else WHITE)
             except ValueError:
                 continue
-            opp_move = (
-                chess.square_name(san_move.from_square),
-                chess.square_name(san_move.to_square),
-            )
-        game.make_move(*opp_move)
-        parse_board.push(chess.Move.from_uci("".join(opp_move)))
+            opp_move = (start_sq, end_sq)
+        game.make_move(opp_move[0], opp_move[1], (lambda p=promo: p) if promo else None)
         if game.result:
             try:
                 await ws.send(json.dumps({"result": game.result}))
@@ -61,7 +56,6 @@ async def handle_client(ws: websockets.WebSocketServerProtocol) -> None:
             break
         start, end = engine.best_move(game)
         game.make_move(start, end)
-        parse_board.push(chess.Move.from_uci(start + end))
         try:
             await ws.send(start + end)
         except websockets.ConnectionClosed:
