@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import tkinter as tk
+from tkinter import messagebox
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "models"))
 
@@ -50,6 +51,35 @@ class ChessGUI:
         self.canvas.bind("<ButtonPress-1>", self.on_press)
         self.canvas.bind("<B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
+
+    def ask_promotion(self) -> ChessPieceType:
+        choice = tk.StringVar(value=ChessPieceType.QUEEN.name)
+        win = tk.Toplevel(self.root)
+        win.title("Promote pawn")
+        for t in [
+            ChessPieceType.QUEEN,
+            ChessPieceType.ROOK,
+            ChessPieceType.BISHOP,
+            ChessPieceType.KNIGHT,
+        ]:
+            tk.Radiobutton(
+                win,
+                text=t.value,
+                variable=choice,
+                value=t.name,
+            ).pack(anchor="w")
+
+        done = tk.BooleanVar(value=False)
+
+        def on_ok() -> None:
+            done.set(True)
+            win.destroy()
+
+        tk.Button(win, text="OK", command=on_ok).pack()
+        win.grab_set()
+        win.protocol("WM_DELETE_WINDOW", on_ok)
+        self.root.wait_variable(done)
+        return ChessPieceType[choice.get()]
 
     def draw_board(self) -> None:
         self.canvas.delete("square")
@@ -113,7 +143,16 @@ class ChessGUI:
             return
         target_square = self.xy_to_square(event.x, event.y)
         if target_square:
-            self.game.make_move(self.drag_start_square, target_square)
+            self.game.make_move(
+                self.drag_start_square, target_square, self.ask_promotion
+            )
+            if self.game.result:
+                if self.game.result == "draw":
+                    messagebox.showinfo("Game Over", "Stalemate: draw")
+                else:
+                    messagebox.showinfo(
+                        "Game Over", f"{self.game.result.capitalize()} wins"
+                    )
         self.canvas.delete(self.drag_item)
         self.drag_item = None
         self.drag_start_square = ""
