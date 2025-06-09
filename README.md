@@ -32,3 +32,15 @@ Run the simple command line interface:
 ```bash
 python play_cli.py
 ```
+
+## WebSocket interface
+
+Start a simple WebSocket server on `ws://localhost:8765` with:
+
+```bash
+python ws_server.py
+```
+
+The client should send "white" or "black" to choose the AI color. Then send moves
+in algebraic format like `e2e4`. After each move, the server responds with the
+AI's move in the same format.
