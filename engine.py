@@ -70,7 +70,7 @@ class Engine:
 
     def _order_moves(
         self,
-        game: ChessGame,
+        board: ChessBoard,
         moves: Dict[str, list[str]],
         tt_move: Optional[Tuple[str, str]] = None,
         ply: int = 0,
@@ -81,7 +81,7 @@ class Engine:
                 score = self.history_table[(start, end)]
                 if tt_move and (start, end) == tt_move:
                     score += 10_000
-                if game.board[end] is not None:
+                if board[end] is not None:
                     score += 5_000
                 if (start, end) in self.killer_moves[ply]:
                     score += 7_000
@@ -108,9 +108,9 @@ class Engine:
             h ^= self._z_ep[board.en_passant_target[0]]
         return h
 
-    def _hash(self, game: ChessGame) -> int:
-        h = self._board_hash(game.board)
-        if game.current_turn == WHITE:
+    def _hash(self, board: ChessBoard, color: str) -> int:
+        h = self._board_hash(board)
+        if color == WHITE:
             h ^= self._z_turn
         return h
 
@@ -139,71 +139,63 @@ class Engine:
         return value
 
     # -------- quiescence search ---------
-    def quiescence(self, game: ChessGame, alpha: int, beta: int, color: str) -> int:
-        stand = self.evaluate(game.board, color)
+    def quiescence(self, board: ChessBoard, alpha: int, beta: int, color: str) -> int:
+        stand = self.evaluate(board, color)
         if stand >= beta:
             return beta
         if alpha < stand:
             alpha = stand
-        moves = game.board.all_legal_moves(game.current_turn)
+        moves = board.all_legal_moves(color)
         for start, ends in moves.items():
-            piece = game.board[start]
+            piece = board[start]
             for end in ends:
-                target = game.board[end]
+                target = board[end]
                 if target is None or target.color == piece.color:
                     continue
-                new_game = self._clone_game(game)
-                new_game.make_move(start, end)
-                score = -self.quiescence(new_game, -beta, -alpha, BLACK if color == WHITE else WHITE)
+                state = board.make_move_state(start, end)
+                next_color = BLACK if color == WHITE else WHITE
+                score = -self.quiescence(board, -beta, -alpha, next_color)
+                board.unmake_move(state)
                 if score >= beta:
                     return beta
                 if score > alpha:
                     alpha = score
         return alpha
 
-    # -------- clone ---------
-    def _clone_game(self, game: ChessGame) -> ChessGame:
-        new = ChessGame(game.current_turn)
-        new.board = game.board.clone()
-        new.history = list(game.history)
-        new.result = game.result
-        return new
-
     # -------- negamax search --------
-    def negamax(self, game: ChessGame, depth: int, alpha: int, beta: int, ply: int = 0) -> Tuple[int, Optional[Tuple[str, str]]]:
-        key = self._hash(game)
+    def negamax(self, board: ChessBoard, color: str, depth: int, alpha: int, beta: int, ply: int = 0) -> Tuple[int, Optional[Tuple[str, str]]]:
+        key = self._hash(board, color)
         entry = self.tt.get(key)
         if entry and entry.depth >= depth:
             return entry.score, entry.move
 
-        if depth == 0 or game.result is not None:
-            return self.quiescence(game, alpha, beta, game.current_turn), None
+        if depth == 0:
+            return self.quiescence(board, alpha, beta, color), None
 
         best_score = -10_000
         best_move: Optional[Tuple[str, str]] = None
-        moves = game.legal_moves()
+        moves = board.all_legal_moves(color)
         if not moves:
             # checkmate or stalemate
-            if game.board.in_check(game.current_turn):
+            if board.in_check(color):
                 return -9999 + (self.depth - depth), None
             return 0, None
         tt_move = entry.move if entry else None
-        ordered_moves = self._order_moves(game, moves, tt_move, ply)
+        ordered_moves = self._order_moves(board, moves, tt_move, ply)
         for i, (start, end) in enumerate(ordered_moves):
-            is_capture = game.board[end] is not None
-            new_game = self._clone_game(game)
-            new_game.make_move(start, end)
+            is_capture = board[end] is not None
+            state = board.make_move_state(start, end)
             reduction = 0
             if depth > 2 and i >= 3 and not is_capture:
                 reduction = 1
             if reduction:
-                score, _ = self.negamax(new_game, depth - 1 - reduction, -alpha - 1, -alpha, ply + 1)
+                score, _ = self.negamax(board, BLACK if color == WHITE else WHITE, depth - 1 - reduction, -alpha - 1, -alpha, ply + 1)
                 score = -score
                 if score > alpha:
-                    score, _ = self.negamax(new_game, depth - 1, -beta, -alpha, ply + 1)
+                    score, _ = self.negamax(board, BLACK if color == WHITE else WHITE, depth - 1, -beta, -alpha, ply + 1)
                     score = -score
             else:
-                score, _ = self.negamax(new_game, depth - 1, -beta, -alpha, ply + 1)
+                score, _ = self.negamax(board, BLACK if color == WHITE else WHITE, depth - 1, -beta, -alpha, ply + 1)
                 score = -score
             if score > best_score:
                 best_score = score
@@ -217,7 +209,10 @@ class Engine:
                         km.pop()
                         km.insert(0, (start, end))
                 self.history_table[(start, end)] += depth * depth
+                board.unmake_move(state)
                 break
+
+            board.unmake_move(state)
 
         self.tt[key] = TransEntry(depth, best_score, best_move)
         return best_score, best_move
@@ -226,12 +221,15 @@ class Engine:
         start_time = time.perf_counter()
         guess = 0
         best_move: Optional[Tuple[str, str]] = None
-        for d in range(1, self.depth + 1):
+        moves_root = game.board.all_legal_moves(game.current_turn)
+        move_count = sum(len(v) for v in moves_root.values())
+        max_depth = self.depth + 1 if move_count <= 10 else self.depth
+        for d in range(1, max_depth + 1):
             window = 50
             alpha = guess - window
             beta = guess + window
             while True:
-                score, move = self.negamax(game, d, alpha, beta)
+                score, move = self.negamax(game.board, game.current_turn, d, alpha, beta)
                 if score <= alpha:
                     alpha -= window
                     window *= 2
@@ -245,6 +243,6 @@ class Engine:
             if move:
                 best_move = move
         end = time.perf_counter()
-        print(f"AI search depth {self.depth} took {end - start_time:.2f}s")
+        print(f"AI search depth {max_depth} took {end - start_time:.2f}s")
         assert best_move is not None
         return best_move

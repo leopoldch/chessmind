@@ -3,12 +3,25 @@
 en-passant."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict
 
 from models.pieces import ChessPiece, ChessPieceType, WHITE, BLACK
 
 FILES = "abcdefgh"
 RANKS = "12345678"
+
+
+@dataclass
+class MoveState:
+    start: str
+    end: str
+    captured: Optional[ChessPiece]
+    prev_en_passant: Optional[Tuple[int, int]]
+    prev_castling_rights: Dict[str, Dict[str, bool]]
+    rook_start: Optional[str] = None
+    rook_end: Optional[str] = None
+    ep_capture_pos: Optional[Tuple[int, int]] = None
 
 
 class ChessBoard:
@@ -80,6 +93,91 @@ class ChessBoard:
             raise ValueError(f"No piece on {start}")
         self[end] = piece
         self[start] = None
+
+    def make_move_state(self, start: str, end: str) -> MoveState:
+        piece = self[start]
+        if piece is None:
+            raise ValueError(f"No piece on {start}")
+        captured = self[end]
+        prev_ep = self.en_passant_target
+        prev_rights = {
+            WHITE: dict(self.castling_rights[WHITE]),
+            BLACK: dict(self.castling_rights[BLACK]),
+        }
+
+        sx, sy = self.algebraic_to_index(start)
+        ex, ey = self.algebraic_to_index(end)
+        color = piece.color
+        dir_y = 1 if color == WHITE else -1
+        rook_start = rook_end = None
+        ep_capture_pos = None
+
+        # Castling
+        if piece.type == ChessPieceType.KING and abs(ex - sx) == 2:
+            if ex > sx:
+                rook_start = self.index_to_algebraic(7, sy)
+                rook_end = self.index_to_algebraic(ex - 1, sy)
+            else:
+                rook_start = self.index_to_algebraic(0, sy)
+                rook_end = self.index_to_algebraic(ex + 1, sy)
+            self.move_piece_unchecked(rook_start, rook_end)
+            self.castling_rights[color]["K"] = False
+            self.castling_rights[color]["Q"] = False
+        elif piece.type == ChessPieceType.ROOK:
+            if sx == 0:
+                self.castling_rights[color]["Q"] = False
+            elif sx == 7:
+                self.castling_rights[color]["K"] = False
+        elif piece.type == ChessPieceType.KING:
+            self.castling_rights[color]["K"] = False
+            self.castling_rights[color]["Q"] = False
+
+        # En-passant capture
+        if piece.type == ChessPieceType.PAWN:
+            if self.en_passant_target and (ex, ey) == self.en_passant_target and self.board[ey][ex] is None:
+                ep_capture_pos = (ex, ey - dir_y)
+                captured = self.board[ep_capture_pos[1]][ep_capture_pos[0]]
+                self.board[ep_capture_pos[1]][ep_capture_pos[0]] = None
+            if abs(ey - sy) == 2:
+                self.en_passant_target = (sx, sy + dir_y)
+            else:
+                self.en_passant_target = None
+        else:
+            self.en_passant_target = None
+
+        self.move_piece_unchecked(start, end)
+
+        return MoveState(
+            start,
+            end,
+            captured,
+            prev_ep,
+            prev_rights,
+            rook_start,
+            rook_end,
+            ep_capture_pos,
+        )
+
+    def unmake_move(self, state: MoveState) -> None:
+        # move piece back
+        self.move_piece_unchecked(state.end, state.start)
+        # restore captured piece
+        if state.ep_capture_pos:
+            self[state.end] = None
+            self[ChessBoard.index_to_algebraic(*state.ep_capture_pos)] = state.captured
+        else:
+            self[state.end] = state.captured
+
+        # restore rook if castling
+        if state.rook_start and state.rook_end:
+            self.move_piece_unchecked(state.rook_end, state.rook_start)
+
+        # restore previous state
+        self.en_passant_target = state.prev_en_passant
+        self.castling_rights = {
+            WHITE: dict(state.prev_castling_rights[WHITE]),
+            BLACK: dict(state.prev_castling_rights[BLACK]),
+        }
 
     def _apply_move(self, start: str, end: str) -> None:
         piece = self[start]
@@ -281,9 +379,10 @@ class ChessBoard:
     def is_legal(self, start: str, end: str, color: str) -> bool:
         if end not in self.pseudo_legal_moves(start):
             return False
-        clone = self.clone()
-        clone._apply_move(start, end)
-        return not clone.in_check(color)
+        state = self.make_move_state(start, end)
+        illegal = self.in_check(color)
+        self.unmake_move(state)
+        return not illegal
 
     def all_legal_moves(self, color: str) -> Dict[str, List[str]]:
         res: Dict[str, List[str]] = {}
