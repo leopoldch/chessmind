@@ -21,12 +21,14 @@ async def handle_client(ws: websockets.WebSocketServerProtocol) -> None:
     # Expect first message to indicate AI color ("white" or "black")
     try:
         msg = await ws.recv()
+        print(f"Received initial message: {msg}")
     except websockets.ConnectionClosed:
         return
     ai_color = WHITE if msg.strip().lower().startswith("w") else BLACK
+    print(f"AI color set to: {'White' if ai_color == WHITE else 'Black'}")
 
     if ai_color == WHITE:
-        start, end = engine.best_move(game)
+        start, end = "e2", "e4"
         game.make_move(start, end)
         try:
             await ws.send(start + end)
