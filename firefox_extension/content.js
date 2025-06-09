@@ -1,64 +1,65 @@
 (function() {
   const WS_URL = 'ws://localhost:8765';
   let ws;
-  let lastMoveCount = 0;
+  let lastSentMoves = null;
+
+  if (!/^\/game\/[^\/]+$/.test(window.location.pathname)){
+    console.log('Pas une page de jeu, arrêt du script.');
+    return;
+  }
 
   function connect() {
     ws = new WebSocket(WS_URL);
     ws.addEventListener('open', () => {
-      const color = detectColor();
-      if (color) ws.send(color); // send plain text color
-      observeMoves(color);
+      const myColor = detectColor();
+      ws.send(JSON.stringify({ type: 'color', color: myColor }));
+      sendMovesIfNew(getAllMoves());
+      observeMoves();
     });
-    ws.addEventListener('message', event => {
-      try {
-        const data = JSON.parse(event.data);
-        if (data.result) {
-          alert(`Game over: ${data.result}`);
-          return;
-        }
-      } catch {
-        // not JSON, treat as next move
-        if (event.data) {
-          alert(`Next move: ${event.data}`);
-        }
-      }
-    });
-    ws.addEventListener('close', () => {
-      setTimeout(connect, 1000);
-    });
+    ws.addEventListener('message', onMessage);
+    ws.addEventListener('close', () => setTimeout(connect, 1000));
   }
 
   function detectColor() {
-    const white = document.getElementsByClassName('piece wk square-51');
-    if (!white) return "black";
-    return "white";
+    const whiteKings = document.querySelectorAll('.piece.wk');
+    return (whiteKings.length > 0) ? 'white' : 'black';
   }
 
-  function getMoveTexts() {
-    const nodes = document.querySelectorAll('.vertical-move-list .move');
-    return Array.from(nodes).map(n => n.textContent.trim()).filter(Boolean);
+  function getAllMoves() {
+    const moves = [];
+    document.querySelectorAll('.node.white-move, .node.black-move')
+      .forEach(n => moves.push(n.textContent.trim()));
+    return moves;
   }
 
-  function sendLastOpponentMove(color) {
-    const moves = getMoveTexts();
-    if (moves.length === 0 || moves.length === lastMoveCount) return;
-    lastMoveCount = moves.length;
-    const isWhite = color === 'white';
-    const opponentMoves = moves.filter((_, i) => isWhite ? i % 2 === 1 : i % 2 === 0);
-    const last = opponentMoves[opponentMoves.length - 1];
-    if (last && ws.readyState === WebSocket.OPEN) {
-      ws.send(last); // send move in plain text
+  function sendMovesIfNew(moves) {
+    const serialized = JSON.stringify(moves);
+    if (serialized !== lastSentMoves) {
+      lastSentMoves = serialized;
+      ws.send(JSON.stringify({ type: 'moves', moves }));
     }
   }
 
-  function observeMoves(color) {
-    const list = document.querySelector('.vertical-move-list');
-    if (!list) return;
-    sendLastOpponentMove(color);
-    const observer = new MutationObserver(() => sendLastOpponentMove(color));
-    observer.observe(list, { childList: true, subtree: true });
+  function observeMoves() {
+    const container = document.querySelector('.mode-swap-move-list-component');
+    if (!container) return;
+    const obs = new MutationObserver(() => {
+      sendMovesIfNew(getAllMoves());
+    });
+    obs.observe(container, { childList: true, subtree: true });
   }
 
+  function onMessage(evt) {
+    try {
+      const data = JSON.parse(evt.data);
+      if (data.result) {
+        alert(`Partie terminée: ${data.result}`);
+        return;
+      }
+    } catch {}
+    alert(`Prochain coup reçu: ${evt.data}`);
+  }
+
+  // Démarrage
   connect();
 })();
