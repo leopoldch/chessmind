@@ -10,6 +10,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "models"))
 from game import ChessGame
 from board import ChessBoard
 from pieces import ChessPieceType, WHITE, BLACK
+from engine import Engine
 
 PIECE_UNICODE = {
     (WHITE, ChessPieceType.KING): "\u2654",
@@ -34,6 +35,8 @@ class ChessGUI:
 
         self.root = tk.Tk()
         self.root.title("ChessMind")
+        self.ai_mode = messagebox.askyesno("Game Mode", "Play against AI?")
+        self.engine = Engine() if self.ai_mode else None
         self.square_size = 60
         self.canvas = tk.Canvas(
             self.root,
@@ -146,6 +149,25 @@ class ChessGUI:
             self.game.make_move(
                 self.drag_start_square, target_square, self.ask_promotion
             )
+            self.check_end_or_ai()
+        self.canvas.delete(self.drag_item)
+        self.drag_item = None
+        self.drag_start_square = ""
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+    def check_end_or_ai(self) -> None:
+        if self.game.result:
+            if self.game.result == "draw":
+                messagebox.showinfo("Game Over", "Stalemate: draw")
+            else:
+                messagebox.showinfo(
+                    "Game Over", f"{self.game.result.capitalize()} wins"
+                )
+        elif self.ai_mode and self.game.current_turn == BLACK:
+            start, end = self.engine.best_move(self.game)
+            self.game.make_move(start, end)
             if self.game.result:
                 if self.game.result == "draw":
                     messagebox.showinfo("Game Over", "Stalemate: draw")
@@ -153,14 +175,8 @@ class ChessGUI:
                     messagebox.showinfo(
                         "Game Over", f"{self.game.result.capitalize()} wins"
                     )
-        self.canvas.delete(self.drag_item)
-        self.drag_item = None
-        self.drag_start_square = ""
-        self.draw_board()
-        self.draw_pieces()
-
-    def run(self) -> None:
-        self.root.mainloop()
+            self.draw_board()
+            self.draw_pieces()
 
 
 if __name__ == "__main__":
