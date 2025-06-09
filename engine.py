@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, Tuple, Optional, List, DefaultDict
+from concurrent.futures import ThreadPoolExecutor
 
 import random
 import time
@@ -42,8 +43,9 @@ class TransEntry:
 
 
 class Engine:
-    def __init__(self, depth: int = 3) -> None:
+    def __init__(self, depth: int = 3, threads: int = 1) -> None:
         self.depth = depth
+        self.threads = threads
         self.tt: Dict[int, TransEntry] = {}
         self.eval_cache: Dict[Tuple[int, str], int] = {}
 
@@ -81,8 +83,11 @@ class Engine:
                 score = self.history_table[(start, end)]
                 if tt_move and (start, end) == tt_move:
                     score += 10_000
-                if board[end] is not None:
+                target = board[end]
+                if target is not None:
+                    attacker = board[start]
                     score += 5_000
+                    score += PIECE_VALUES[target.type] * 100 - PIECE_VALUES[attacker.type]
                 if (start, end) in self.killer_moves[ply]:
                     score += 7_000
                 ordered.append((score, (start, end)))
@@ -217,6 +222,37 @@ class Engine:
         self.tt[key] = TransEntry(depth, best_score, best_move)
         return best_score, best_move
 
+    def _negamax_root_parallel(
+        self,
+        board: ChessBoard,
+        color: str,
+        depth: int,
+        alpha: int,
+        beta: int,
+    ) -> Tuple[int, Optional[Tuple[str, str]]]:
+        moves = board.all_legal_moves(color)
+        ordered = self._order_moves(board, moves, None, 0)
+        if not ordered:
+            return 0, None
+        results: List[Tuple[int, Tuple[str, str]]] = []
+        next_color = BLACK if color == WHITE else WHITE
+        with ThreadPoolExecutor(max_workers=self.threads) as ex:
+            futs = []
+            boards = []
+            for start, end in ordered:
+                clone = board.clone()
+                clone._apply_move(start, end)
+                futs.append(ex.submit(self.negamax, clone, next_color, depth - 1, -beta, -alpha, 1))
+                boards.append((start, end))
+            for fut, move in zip(futs, boards):
+                score, _ = fut.result()
+                score = -score
+                results.append((score, move))
+        if not results:
+            return 0, None
+        best_score, best_move = max(results, key=lambda x: x[0])
+        return best_score, best_move
+
     def best_move(self, game: ChessGame) -> Tuple[str, str]:
         start_time = time.perf_counter()
         guess = 0
@@ -229,7 +265,10 @@ class Engine:
             alpha = guess - window
             beta = guess + window
             while True:
-                score, move = self.negamax(game.board, game.current_turn, d, alpha, beta)
+                if self.threads > 1 and d == max_depth:
+                    score, move = self._negamax_root_parallel(game.board, game.current_turn, d, alpha, beta)
+                else:
+                    score, move = self.negamax(game.board, game.current_turn, d, alpha, beta)
                 if score <= alpha:
                     alpha -= window
                     window *= 2
