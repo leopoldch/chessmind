@@ -19,3 +19,5 @@ python tk_gui.py
 ```
 
 Drag pieces with the mouse. Illegal moves or moves by the wrong color are rejected.
+The game ends automatically when a player is checkmated or no legal moves remain.
+Pawns promote upon reaching the last rank. The GUI will prompt you to choose the piece type.
