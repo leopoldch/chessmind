@@ -42,6 +42,24 @@ class Engine:
         self.depth = depth
         self.tt: Dict[str, TransEntry] = {}
 
+    def _order_moves(
+        self,
+        game: ChessGame,
+        moves: Dict[str, list[str]],
+        tt_move: Optional[Tuple[str, str]] = None,
+    ) -> list[Tuple[str, str]]:
+        ordered: list[Tuple[int, Tuple[str, str]]] = []
+        for start, ends in moves.items():
+            for end in ends:
+                score = 0
+                if tt_move and (start, end) == tt_move:
+                    score = 2
+                elif game.board[end] is not None:
+                    score = 1
+                ordered.append((score, (start, end)))
+        ordered.sort(key=lambda x: x[0], reverse=True)
+        return [m for _, m in ordered]
+
     # -------- state hashing ---------
     def _hash(self, game: ChessGame) -> str:
         board = game.board
@@ -136,19 +154,18 @@ class Engine:
             if game.board.in_check(game.current_turn):
                 return -9999 + (self.depth - depth), None
             return 0, None
-        for start, ends in moves.items():
-            for end in ends:
-                new_game = self._clone_game(game)
-                new_game.make_move(start, end)
-                score, _ = self.negamax(new_game, depth - 1, -beta, -alpha)
-                score = -score
-                if score > best_score:
-                    best_score = score
-                    best_move = (start, end)
-                if best_score > alpha:
-                    alpha = best_score
-                if alpha >= beta:
-                    break
+        tt_move = entry.move if entry else None
+        ordered_moves = self._order_moves(game, moves, tt_move)
+        for start, end in ordered_moves:
+            new_game = self._clone_game(game)
+            new_game.make_move(start, end)
+            score, _ = self.negamax(new_game, depth - 1, -beta, -alpha)
+            score = -score
+            if score > best_score:
+                best_score = score
+                best_move = (start, end)
+            if best_score > alpha:
+                alpha = best_score
             if alpha >= beta:
                 break
 

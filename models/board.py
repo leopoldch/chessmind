@@ -4,8 +4,6 @@ en-passant."""
 from __future__ import annotations
 
 from typing import List, Optional, Tuple, Dict
-import copy
-import string
 
 from models.pieces import ChessPiece, ChessPieceType, WHITE, BLACK
 
@@ -135,7 +133,25 @@ class ChessBoard:
         return True
 
     def clone(self) -> "ChessBoard":
-        return copy.deepcopy(self)
+        new = ChessBoard()
+        for y in range(8):
+            for x in range(8):
+                p = self.board[y][x]
+                if p is None:
+                    new.board[y][x] = None
+                else:
+                    # create a new ChessPiece with same attributes
+                    new.board[y][x] = ChessPiece(p.type, p.color, p.position)
+        new.en_passant_target = (
+            (self.en_passant_target[0], self.en_passant_target[1])
+            if self.en_passant_target is not None
+            else None
+        )
+        new.castling_rights = {
+            WHITE: dict(self.castling_rights[WHITE]),
+            BLACK: dict(self.castling_rights[BLACK]),
+        }
+        return new
 
     @staticmethod
     def _inside(x: int, y: int) -> bool:
