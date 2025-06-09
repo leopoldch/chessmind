@@ -1,6 +1,3 @@
-"""Simple WebSocket interface for the chess engine (fixed)"""
-from __future__ import annotations
-
 import asyncio
 import json
 from typing import Optional
@@ -13,12 +10,8 @@ from san import parse_san
 from engine import Engine
 
 
-# ------------------------------
-# Helper
-# ------------------------------
-
 def _is_coordinate(move: str) -> bool:
-    """Return True if *move* looks like long algebraic (e2e4, g7g8)"""
+    """Return True if *move* looks like long algebraic (e2e4)."""
     return (
         len(move) == 4
         and move[0] in "abcdefgh"
@@ -28,79 +21,98 @@ def _is_coordinate(move: str) -> bool:
     )
 
 
-# ------------------------------
-# Main handler
-# ------------------------------
 async def handle_client(ws: websockets.WebSocketServerProtocol) -> None:
     """Handle a single WebSocket connection."""
     game = ChessGame()
     engine = Engine()
+    ai_color: Optional[str] = None
+    last_len = 0
 
-    # ── 1. Receive initial colour ─────────────────────────────────────────────
-    try:
-        msg = await ws.recv()
-        print(f"Received initial message: {msg}")
-    except websockets.ConnectionClosed:
-        return
-
-    ai_color = WHITE if msg.strip().lower().startswith("w") else BLACK
-    print(f"AI colour set to: {'White' if ai_color == WHITE else 'Black'}")
-
-    if ai_color == WHITE:
-        start, end = "e2", "e4"
-        game.make_move(start, end)
-        try:
-            await ws.send(start + end)  # send as long algebraic e2e4
-        except websockets.ConnectionClosed:
-            return
-
-    while not game.result:
-        # 3‑a. Wait for the human move (opponent of the engine)
+    while True:
         try:
             msg = await ws.recv()
-            print(f"Received move: {msg}")
+            print(f"Received message: {msg}")
         except websockets.ConnectionClosed:
             break
-        if not msg:
-            continue
 
-        if _is_coordinate(msg):
-            opp_move = (msg[:2], msg[2:4])
-            promo: Optional[ChessPieceType] = None
-        else:
-            try:
-                start_sq, end_sq, promo = parse_san(
-                    game, msg, BLACK if ai_color == WHITE else WHITE
-                )
-            except ValueError:
-                print(f"Could not parse move '{msg}', ignoring.")
+        try:
+            data = json.loads(msg)
+        except json.JSONDecodeError:
+            # Fallback for raw coordinate/SAN moves (legacy)
+            if ai_color is None:
                 continue
-            opp_move = (start_sq, end_sq)
+            if _is_coordinate(msg):
+                start, end = msg[:2], msg[2:4]
+                promo: Optional[ChessPieceType] = None
+            else:
+                try:
+                    start, end, promo = parse_san(
+                        game, msg, BLACK if game.current_turn == WHITE else WHITE
+                    )
+                except ValueError:
+                    print(f"Could not parse move '{msg}', ignoring.")
+                    continue
+            game.make_move(start, end, (lambda p=promo: p) if promo else None)
+            last_len += 1
+        else:
+            if data.get("type") == "color":
+                col = str(data.get("color", "white")).lower()
+                ai_color = WHITE if col.startswith("w") else BLACK
+                print(
+                    f"AI colour set to: {'White' if ai_color == WHITE else 'Black'}"
+                )
+                # reset game in case of reconnect
+                game = ChessGame()
+                last_len = 0
+                if ai_color == WHITE and game.current_turn == WHITE:
+                    start, end = engine.best_move(game)
+                    game.make_move(start, end)
+                    await ws.send(start + end)
+                continue
 
-        game.make_move(opp_move[0], opp_move[1], (lambda p=promo: p) if promo else None)
-        print(f"Opponent move applied: {opp_move[0]} to {opp_move[1]}")
+            if data.get("type") != "moves":
+                print(f"Unknown message type: {data.get('type')}")
+                continue
 
+            moves = [m.replace("+", "") for m in data.get("moves", [])]
+            if len(moves) == last_len:
+                continue
+
+            # rebuild game from scratch to handle reconnects
+            game = ChessGame()
+            color = WHITE
+            for m in moves:
+                try:
+                    s, e, promo = parse_san(game, m, color)
+                except ValueError:
+                    print(f"Could not parse move '{m}', stopping replay.")
+                    return
+                game.make_move(s, e, (lambda p=promo: p) if promo else None)
+                color = BLACK if color == WHITE else WHITE
+            last_len = len(moves)
+
+        if ai_color is None:
+            continue
         if game.result:
-            try:
-                await ws.send(json.dumps({"result": game.result}))
-            except websockets.ConnectionClosed:
-                pass
+            await ws.send(json.dumps({"result": game.result}))
             break
+        if game.current_turn != ai_color:
+            continue
 
         start, end = engine.best_move(game)
         game.make_move(start, end)
-        print(f"Engine move applied: {start} to {end}")
-        try:
-            await ws.send(start + end)  # again long algebraic
-        except websockets.ConnectionClosed:
-            break
+        await ws.send(start + end)
 
 
-async def main() -> None:
+def main() -> None:
+    asyncio.run(_main())
+
+
+async def _main() -> None:
     async with websockets.serve(handle_client, "localhost", 8765):
         print("WebSocket server started on ws://localhost:8765")
-        await asyncio.Future()  # run forever
+        await asyncio.Future()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(_main())
