@@ -35,7 +35,7 @@ class ChessGUI:
         self.root = tk.Tk()
         self.root.title("ChessMind")
         self.ai_mode = messagebox.askyesno("Game Mode", "Play against AI?")
-        self.engine = Engine() if self.ai_mode else None
+        self.engine = Engine(depth=3) if self.ai_mode else None
         self.square_size = 60
         self.canvas = tk.Canvas(
             self.root,
