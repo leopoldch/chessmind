@@ -7,8 +7,22 @@
     ws = new WebSocket(WS_URL);
     ws.addEventListener('open', () => {
       const color = detectColor();
-      if (color) ws.send(JSON.stringify({type: 'color', color}));
+      if (color) ws.send(color); // send plain text color
       observeMoves(color);
+    });
+    ws.addEventListener('message', event => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.result) {
+          alert(`Game over: ${data.result}`);
+          return;
+        }
+      } catch {
+        // not JSON, treat as next move
+        if (event.data) {
+          alert(`Next move: ${event.data}`);
+        }
+      }
     });
     ws.addEventListener('close', () => {
       setTimeout(connect, 1000);
@@ -38,7 +52,7 @@
     const opponentMoves = moves.filter((_, i) => isWhite ? i % 2 === 1 : i % 2 === 0);
     const last = opponentMoves[opponentMoves.length - 1];
     if (last && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({type: 'opponent_move', move: last}));
+      ws.send(last); // send move in plain text
     }
   }
 
