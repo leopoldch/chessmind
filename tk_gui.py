@@ -5,11 +5,10 @@ import sys
 import tkinter as tk
 from tkinter import messagebox
 
-sys.path.append(os.path.join(os.path.dirname(__file__), "models"))
 
-from game import ChessGame
-from board import ChessBoard
-from pieces import ChessPieceType, WHITE, BLACK
+from models.game import ChessGame
+from models.board import ChessBoard
+from models.pieces import ChessPieceType, WHITE, BLACK
 from engine import Engine
 
 PIECE_UNICODE = {

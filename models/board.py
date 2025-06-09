@@ -7,7 +7,7 @@ from typing import List, Optional, Tuple, Dict
 import copy
 import string
 
-from pieces import ChessPiece, ChessPieceType, WHITE, BLACK
+from models.pieces import ChessPiece, ChessPieceType, WHITE, BLACK
 
 FILES = "abcdefgh"
 RANKS = "12345678"
