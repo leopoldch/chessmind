@@ -4,12 +4,35 @@
   let ws;
   let lastMoveCount = 0;
 
+  /** Wait for a DOM element to appear */
+  function waitForElement(selector, timeout = 10000) {
+    return new Promise(resolve => {
+      const el = document.querySelector(selector);
+      if (el) {
+        resolve(el);
+        return;
+      }
+      const observer = new MutationObserver(() => {
+        const el = document.querySelector(selector);
+        if (el) {
+          observer.disconnect();
+          resolve(el);
+        }
+      });
+      observer.observe(document.documentElement, { childList: true, subtree: true });
+      setTimeout(() => {
+        observer.disconnect();
+        resolve(null);
+      }, timeout);
+    });
+  }
+
   /** Try to establish (or re‑establish) the WebSocket connection */
   function connect() {
     ws = new WebSocket(WS_URL);
 
-    ws.addEventListener('open', () => {
-      const colour = detectColour();
+    ws.addEventListener('open', async () => {
+      const colour = await detectColour();
       if (colour) ws.send(colour); // e.g. "white" or "black"
       observeMoves(colour);
     });
@@ -37,13 +60,14 @@
   }
 
   /** Determine our colour by checking board orientation.  Works on Lichess & Chess.com */
-  function detectColour() {
-    const board = document.querySelector('chess-board, .board');
+  async function detectColour() {
+    const board = await waitForElement('chess-board, .board');
     if (!board) return null;
 
-    // Lichess: white at bottom ⇒ no class "flipped" ; Chess.com: orientation=white
-    const isWhiteBottom = !board.classList.contains('flipped') || board.getAttribute('orientation') === 'white';
-    return isWhiteBottom ? 'black' : 'white'; // we play the opposite colour
+    const isWhiteBottom =
+      !board.classList.contains('flipped') ||
+      board.getAttribute('orientation') === 'white';
+    return isWhiteBottom ? 'black' : 'white';
   }
 
   /** Return array with SAN strings from the move list */
@@ -69,8 +93,8 @@
   }
 
   /** Observe DOM change in the move list */
-  function observeMoves(colour) {
-    const list = document.querySelector('.vertical-move-list');
+  async function observeMoves(colour) {
+    const list = await waitForElement('.vertical-move-list');
     if (!list) return;
 
     // Send any move already present when we connected

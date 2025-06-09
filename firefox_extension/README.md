@@ -15,4 +15,7 @@ Run the WebSocket server from this repository:
 python ws_server.py
 ```
 
-Open a game on Chess.com. The extension will detect whether you're playing White or Black based on the board orientation and will send the opponent's latest moves to the WebSocket server at `ws://localhost:8765`.
+Open a game on Chess.com. The extension waits for the board and move list to
+appear, then determines your colour from the board orientation. The opponent's
+moves are observed in real time and sent to the WebSocket server at
+`ws://localhost:8765`.
