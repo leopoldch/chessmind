@@ -2,11 +2,11 @@ import os
 import sys
 import pytest
 
-# Add the models directory to the path so the modules can be imported
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "models"))
+# Ensure project root is on the path
+sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
-from board import ChessBoard
-from pieces import ChessPiece, ChessPieceType, WHITE, BLACK
+from models.board import ChessBoard
+from models.pieces import ChessPiece, ChessPieceType, WHITE, BLACK
 
 
 def empty_board():

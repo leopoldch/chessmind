@@ -3,8 +3,8 @@ from __future__ import annotations
 
 from typing import List, Tuple, Dict, Callable
 
-from board import ChessBoard
-from pieces import WHITE, BLACK, ChessPiece, ChessPieceType
+from models.board import ChessBoard
+from models.pieces import WHITE, BLACK, ChessPiece, ChessPieceType
 
 
 class ChessGame:
