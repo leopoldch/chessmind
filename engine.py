@@ -48,6 +48,7 @@ class Engine:
         self.threads = threads
         self.tt: Dict[int, TransEntry] = {}
         self.eval_cache: Dict[Tuple[int, str], int] = {}
+        self.move_times: List[float] = []
 
         rng = random.Random(42)
         # mapping from (color, piece type) -> index
@@ -254,12 +255,18 @@ class Engine:
         return best_score, best_move
 
     def best_move(self, game: ChessGame) -> Tuple[str, str]:
+        extra_depth = 0
+        if len(self.move_times) >= 10 and all(t < 2 for t in self.move_times[-10:]):
+            extra_depth = 2
+
         start_time = time.perf_counter()
         guess = 0
         best_move: Optional[Tuple[str, str]] = None
         moves_root = game.board.all_legal_moves(game.current_turn)
         move_count = sum(len(v) for v in moves_root.values())
-        max_depth = self.depth + 1 if move_count <= 10 else self.depth
+        max_depth = self.depth + extra_depth
+        if move_count <= 10:
+            max_depth += 1
         for d in range(1, max_depth + 1):
             window = 50
             alpha = guess - window
@@ -283,5 +290,8 @@ class Engine:
                 best_move = move
         end = time.perf_counter()
         print(f"AI search depth {max_depth} took {end - start_time:.2f}s")
+        self.move_times.append(end - start_time)
+        if len(self.move_times) > 10:
+            self.move_times.pop(0)
         assert best_move is not None
         return best_move
