@@ -17,9 +17,8 @@ class ChessGame:
         p: ChessPiece | None = self.board[start]
         if p is None or p.color != self.current_turn:
             return False
-        if not self.board.is_legal(start, end, self.current_turn):
+        if not self.board.move(start, end, self.current_turn):
             return False
-        self.board.move_piece_unchecked(start, end)
         self.history.append((start, end))
         self.current_turn = BLACK if self.current_turn == WHITE else WHITE
         return True
