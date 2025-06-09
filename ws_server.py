@@ -89,9 +89,9 @@ async def handle_client(ws: websockets.WebSocketServerProtocol) -> None:
 
         start, end = engine.best_move(game)
         game.make_move(start, end)
-        print(f"AI move applied: {start} to {end}")
+        print(f"Engine move applied: {start} to {end}")
         try:
-            await ws.send(start + end)
+            await ws.send(start + end)  # again long algebraic
         except websockets.ConnectionClosed:
             break
 

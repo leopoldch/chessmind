@@ -1,116 +1,111 @@
-// Content script for chess‑site extension (fixed)
+/*  content.js  – injecté dans https://www.chess.com/play …
+ *  1. Détecte la couleur du joueur affiché en bas.
+ *  2. Observe la liste des coups et expédie UNIQUEMENT les coups adverses.
+ *  3. Tous les messages sont envoyés au serveur WS sous forme JSON
+ *     { type: 'color' | 'move', payload: string }             */
+
 (() => {
   const WS_URL = 'ws://localhost:8765';
-  let ws;
-  let lastMoveCount = 0;
+  let ws;                       // WebSocket courant
+  let myColor = null;           // 'white' ou 'black'
+  let lastPlySent = 0;          // indice (½-coup) du dernier coup vraiment expédié
 
-  /** Wait for a DOM element to appear */
-  function waitForElement(selector, timeout = 10000) {
-    return new Promise(resolve => {
-      const el = document.querySelector(selector);
-      if (el) {
-        resolve(el);
-        return;
-      }
-      const observer = new MutationObserver(() => {
-        const el = document.querySelector(selector);
-        if (el) {
-          observer.disconnect();
-          resolve(el);
-        }
+  /* ----------  OUTILS GÉNÉRIQUES  ---------- */
+
+  /** Attend qu’un sélecteur CSS apparaisse dans le DOM */
+  const waitForEl = (sel, timeout = 10000) =>
+    new Promise((ok, ko) => {
+      const el = document.querySelector(sel);
+      if (el) return ok(el);
+      const obs = new MutationObserver(() => {
+        const found = document.querySelector(sel);
+        if (found) { obs.disconnect(); ok(found); }
       });
-      observer.observe(document.documentElement, { childList: true, subtree: true });
-      setTimeout(() => {
-        observer.disconnect();
-        resolve(null);
-      }, timeout);
+      obs.observe(document.documentElement, { childList: true, subtree: true });
+      setTimeout(() => { obs.disconnect(); ko(`Timeout : ${sel}`); }, timeout);
     });
-  }
 
-  /** Try to establish (or re‑establish) the WebSocket connection */
-  function connect() {
+  /** Envoie un objet JSON si le WS est ouvert */
+  const send = obj => {
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(obj));
+    }
+  };
+
+  /* ----------  DÉTECTION DE LA COULEUR  ----------
+   * Astuce : le #board imprime les pièces comme sprites dans le style inline.
+   * 'br.png' (tour noire) vient avant 'wr.png' (tour blanche) si le NOIR est EN HAUT
+   * -> Donc si br < wr  →  je suis blanc en bas.                         */
+  const detectColor = () => {
+    const board = document.getElementById('board');
+    if (!board) return null;
+    const style = board.getAttribute('style') || '';
+    const pBr = style.indexOf('br.png');
+    const pWr = style.indexOf('wr.png');
+    if (pBr === -1 || pWr === -1) return null;
+    return pBr < pWr ? 'white' : 'black';
+  };
+
+  /* ----------  OBSERVATION DES COUPS  ---------- */
+
+  /** Retourne la liste plate des ½-coups dans l’ordre : ['d4','d5','c4',…] */
+  const getMoves = (listNode) => {
+    const moves = [];
+    listNode.querySelectorAll('.move').forEach(node => {
+      const white = node.querySelector('.white')?.textContent.trim();
+      const black = node.querySelector('.black')?.textContent.trim();
+      if (white) moves.push(white);
+      if (black) moves.push(black);
+    });
+    return moves;
+  };
+
+  /** Envoie le dernier coup adverse s’il y en a un nouveau */
+  const maybeSendOpponentMove = (listNode) => {
+    const moves = getMoves(listNode);
+    if (moves.length === 0 || moves.length === lastPlySent) return;
+
+    const isWhiteBottom = myColor === 'white';
+    const plyIdx   = moves.length - 1;
+    const oppTurn  = isWhiteBottom ? plyIdx % 2 === 1 : plyIdx % 2 === 0;
+
+    lastPlySent = moves.length;          // on mémorise le nouveau total
+
+    if (oppTurn) {
+      send({ type: 'move', payload: moves[plyIdx] });
+    }
+  };
+
+  /** Installe un MutationObserver sur la liste verticale */
+  const hookMoveList = async () => {
+    const list = await waitForEl('.vertical-move-list');
+    maybeSendOpponentMove(list);           // on rattrape la position courante
+
+    new MutationObserver(() => maybeSendOpponentMove(list))
+      .observe(list, { childList: true, subtree: true });
+  };
+
+  /* ----------  GESTION DU WEBSOCKET  ---------- */
+
+  const connectWS = () => {
     ws = new WebSocket(WS_URL);
 
-    ws.addEventListener('open', async () => {
-      const colour = await detectColour();
-      if (colour) ws.send(colour); // e.g. "white" or "black"
-      observeMoves(colour);
+    ws.addEventListener('open', () => {
+      send({ type: 'color', payload: myColor });
+      hookMoveList().catch(console.error);
     });
 
-    ws.addEventListener('message', event => {
-      // Engine either sends a JSON (game over) or plain text long‑algebraic move
-      try {
-        const data = JSON.parse(event.data);
-        if (data.result) {
-          alert(`Game over: ${data.result}`);
-          return;
-        }
-      } catch {
-        // Not JSON ⇒ should be coordinate like "e7e5"
-        if (event.data && event.data.length === 4) {
-          makeEngineMove(event.data);
-        }
-      }
-    });
+    ws.addEventListener('close', () => setTimeout(connectWS, 1000));
+  };
 
-    ws.addEventListener('close', () => {
-      // simple reconnection strategy
-      setTimeout(connect, 1000);
-    });
-  }
+  /* ----------  INITIALISATION  ---------- */
 
-  /** Determine our colour by checking board orientation.  Works on Lichess & Chess.com */
-  async function detectColour() {
-    const board = await waitForElement('chess-board, .board');
-    if (!board) return null;
+  (async () => {
+    await waitForEl('#board');           // le plateau doit exister
+    myColor = detectColor();
+    if (!myColor) return console.error('Impossible de déterminer la couleur.');
 
-    const isWhiteBottom =
-      !board.classList.contains('flipped') ||
-      board.getAttribute('orientation') === 'white';
-    return isWhiteBottom ? 'black' : 'white';
-  }
+    connectWS();                         // et c’est parti !
+  })();
 
-  /** Return array with SAN strings from the move list */
-  function getMoveTexts() {
-    const nodes = document.querySelectorAll('.vertical-move-list .move');
-    return Array.from(nodes).map(n => n.textContent.trim()).filter(Boolean);
-  }
-
-  /** When move list mutates, send the newest opponent move to the backend */
-  function sendLastOpponentMove(colour) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-    const moves = getMoveTexts();
-    if (moves.length === 0 || moves.length === lastMoveCount) return;
-    lastMoveCount = moves.length;
-
-    const isWhite = colour === 'white';
-    const opponentMoves = moves.filter((_, i) => (isWhite ? i % 2 === 1 : i % 2 === 0));
-    const last = opponentMoves[opponentMoves.length - 1];
-    if (last) {
-      ws.send(last); // send SAN like "e4", "Nf3" etc.
-    }
-  }
-
-  /** Observe DOM change in the move list */
-  async function observeMoves(colour) {
-    const list = await waitForElement('.vertical-move-list');
-    if (!list) return;
-
-    // Send any move already present when we connected
-    sendLastOpponentMove(colour);
-
-    const observer = new MutationObserver(() => sendLastOpponentMove(colour));
-    observer.observe(list, { childList: true, subtree: true });
-  }
-
-  /** Play engine move on the board (simple version using chessboard API if present) */
-  function makeEngineMove(coord) {
-    // If you have access to a board API (e.g. window.board.move) use it.
-    // This placeholder just alerts.
-    alert(`Engine plays: ${coord}`);
-  }
-
-  // Kick off
-  connect();
 })();

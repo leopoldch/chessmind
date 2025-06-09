@@ -1,15 +1,17 @@
 {
   "manifest_version": 3,
-  "name": "Chess.com Move Reporter",
-  "version": "1.0",
-  "description": "Detects player color and opponent moves on Chess.com and sends them over WebSocket.",
+  "name": "Chess.com Move Listener",
+  "version": "1.1",
+  "description": "Envoie la couleur du joueur du bas et chaque coup adverse vers un serveur local WS.",
   "content_scripts": [
     {
-      "matches": ["*://www.chess.com/*"],
+      "matches": [
+        "https://www.chess.com/play*",
+        "https://www.chess.com/*/play*"
+      ],
       "js": ["content.js"],
       "run_at": "document_idle"
     }
   ],
-  "permissions": ["storage"],
-  "host_permissions": ["ws://localhost:8765/"]
+  "host_permissions": ["https://www.chess.com/*"]
 }
