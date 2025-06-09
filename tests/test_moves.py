@@ -86,3 +86,21 @@ def test_en_passant_capture():
 
     moves = board.pseudo_legal_moves("e5")
     assert "f6" in moves
+
+
+def test_castling_illegal_when_in_check():
+    board = empty_board()
+    board["e1"] = ChessPiece(ChessPieceType.KING, WHITE, (4, 0))
+    board["h1"] = ChessPiece(ChessPieceType.ROOK, WHITE, (7, 0))
+    board["e8"] = ChessPiece(ChessPieceType.ROOK, BLACK, (4, 7))
+    moves = board.all_legal_moves(WHITE)
+    assert "g1" not in moves.get("e1", [])
+
+
+def test_castling_illegal_through_check():
+    board = empty_board()
+    board["e1"] = ChessPiece(ChessPieceType.KING, WHITE, (4, 0))
+    board["h1"] = ChessPiece(ChessPieceType.ROOK, WHITE, (7, 0))
+    board["c4"] = ChessPiece(ChessPieceType.BISHOP, BLACK, (2, 3))
+    moves = board.all_legal_moves(WHITE)
+    assert "g1" not in moves.get("e1", [])

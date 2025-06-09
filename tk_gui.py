@@ -42,6 +42,8 @@ class ChessGUI:
             self.engine = Engine(depth=5)
         else:
             self.engine = None
+        # Board orientation: AI pieces always at bottom
+        self.flip = self.ai_mode and self.ai_color == BLACK
         self.square_size = 60
         self.canvas = tk.Canvas(
             self.root,
@@ -98,11 +100,14 @@ class ChessGUI:
                 color = "#EEEED2" if (x + y) % 2 == 0 else "#769656"
                 if self.last_move and square in self.last_move:
                     color = "#a8e6a3"
+                dx, dy = (x, y)
+                if self.flip:
+                    dx, dy = 7 - x, 7 - y
                 self.canvas.create_rectangle(
-                    x * self.square_size,
-                    (7 - y) * self.square_size,
-                    (x + 1) * self.square_size,
-                    (8 - y) * self.square_size,
+                    dx * self.square_size,
+                    (7 - dy) * self.square_size,
+                    (dx + 1) * self.square_size,
+                    (8 - dy) * self.square_size,
                     fill=color,
                     tags="square",
                 )
@@ -114,9 +119,12 @@ class ChessGUI:
                 piece = self.game.board.board[y][x]
                 if piece:
                     square = ChessBoard.index_to_algebraic(x, y)
+                    dx, dy = (x, y)
+                    if self.flip:
+                        dx, dy = 7 - x, 7 - y
                     self.canvas.create_text(
-                        x * self.square_size + self.square_size / 2,
-                        (7 - y) * self.square_size + self.square_size / 2,
+                        dx * self.square_size + self.square_size / 2,
+                        (7 - dy) * self.square_size + self.square_size / 2,
                         text=PIECE_UNICODE[(piece.color, piece.type)],
                         font=("Arial", int(self.square_size / 1.2)),
                         tags=("piece", square),
@@ -125,6 +133,9 @@ class ChessGUI:
     def xy_to_square(self, x: int, y: int) -> str | None:
         file = x // self.square_size
         rank = 7 - (y // self.square_size)
+        if self.flip:
+            file = 7 - file
+            rank = 7 - rank
         if 0 <= file < 8 and 0 <= rank < 8:
             return ChessBoard.index_to_algebraic(file, rank)
         return None
