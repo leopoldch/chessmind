@@ -4,7 +4,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List, DefaultDict
+
+import random
+import time
+from collections import defaultdict
 
 from models.game import ChessGame
 from models.board import ChessBoard
@@ -40,53 +44,81 @@ class TransEntry:
 class Engine:
     def __init__(self, depth: int = 3) -> None:
         self.depth = depth
-        self.tt: Dict[str, TransEntry] = {}
+        self.tt: Dict[int, TransEntry] = {}
+        self.eval_cache: Dict[Tuple[int, str], int] = {}
+
+        rng = random.Random(42)
+        # mapping from (color, piece type) -> index
+        self._piece_index = {}
+        idx = 0
+        for c in (WHITE, BLACK):
+            for t in ChessPieceType:
+                self._piece_index[(c, t)] = idx
+                idx += 1
+        self._z_table: List[List[List[int]]] = [
+            [[rng.getrandbits(64) for _ in range(8)] for _ in range(8)]
+            for _ in range(len(self._piece_index))
+        ]
+        self._z_castling = [[rng.getrandbits(64) for _ in range(2)] for _ in range(2)]
+        self._z_ep = [rng.getrandbits(64) for _ in range(8)]
+        self._z_turn = rng.getrandbits(64)
+
+        self.killer_moves: List[List[Optional[Tuple[str, str]]]] = [
+            [None, None] for _ in range(self.depth + 5)
+        ]
+        self.history_table: DefaultDict[Tuple[str, str], int] = defaultdict(int)
 
     def _order_moves(
         self,
         game: ChessGame,
         moves: Dict[str, list[str]],
         tt_move: Optional[Tuple[str, str]] = None,
+        ply: int = 0,
     ) -> list[Tuple[str, str]]:
         ordered: list[Tuple[int, Tuple[str, str]]] = []
         for start, ends in moves.items():
             for end in ends:
-                score = 0
+                score = self.history_table[(start, end)]
                 if tt_move and (start, end) == tt_move:
-                    score = 2
-                elif game.board[end] is not None:
-                    score = 1
+                    score += 10_000
+                if game.board[end] is not None:
+                    score += 5_000
+                if (start, end) in self.killer_moves[ply]:
+                    score += 7_000
                 ordered.append((score, (start, end)))
         ordered.sort(key=lambda x: x[0], reverse=True)
         return [m for _, m in ordered]
 
     # -------- state hashing ---------
-    def _hash(self, game: ChessGame) -> str:
-        board = game.board
-        rows = []
+    def _board_hash(self, board: ChessBoard) -> int:
+        h = 0
         for y in range(8):
             for x in range(8):
                 p = board.board[y][x]
-                if p is None:
-                    rows.append(".")
-                else:
-                    c = p.type.name[0]
-                    rows.append(c.upper() if p.color == WHITE else c.lower())
-        castling = (
-            ("K" if board.castling_rights[WHITE]["K"] else "")
-            + ("Q" if board.castling_rights[WHITE]["Q"] else "")
-            + ("k" if board.castling_rights[BLACK]["K"] else "")
-            + ("q" if board.castling_rights[BLACK]["Q"] else "")
-        )
-        ep = (
-            ChessBoard.index_to_algebraic(*board.en_passant_target)
-            if board.en_passant_target
-            else "-"
-        )
-        return "".join(rows) + game.current_turn[0] + castling + ep
+                if p:
+                    idx = self._piece_index[(p.color, p.type)]
+                    h ^= self._z_table[idx][y][x]
+        for c_idx, c in enumerate((WHITE, BLACK)):
+            rights = board.castling_rights[c]
+            if rights["K"]:
+                h ^= self._z_castling[c_idx][0]
+            if rights["Q"]:
+                h ^= self._z_castling[c_idx][1]
+        if board.en_passant_target:
+            h ^= self._z_ep[board.en_passant_target[0]]
+        return h
+
+    def _hash(self, game: ChessGame) -> int:
+        h = self._board_hash(game.board)
+        if game.current_turn == WHITE:
+            h ^= self._z_turn
+        return h
 
     # -------- evaluation -----------
     def evaluate(self, board: ChessBoard, color: str) -> int:
+        key = (self._board_hash(board), color)
+        if key in self.eval_cache:
+            return self.eval_cache[key]
         value = 0
         for y in range(8):
             for x in range(8):
@@ -103,6 +135,7 @@ class Engine:
             value += 1 if color == WHITE else -1
         if bk in ("g8", "c8"):
             value += 1 if color == BLACK else -1
+        self.eval_cache[key] = value
         return value
 
     # -------- quiescence search ---------
@@ -137,7 +170,7 @@ class Engine:
         return new
 
     # -------- negamax search --------
-    def negamax(self, game: ChessGame, depth: int, alpha: int, beta: int) -> Tuple[int, Optional[Tuple[str, str]]]:
+    def negamax(self, game: ChessGame, depth: int, alpha: int, beta: int, ply: int = 0) -> Tuple[int, Optional[Tuple[str, str]]]:
         key = self._hash(game)
         entry = self.tt.get(key)
         if entry and entry.depth >= depth:
@@ -155,24 +188,63 @@ class Engine:
                 return -9999 + (self.depth - depth), None
             return 0, None
         tt_move = entry.move if entry else None
-        ordered_moves = self._order_moves(game, moves, tt_move)
-        for start, end in ordered_moves:
+        ordered_moves = self._order_moves(game, moves, tt_move, ply)
+        for i, (start, end) in enumerate(ordered_moves):
+            is_capture = game.board[end] is not None
             new_game = self._clone_game(game)
             new_game.make_move(start, end)
-            score, _ = self.negamax(new_game, depth - 1, -beta, -alpha)
-            score = -score
+            reduction = 0
+            if depth > 2 and i >= 3 and not is_capture:
+                reduction = 1
+            if reduction:
+                score, _ = self.negamax(new_game, depth - 1 - reduction, -alpha - 1, -alpha, ply + 1)
+                score = -score
+                if score > alpha:
+                    score, _ = self.negamax(new_game, depth - 1, -beta, -alpha, ply + 1)
+                    score = -score
+            else:
+                score, _ = self.negamax(new_game, depth - 1, -beta, -alpha, ply + 1)
+                score = -score
             if score > best_score:
                 best_score = score
                 best_move = (start, end)
             if best_score > alpha:
                 alpha = best_score
             if alpha >= beta:
+                if not is_capture:
+                    km = self.killer_moves[ply]
+                    if (start, end) not in km:
+                        km.pop()
+                        km.insert(0, (start, end))
+                self.history_table[(start, end)] += depth * depth
                 break
 
         self.tt[key] = TransEntry(depth, best_score, best_move)
         return best_score, best_move
 
     def best_move(self, game: ChessGame) -> Tuple[str, str]:
-        _, move = self.negamax(game, self.depth, -10_000, 10_000)
-        assert move is not None
-        return move
+        start_time = time.perf_counter()
+        guess = 0
+        best_move: Optional[Tuple[str, str]] = None
+        for d in range(1, self.depth + 1):
+            window = 50
+            alpha = guess - window
+            beta = guess + window
+            while True:
+                score, move = self.negamax(game, d, alpha, beta)
+                if score <= alpha:
+                    alpha -= window
+                    window *= 2
+                    continue
+                if score >= beta:
+                    beta += window
+                    window *= 2
+                    continue
+                break
+            guess = score
+            if move:
+                best_move = move
+        end = time.perf_counter()
+        print(f"AI search depth {self.depth} took {end - start_time:.2f}s")
+        assert best_move is not None
+        return best_move

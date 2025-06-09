@@ -35,7 +35,13 @@ class ChessGUI:
         self.root = tk.Tk()
         self.root.title("ChessMind")
         self.ai_mode = messagebox.askyesno("Game Mode", "Play against AI?")
-        self.engine = Engine(depth=3) if self.ai_mode else None
+        self.ai_color = BLACK
+        if self.ai_mode:
+            if messagebox.askyesno("Choose Color", "Should AI play White?"):
+                self.ai_color = WHITE
+            self.engine = Engine(depth=3)
+        else:
+            self.engine = None
         self.square_size = 60
         self.canvas = tk.Canvas(
             self.root,
@@ -164,7 +170,7 @@ class ChessGUI:
                 messagebox.showinfo(
                     "Game Over", f"{self.game.result.capitalize()} wins"
                 )
-        elif self.ai_mode and self.game.current_turn == BLACK:
+        elif self.ai_mode and self.game.current_turn == self.ai_color:
             start, end = self.engine.best_move(self.game)
             self.game.make_move(start, end)
             if self.game.result:

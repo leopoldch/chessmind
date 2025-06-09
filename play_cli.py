@@ -13,7 +13,8 @@ def print_board(game: ChessGame) -> None:
 def main() -> None:
     game = ChessGame()
     engine = Engine()
-    human_color = WHITE
+    color_choice = input("Play as (w/b)? ").strip().lower()
+    human_color = WHITE if color_choice != "b" else BLACK
     print("Enter moves in algebraic format like e2e4")
     while not game.result:
         print_board(game)
