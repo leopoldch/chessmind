@@ -400,3 +400,6 @@ class Engine:
         assert best_move is not None
         self.depth = orig_depth
         return best_move
+
+
+Engine.TransEntry = TransEntry
