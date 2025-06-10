@@ -125,60 +125,72 @@
    * Chess.com indexe les cases de 0 à 63 de haut-gauche à bas-droite pour les blancs
    * et inverse si on joue noir (plateau flipped)
    */
-  function algebraicToSquareIndex(square, color) {
-    const file = square.charCodeAt(0) - 'a'.charCodeAt(0); // a=0 ... h=7
-    const rank = parseInt(square[1], 10) - 1; // 1=0 ... 8=7
-    if (color === 'white') {
-      return (7 - rank) * 8 + file; // chess.com: top-left=0
-    } else {
-      // inversion pour les noirs
-      return rank * 8 + (7 - file);
-    }
+  function algebraicToSquareIndex(square) {
+    const file = square.charCodeAt(0) - 'a'.charCodeAt(0) + 1; // a=1 ... h=8
+    const rank = parseInt(square[1], 10); // 1 à 8
+    return rank * 10 + file;
   }
 
-  /**
-   * Simule un mouvement drag&drop de la pièce sur Chess.com
-   */
-  function simulateMove(from, to) {
-    const color = detectColor();
-    const fromIdx = algebraicToSquareIndex(from, color);
-    const toIdx = algebraicToSquareIndex(to, color);
 
-    // Les pièces sont dans .piece[class*="square-XX"]
-    const piece = document.querySelector(`.piece[class*="square-${fromIdx}"]`);
-    // Les cases sont dans .board .square-XX
-    const toSquare = document.querySelector(`.board .square-${toIdx}`);
-
-    if (!piece || !toSquare) {
-      alert(`Impossible de trouver la pièce (${from}) ou la case cible (${to})`);
-      return;
-    }
-
-    function getCenter(el) {
-      const r = el.getBoundingClientRect();
-      return { x: r.left + r.width/2, y: r.top + r.height/2 };
-    }
-    const fromCenter = getCenter(piece);
-    const toCenter = getCenter(toSquare);
-
-    function fireMouseEvent(type, x, y, target) {
-      const evt = new MouseEvent(type, {
-        bubbles: true, cancelable: true,
-        clientX: x, clientY: y, buttons: 1, // button 0 = main bouton
-      });
-      target.dispatchEvent(evt);
-    }
-
-    // Séquence typique : mousedown (sur pièce) -> mousemove (vers case) -> mouseup (sur case)
-    fireMouseEvent('mousedown', fromCenter.x, fromCenter.y, piece);
-    // On simule le mouvement en plusieurs steps pour plus de "réalisme"
-    for (let t = 1; t <= 3; ++t) {
-      const x = fromCenter.x + (toCenter.x - fromCenter.x) * t / 3;
-      const y = fromCenter.y + (toCenter.y - fromCenter.y) * t / 3;
-      fireMouseEvent('mousemove', x, y, piece);
-    }
-    fireMouseEvent('mouseup', toCenter.x, toCenter.y, toSquare);
+function simulateMove(from, to) {
+  // 1) Récupérer la pièce à déplacer
+  const fromIdx = algebraicToSquareIndex(from);
+  const piece = document.querySelector(`.piece[class*="square-${fromIdx}"]`);
+  if (!piece) {
+    alert(`Pièce introuvable sur ${from}`);
+    return;
   }
+
+  // 2) Récupérer le plateau (élément interactif)
+  const board = document.querySelector('wc-chess-board.board');
+  if (!board) {
+    alert("Impossibilité de trouver le plateau");
+    return;
+  }
+  const rect = board.getBoundingClientRect();
+  const tileW = rect.width / 8;
+  const tileH = rect.height / 8;
+
+  // 3) Calculer les coordonnées pixel du centre de la case cible
+  const file = to.charCodeAt(0) - 'a'.charCodeAt(0);     // 0 à 7
+  const rank = parseInt(to[1], 10);                      // 1 à 8
+  const orientation = detectColor();                     // 'white' ou 'black'
+
+  let fileIdx, rankIdx;
+  if (orientation === 'white') {
+    fileIdx = file;
+    rankIdx = 8 - rank;    // rank=1 → idx=7 (bas), rank=8 → idx=0 (haut)
+  } else {
+    fileIdx = 7 - file;    // miroir horizontal
+    rankIdx = rank - 1;    // miroir vertical
+  }
+
+  const toX = rect.left + (fileIdx + 0.5) * tileW;
+  const toY = rect.top  + (rankIdx + 0.5) * tileH;
+
+  // 4) Séquence drag&drop
+  const fromBox = piece.getBoundingClientRect();
+  const fromX = fromBox.left + fromBox.width  / 2;
+  const fromY = fromBox.top  + fromBox.height / 2;
+
+  function fireMouse(type, x, y, target) {
+    const evt = new MouseEvent(type, {
+      bubbles: true, cancelable: true,
+      clientX: x, clientY: y, buttons: 1
+    });
+    target.dispatchEvent(evt);
+  }
+
+  fireMouse('mousedown', fromX, fromY, piece);
+  // quelques mousemove intermédiaires pour plus de réalisme
+  for (let t = 1; t <= 3; t++) {
+    const ix = fromX + (toX - fromX) * t / 3;
+    const iy = fromY + (toY - fromY) * t / 3;
+    fireMouse('mousemove', ix, iy, board);
+  }
+  fireMouse('mouseup', toX, toY, board);
+}
+
 
   function onMessage(evt) {
     let data;
