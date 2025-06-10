@@ -1,5 +1,6 @@
 (function() {
-  const WS_URL = 'ws://localhost:8765';
+  const port = 8771;
+  const WS_URL = 'ws://localhost:'+port;
   let ws;
   let lastMoves = [];
   let gameStarted = false;
@@ -127,9 +128,10 @@
    */
   function algebraicToSquareIndex(square) {
     const file = square.charCodeAt(0) - 'a'.charCodeAt(0) + 1; // a=1 ... h=8
-    const rank = parseInt(square[1], 10); // 1 à 8
-    return rank * 10 + file;
+    const rank = parseInt(square[1], 10);                     // 1 à 8
+    return file * 10 + rank;  // file=4, rank=7 → 4*10+7 = 47 pour "d7"
   }
+
 
 
 function simulateMove(from, to) {
