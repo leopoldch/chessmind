@@ -38,7 +38,7 @@ cpdef int quiescence_cython(object engine, object board, int alpha, int beta, st
 @cython.boundscheck(False)
 @cython.wraparound(False)
 cpdef tuple negamax_cython(object engine, object board, str color, int depth, int alpha, int beta, int ply):
-    cdef int key = engine._hash(board, color)
+    cdef unsigned long long key = engine._hash(board, color)
     cdef object entry = engine.tt.get(key)
     cdef str next_color
     cdef int score
