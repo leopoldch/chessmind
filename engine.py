@@ -21,6 +21,12 @@ try:
 except Exception:  # pragma: no cover - optional Cython extension
     order_moves_cython = None
 
+try:
+    from engine_cython.search_speedups import negamax_cython, quiescence_cython
+except Exception:  # pragma: no cover - optional Cython extension
+    negamax_cython = None
+    quiescence_cython = None
+
 from models.game import ChessGame
 from models.board import ChessBoard
 from models.pieces import (
@@ -190,6 +196,8 @@ class Engine:
 
     # -------- quiescence search ---------
     def quiescence(self, board: ChessBoard, alpha: int, beta: int, color: str) -> int:
+        if quiescence_cython is not None:
+            return quiescence_cython(self, board, alpha, beta, color)
         stand = self.evaluate(board, color)
         if stand >= beta:
             return beta
@@ -214,6 +222,9 @@ class Engine:
 
     # -------- negamax search --------
     def negamax(self, board: ChessBoard, color: str, depth: int, alpha: int, beta: int, ply: int = 0) -> Tuple[int, Optional[Tuple[str, str]]]:
+        if negamax_cython is not None:
+            return negamax_cython(self, board, color, depth, alpha, beta, ply)
+
         key = self._hash(board, color)
         entry = self.tt.get(key)
         if entry and entry.depth >= depth:

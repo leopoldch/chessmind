@@ -50,7 +50,7 @@ notation.
 
 ## Cython acceleration
 
-A small set of Cython extensions speed up move ordering and board evaluation.
+A small set of Cython extensions speed up move ordering, board evaluation and search.
 After installing dependencies run:
 
 ```bash
