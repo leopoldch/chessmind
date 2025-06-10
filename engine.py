@@ -134,6 +134,13 @@ class Engine:
                     value += PIECE_VALUES[p.type] * mul
                     if (x, y) in CENTER_SQUARES:
                         value += mul
+                    if p.type == ChessPieceType.PAWN:
+                        advance = y if p.color == WHITE else 7 - y
+                        value += (advance // 2) * mul
+                        if (p.color == WHITE and y == 6) or (
+                            p.color == BLACK and y == 1
+                        ):
+                            value += 3 * mul
         # simple king safety: reward castled positions
         wk = board._king_square(WHITE)
         bk = board._king_square(BLACK)
@@ -141,6 +148,10 @@ class Engine:
             value += 1 if color == WHITE else -1
         if bk in ("g8", "c8"):
             value += 1 if color == BLACK else -1
+        if board.in_check(BLACK if color == WHITE else WHITE):
+            value += 1
+        if board.in_check(color):
+            value -= 1
         self.eval_cache[key] = value
         return value
 
@@ -191,17 +202,41 @@ class Engine:
         for i, (start, end) in enumerate(ordered_moves):
             is_capture = board[end] is not None
             state = board.make_move_state(start, end)
+            next_color = BLACK if color == WHITE else WHITE
+            gives_check = board.in_check(next_color)
             reduction = 0
             if depth > 2 and i >= 3 and not is_capture:
                 reduction = 1
+            ext_depth = depth - 1 + (1 if gives_check else 0)
             if reduction:
-                score, _ = self.negamax(board, BLACK if color == WHITE else WHITE, depth - 1 - reduction, -alpha - 1, -alpha, ply + 1)
+                score, _ = self.negamax(
+                    board,
+                    next_color,
+                    ext_depth - reduction,
+                    -alpha - 1,
+                    -alpha,
+                    ply + 1,
+                )
                 score = -score
                 if score > alpha:
-                    score, _ = self.negamax(board, BLACK if color == WHITE else WHITE, depth - 1, -beta, -alpha, ply + 1)
+                    score, _ = self.negamax(
+                        board,
+                        next_color,
+                        ext_depth,
+                        -beta,
+                        -alpha,
+                        ply + 1,
+                    )
                     score = -score
             else:
-                score, _ = self.negamax(board, BLACK if color == WHITE else WHITE, depth - 1, -beta, -alpha, ply + 1)
+                score, _ = self.negamax(
+                    board,
+                    next_color,
+                    ext_depth,
+                    -beta,
+                    -alpha,
+                    ply + 1,
+                )
                 score = -score
             if score > best_score:
                 best_score = score
