@@ -4,7 +4,9 @@ from typing import Tuple, Optional
 from models.game import ChessGame
 from models.pieces import WHITE, BLACK, ChessPieceType
 
-SAN_REGEX = re.compile(r'^([NBRQK])?([a-h])?([1-8])?[x-]?([a-h][1-8])(=?[NBRQK])?[+#]?$', re.I)
+SAN_REGEX = re.compile(
+    r'^([NBRQK])?([a-h])?([1-8])?[x-]?([a-h][1-8])(=?[NBRQK])?[+#]?$', re.I
+)
 
 PIECE_MAP = {
     None: ChessPieceType.PAWN,
@@ -39,6 +41,15 @@ def parse_san(game: ChessGame, san: str, color: str) -> Tuple[str, str, Optional
     if not m:
         raise ValueError(f"cannot parse SAN: {san}")
     piece_letter, dfile, drank, dest, promo = m.groups()
+    # If the first group is a lowercase file letter, it actually refers to a
+    # pawn move rather than a piece designator. This happens for moves like
+    # "bxc6" where the regex would otherwise interpret the leading "b" as a
+    # bishop.  Treat such cases as no piece letter and use it as the file
+    # disambiguator instead.
+    if piece_letter and piece_letter.islower() and piece_letter in "abcdefgh" and not dfile:
+        dfile = piece_letter
+        piece_letter = None
+
     piece_type = PIECE_MAP[piece_letter.upper() if piece_letter else None]
     dis_file = dfile
     dis_rank = drank

@@ -31,3 +31,21 @@ def test_parse_castle():
     assert (s, e) == ("e1", "g1")
     assert p is None
 
+
+def test_parse_pawn_capture_with_file_start():
+    game = ChessGame()
+    # Clear board and set up custom position
+    board = game.board
+    for y in range(8):
+        for x in range(8):
+            board.board[y][x] = None
+    from models.pieces import ChessPiece, ChessPieceType
+    board.bitboards = {WHITE: {t: 0 for t in ChessPieceType}, BLACK: {t: 0 for t in ChessPieceType}}
+    board["b5"] = ChessPiece(ChessPieceType.PAWN, WHITE, (1, 4))
+    board["c6"] = ChessPiece(ChessPieceType.KNIGHT, BLACK, (2, 5))
+    game.current_turn = WHITE
+
+    start, end, promo = parse_san(game, "bxc6", WHITE)
+    assert (start, end) == ("b5", "c6")
+    assert promo is None
+
