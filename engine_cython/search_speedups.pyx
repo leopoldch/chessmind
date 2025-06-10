@@ -40,6 +40,8 @@ cpdef int quiescence_cython(object engine, object board, int alpha, int beta, st
 cpdef tuple negamax_cython(object engine, object board, str color, int depth, int alpha, int beta, int ply):
     cdef int key = engine._hash(board, color)
     cdef object entry = engine.tt.get(key)
+    cdef str next_color
+    cdef int score
     if entry is not None and entry.depth >= depth:
         return entry.score, entry.move
 
@@ -69,11 +71,9 @@ cpdef tuple negamax_cython(object engine, object board, str color, int depth, in
     cdef object end
     cdef bint is_capture
     cdef object state
-    cdef str next_color
     cdef bint gives_check
     cdef int reduction
     cdef int ext_depth
-    cdef int score
     for start, end in ordered_moves:
         is_capture = board[end] is not None
         state = board.make_move_state(start, end)
