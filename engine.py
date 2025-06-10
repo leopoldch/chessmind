@@ -101,7 +101,7 @@ class Engine:
                 board,
                 moves,
                 self.killer_moves,
-                self.history_table,
+                dict(self.history_table),
                 PIECE_VALUES,
                 tt_move,
                 ply,
