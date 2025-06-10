@@ -448,6 +448,18 @@ class ChessBoard:
                 bb &= bb - 1
         return res
 
+    def piece_count(self, piece_type: ChessPieceType, color: str | None = None) -> int:
+        """Return the number of pieces of the given type on the board.
+
+        If ``color`` is provided, only pieces of that color are counted.
+        """
+        if color is not None:
+            return self.bitboards[color][piece_type].bit_count()
+        return (
+            self.bitboards[WHITE][piece_type].bit_count()
+            + self.bitboards[BLACK][piece_type].bit_count()
+        )
+
     # ── ASCII board ─────────────────────────────────────────────────
     def __repr__(self) -> str:
         rows = []

@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import random
 import time
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 
 from models.game import ChessGame
 from models.board import ChessBoard
@@ -47,7 +47,8 @@ class Engine:
         self.depth = depth
         self.threads = threads
         self.tt: Dict[int, TransEntry] = {}
-        self.eval_cache: Dict[Tuple[int, str], int] = {}
+        self.eval_cache: OrderedDict[Tuple[int, str], int] = OrderedDict()
+        self._eval_cache_size = 10000
         self.move_times: List[float] = []
 
         rng = random.Random(42)
@@ -126,6 +127,7 @@ class Engine:
     def evaluate(self, board: ChessBoard, color: str) -> int:
         key = (self._board_hash(board), color)
         if key in self.eval_cache:
+            self.eval_cache.move_to_end(key)
             return self.eval_cache[key]
         value = 0
         for y in range(8):
@@ -155,6 +157,9 @@ class Engine:
         if board.in_check(color):
             value -= 1
         self.eval_cache[key] = value
+        self.eval_cache.move_to_end(key)
+        if len(self.eval_cache) > self._eval_cache_size:
+            self.eval_cache.popitem(last=False)
         return value
 
     # -------- quiescence search ---------
@@ -298,6 +303,13 @@ class Engine:
         if len(self.move_times) >= 10 and all(t < 2 for t in self.move_times[-10:]):
             extra_depth = 2
 
+        orig_depth = self.depth
+        queen_count = game.board.piece_count(ChessPieceType.QUEEN)
+        if queen_count == 1 and self.depth < 5:
+            self.depth = 5
+        elif queen_count == 0 and self.depth < 7:
+            self.depth = 7
+
         start_time = time.perf_counter()
         guess = 0
         best_move: Optional[Tuple[str, str]] = None
@@ -333,4 +345,5 @@ class Engine:
         if len(self.move_times) > 10:
             self.move_times.pop(0)
         assert best_move is not None
+        self.depth = orig_depth
         return best_move
