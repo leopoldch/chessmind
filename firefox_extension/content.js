@@ -4,6 +4,7 @@
   let lastMoves = [];
   let gameStarted = false;
   let observer = null;
+  let myColor = null;
 
   if (!/^\/game\/[^\/]+$/.test(window.location.pathname)) return;
 
@@ -23,7 +24,7 @@
   function connect() {
     ws = new WebSocket(WS_URL);
     ws.addEventListener('open', () => {
-      const myColor = detectColor();
+      myColor = detectColor();
       ws.send(JSON.stringify({ type: 'color', color: myColor }));
       // Envoi immédiat de la liste des coups présents
       sendMoves(getAllMoves());
@@ -50,11 +51,12 @@
     document.querySelectorAll('.timestamps-with-base-time .main-line-row').forEach(row => {
       for (const side of ['white', 'black']) {
         const node = row.querySelector(`.${side}-move .node-highlight-content`);
-        if (node) moves.push(parseMove(node));
+        if (node) moves.push({ move: parseMove(node), color: side });
       }
     });
     return moves;
   }
+
 
   function parseMove(node) {
     const figurine = node.querySelector('.icon-font-chess');
@@ -79,20 +81,32 @@
   function observeMoves() {
     const container = document.querySelector('.timestamps-with-base-time');
     if (!container) return;
-    if (observer) observer.disconnect(); // Securité : on évite les doublons
+    if (observer) observer.disconnect();
+
     observer = new MutationObserver(() => {
       const currentMoves = getAllMoves();
+      // Détection des nouveaux coups uniquement
       for (let i = lastMoves.length; i < currentMoves.length; i++) {
-        const move = currentMoves[i];
-        sendNewMove(move);
+        const { move, color } = currentMoves[i];
+        if (color !== myColor) { // On n’envoie que les coups de l’adversaire
+          sendNewMove(move);
+        }
       }
-      // Toujours mettre à jour lastMoves (sinon perte de synchro)
       lastMoves = currentMoves;
     });
+
     observer.observe(container, { childList: true, subtree: true });
-    // Envoi aussi à l'init, au cas où la partie a déjà des coups
-    sendMoves(getAllMoves());
+    // A l'init, envoie aussi les coups de l'adversaire déjà joués
+    const currentMoves = getAllMoves();
+    for (let i = lastMoves.length; i < currentMoves.length; i++) {
+      const { move, color } = currentMoves[i];
+      if (color !== myColor) {
+        sendNewMove(move);
+      }
+    }
+    lastMoves = currentMoves;
   }
+
 
   function onMessage(evt) {
     try {
