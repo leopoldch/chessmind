@@ -3,6 +3,9 @@ from Cython.Build import cythonize
 import numpy as np
 
 setup(
-    ext_modules=cythonize('engine_cython/speedups.pyx', language_level=3),
+    ext_modules=cythonize([
+        'engine_cython/speedups.pyx',
+        'engine_cython/eval_speedups.pyx',
+    ], language_level=3),
     include_dirs=[np.get_include()],
 )

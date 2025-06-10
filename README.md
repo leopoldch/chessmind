@@ -50,12 +50,19 @@ notation.
 
 ## Cython acceleration
 
-A small Cython extension is provided to speed up move ordering. After installing dependencies run:
+A small set of Cython extensions speed up move ordering and board evaluation.
+After installing dependencies run:
 
 ```bash
 pip install cython numpy
 python setup.py build_ext --inplace
 ```
 
-This step compiles the `engine_cython/speedups.pyx` module which the engine uses automatically if available.
+This step compiles the modules in `engine_cython/` which the engine uses
+automatically if available.
+
+## Profiling
+
+Run `python profile_engine.py` to produce a simple `cProfile` report of the
+engine searching for a move from the initial position.
 
