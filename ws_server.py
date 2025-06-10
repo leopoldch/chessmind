@@ -65,31 +65,47 @@ async def handle_client(ws: websockets.WebSocketServerProtocol) -> None:
                 game = ChessGame()
                 last_len = 0
                 if ai_color == WHITE and game.current_turn == WHITE:
-                    start, end = engine.best_move(game)
+                    # Fixed opening move when playing white
+                    start, end = "d2", "d4"
                     game.make_move(start, end)
+                    last_len = 1
                     await ws.send(start + end)
                 continue
 
-            if data.get("type") != "moves":
-                print(f"Unknown message type: {data.get('type')}")
+            msg_type = data.get("type")
+            if msg_type == "move":
+                move = str(data.get("move", "")).replace("+", "")
+                if _is_coordinate(move):
+                    start, end = move[:2], move[2:4]
+                    promo: Optional[ChessPieceType] = None
+                else:
+                    try:
+                        start, end, promo = parse_san(game, move, game.current_turn)
+                    except ValueError:
+                        print(f"Could not parse move '{move}', ignoring.")
+                        continue
+                game.make_move(start, end, (lambda p=promo: p) if promo else None)
+                last_len += 1
+            elif msg_type == "moves":
+                moves = [m.replace("+", "") for m in data.get("moves", [])]
+                if len(moves) == last_len:
+                    continue
+                print(f"Received moves: {moves}")
+                # rebuild game from scratch to handle reconnects
+                game = ChessGame()
+                color = WHITE
+                for m in moves:
+                    try:
+                        s, e, promo = parse_san(game, m, color)
+                    except ValueError:
+                        print(f"Could not parse move '{m}', stopping replay.")
+                        return
+                    game.make_move(s, e, (lambda p=promo: p) if promo else None)
+                    color = BLACK if color == WHITE else WHITE
+                last_len = len(moves)
+            else:
+                print(f"Unknown message type: {msg_type}")
                 continue
-
-            moves = [m.replace("+", "") for m in data.get("moves", [])]
-            if len(moves) == last_len:
-                continue
-            print(f"Received moves: {moves}")
-            # rebuild game from scratch to handle reconnects
-            game = ChessGame()
-            color = WHITE
-            for m in moves:
-                try:
-                    s, e, promo = parse_san(game, m, color)
-                except ValueError:
-                    print(f"Could not parse move '{m}', stopping replay.")
-                    return
-                game.make_move(s, e, (lambda p=promo: p) if promo else None)
-                color = BLACK if color == WHITE else WHITE
-            last_len = len(moves)
 
         if ai_color is None:
             continue
