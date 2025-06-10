@@ -12,7 +12,20 @@
     if (node && node.dataset && node.dataset.uci) {
       return node.dataset.uci;
     }
-    return node ? node.textContent.trim() : '';
+
+    // For boards that don't expose the UCI data attribute, fall back to
+    // reconstructing the SAN move from the displayed figurine and text.
+    const figurine = node ? node.querySelector('.icon-font-chess') : null;
+    let piece = '';
+    if (figurine && figurine.dataset) {
+      piece = figurine.dataset.figurine || '';
+    }
+    const rawText = node ? node.textContent : '';
+    const casePart = rawText.replace(/[\u2654-\u265F]/g, '').trim().replace(/\s+/g, '');
+    if (piece || casePart) {
+      return (piece ? piece : '') + casePart;
+    }
+    return '';
   }
 
   if (!/^\/game\/[^\/]+$/.test(window.location.pathname)) return;
