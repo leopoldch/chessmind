@@ -13,6 +13,7 @@ cpdef int evaluate_board_cython(object board, str color, dict piece_values):
     cdef int x, y
     cdef object p
     cdef int mul
+    cdef int advance
     for y in range(8):
         for x in range(8):
             p = board.board[y][x]

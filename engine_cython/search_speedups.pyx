@@ -1,5 +1,7 @@
 # cython: language_level=3
 import cython
+cimport cython
+from libc.stdint cimport uint64_t
 from models.pieces import WHITE, BLACK
 
 @cython.boundscheck(False)
@@ -38,7 +40,7 @@ cpdef int quiescence_cython(object engine, object board, int alpha, int beta, st
 @cython.boundscheck(False)
 @cython.wraparound(False)
 cpdef tuple negamax_cython(object engine, object board, str color, int depth, int alpha, int beta, int ply):
-    cdef unsigned long long key = engine._hash(board, color)
+    cdef uint64_t key = engine._hash(board, color)
     cdef object entry = engine.tt.get(key)
     cdef str next_color
     cdef int score
