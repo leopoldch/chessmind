@@ -162,66 +162,55 @@
     return file * 10 + rank;  // file=4, rank=7 → 4*10+7 = 47 pour "d7"
   }
 
-
-
-function simulateMove(from, to) {
-  // 1) Récupérer la pièce à déplacer
-  const fromIdx = algebraicToSquareIndex(from);
-  const piece = document.querySelector(`.piece[class*="square-${fromIdx}"]`);
-  if (!piece) {
-    alert(`Pièce introuvable sur ${from}`);
-    return;
+  function clickSquare(idx, square) {
+    const sq = document.querySelector(`.square-${idx}`);
+    if (sq) {
+      console.log(`Clicking square: ${square} (index: ${idx})`);
+      const { left, top, width, height } = sq.getBoundingClientRect();
+      const x = left + width  / 2;
+      const y = top  + height / 2;
+      const clickEvt = new MouseEvent('click', {
+        bubbles: true, cancelable: true,
+        clientX: x, clientY: y
+      });
+      sq.dispatchEvent(clickEvt);
+      console.log(`Clicked square: ${square} at (${x}, ${y})`);
+    } else {
+      console.warn(`Square not found: ${square} (index: ${idx})`);
+      console.warn(`Falling back to click on board for square: ${square}`);
+      console.warn(`Square index: ${idx}`);
+      console.warn(`Square coordinates: ${JSON.stringify(sq ? sq.getBoundingClientRect() : {})}`);
+      // fallback : cliquer sur les coordonnées du plateau
+      const board = document.querySelector('wc-chess-board.board');
+      const rect = board.getBoundingClientRect();
+      const file = square.charCodeAt(0) - 'a'.charCodeAt(0);   // 0..7
+      const rank = parseInt(square[1], 10);                    // 1..8
+      const orientation = detectColor();
+      let fileIdx, rankIdx;
+      if (orientation === 'white') {
+        fileIdx = file;
+        rankIdx = 8 - rank;
+      } else {
+        fileIdx = 7 - file;
+        rankIdx = rank - 1;
+      }
+      const x = rect.left + (fileIdx + 0.5) * (rect.width / 8);
+      const y = rect.top  + (rankIdx + 0.5) * (rect.height / 8);
+      const clickEvt = new MouseEvent('click', {
+        bubbles: true, cancelable: true,
+        clientX: x, clientY: y
+      });
+      board.dispatchEvent(clickEvt);
+    }
   }
 
-  // 2) Récupérer le plateau (élément interactif)
-  const board = document.querySelector('wc-chess-board.board');
-  if (!board) {
-    alert("Impossibilité de trouver le plateau");
-    return;
-  }
-  const rect = board.getBoundingClientRect();
-  const tileW = rect.width / 8;
-  const tileH = rect.height / 8;
-
-  // 3) Calculer les coordonnées pixel du centre de la case cible
-  const file = to.charCodeAt(0) - 'a'.charCodeAt(0);     // 0 à 7
-  const rank = parseInt(to[1], 10);                      // 1 à 8
-  const orientation = detectColor();                     // 'white' ou 'black'
-
-  let fileIdx, rankIdx;
-  if (orientation === 'white') {
-    fileIdx = file;
-    rankIdx = 8 - rank;    // rank=1 → idx=7 (bas), rank=8 → idx=0 (haut)
-  } else {
-    fileIdx = 7 - file;    // miroir horizontal
-    rankIdx = rank - 1;    // miroir vertical
+  function simulateMove(from, to) {
+    const fromIdx = algebraicToSquareIndex(from);
+    const toIdx   = algebraicToSquareIndex(to);
+    clickSquare(fromIdx, from);
+    //setTimeout(() => clickSquare(toIdx, to), 100);
   }
 
-  const toX = rect.left + (fileIdx + 0.5) * tileW;
-  const toY = rect.top  + (rankIdx + 0.5) * tileH;
-
-  // 4) Séquence drag&drop
-  const fromBox = piece.getBoundingClientRect();
-  const fromX = fromBox.left + fromBox.width  / 2;
-  const fromY = fromBox.top  + fromBox.height / 2;
-
-  function fireMouse(type, x, y, target) {
-    const evt = new MouseEvent(type, {
-      bubbles: true, cancelable: true,
-      clientX: x, clientY: y, buttons: 1
-    });
-    target.dispatchEvent(evt);
-  }
-
-  fireMouse('mousedown', fromX, fromY, piece);
-  // quelques mousemove intermédiaires pour plus de réalisme
-  for (let t = 1; t <= 3; t++) {
-    const ix = fromX + (toX - fromX) * t / 3;
-    const iy = fromY + (toY - fromY) * t / 3;
-    fireMouse('mousemove', ix, iy, board);
-  }
-  fireMouse('mouseup', toX, toY, board);
-}
 
 
   function onMessage(evt) {
