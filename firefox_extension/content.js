@@ -6,6 +6,7 @@
   let gameStarted = false;
   let observer = null;
   let myColor = null;
+  let shouldReconnect = false;
 
   function parseMove(node) {
     if (node && node.dataset && node.dataset.uci) {
@@ -16,25 +17,38 @@
 
   if (!/^\/game\/[^\/]+$/.test(window.location.pathname)) return;
 
-  // Écoute du message venant de la popup pour démarrer la partie
+  // Écoute du message venant de la popup pour démarrer/arrêter la partie
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg.action === 'start_game') {
       startGame();
+    } else if (msg.action === 'stop_game') {
+      stopGame();
     }
   });
 
   function startGame() {
     if (gameStarted) return;
     gameStarted = true;
+    shouldReconnect = true;
     connect();
-    window.addEventListener('beforeunload', () => {
-      if (ws) {
-        try { ws.close(); } catch (e) {}
-      }
-    });
+    window.addEventListener('beforeunload', stopGame);
+  }
+
+  function stopGame() {
+    shouldReconnect = false;
+    gameStarted = false;
+    if (observer) {
+      observer.disconnect();
+      observer = null;
+    }
+    if (ws) {
+      try { ws.close(); } catch (e) {}
+      ws = null;
+    }
   }
 
   function connect() {
+      if (!shouldReconnect) return;
       if (ws && ws.readyState !== WebSocket.CLOSED) {
         try { ws.close(); } catch (e) {}
       }
@@ -47,7 +61,10 @@
           observeMoves();
       });
       ws.addEventListener('message', onMessage);
-      ws.addEventListener('close', () => setTimeout(connect, 1000));
+      ws.addEventListener('close', () => {
+        ws = null;
+        if (shouldReconnect) setTimeout(connect, 1000);
+      });
       ws.addEventListener('error', () => {
         if (ws && ws.readyState !== WebSocket.CLOSED) {
           ws.close();
