@@ -5,3 +5,10 @@ document.getElementById('start-game').onclick = () => {
     document.getElementById('status').textContent = "Partie démarrée !";
   });
 };
+
+document.getElementById('stop-game').onclick = () => {
+  chrome.tabs.query({active: true, currentWindow: true}, (tabs) => {
+    chrome.tabs.sendMessage(tabs[0].id, {action: 'stop_game'});
+    document.getElementById('status').textContent = "Partie stoppée";
+  });
+};
