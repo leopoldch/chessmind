@@ -78,6 +78,8 @@ class Engine:
         tt_move: Optional[Tuple[str, str]] = None,
         ply: int = 0,
     ) -> list[Tuple[str, str]]:
+        if ply >= len(self.killer_moves):
+            self.killer_moves.extend([[None, None] for _ in range(ply - len(self.killer_moves) + 1)])
         ordered: list[Tuple[int, Tuple[str, str]]] = []
         for start, ends in moves.items():
             for end in ends:
@@ -245,6 +247,8 @@ class Engine:
                 alpha = best_score
             if alpha >= beta:
                 if not is_capture:
+                    if ply >= len(self.killer_moves):
+                        self.killer_moves.extend([[None, None] for _ in range(ply - len(self.killer_moves) + 1)])
                     km = self.killer_moves[ply]
                     if (start, end) not in km:
                         km.pop()
