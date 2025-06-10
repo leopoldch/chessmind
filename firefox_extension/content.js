@@ -6,6 +6,13 @@
   let observer = null;
   let myColor = null;
 
+  function parseMove(node) {
+    if (node && node.dataset && node.dataset.uci) {
+      return node.dataset.uci;
+    }
+    return node ? node.textContent.trim() : '';
+  }
+
   if (!/^\/game\/[^\/]+$/.test(window.location.pathname)) return;
 
   // Écoute du message venant de la popup pour démarrer la partie
@@ -19,19 +26,32 @@
     if (gameStarted) return;
     gameStarted = true;
     connect();
+    window.addEventListener('beforeunload', () => {
+      if (ws) {
+        try { ws.close(); } catch (e) {}
+      }
+    });
   }
 
   function connect() {
+      if (ws && ws.readyState !== WebSocket.CLOSED) {
+        try { ws.close(); } catch (e) {}
+      }
       ws = new WebSocket(WS_URL);
       ws.addEventListener('open', () => {
           myColor = detectColor();
           ws.send(JSON.stringify({ type: 'color', color: myColor }));
-      // Envoi immédiat de la liste des coups présents
+          // Envoi immédiat de la liste des coups présents
           sendMoves(getAllMoves());
           observeMoves();
       });
       ws.addEventListener('message', onMessage);
-    ws.addEventListener('close', () => setTimeout(connect, 1000));
+      ws.addEventListener('close', () => setTimeout(connect, 1000));
+      ws.addEventListener('error', () => {
+        if (ws && ws.readyState !== WebSocket.CLOSED) {
+          ws.close();
+        }
+      });
   }
 
   function detectColor() {
@@ -161,26 +181,33 @@
   }
 
   function onMessage(evt) {
+    let data;
     try {
-      const data = JSON.parse(evt.data);
+      data = JSON.parse(evt.data);
+    } catch {
+      data = evt.data;
+    }
+
+    if (typeof data === 'object' && data !== null) {
       if (data.result) {
         alert(`Partie terminée : ${data.result}`);
         return;
-      } 
-      console.log(`Message reçu : ${evt.data}`);
-      // Cas 1 : reçoit coup "d2d4" pour jouer
-      if (typeof data === "string" && /^[a-h][1-8][a-h][1-8]$/.test(data)) {
-        const from = data.slice(0, 2);
-        const to = data.slice(2, 4);
-        simulateMove(from, to);
-      } else if (data.next_move && /^[a-h][1-8][a-h][1-8]$/.test(data.next_move)) {
+      }
+      if (data.next_move && /^[a-h][1-8][a-h][1-8]$/.test(data.next_move)) {
         const from = data.next_move.slice(0, 2);
         const to = data.next_move.slice(2, 4);
         simulateMove(from, to);
-      } else {
-        alert(`Prochain coup reçu : ${evt.data}`);
+        return;
       }
-    } catch {
+      alert(`Prochain coup reçu : ${evt.data}`);
+      return;
+    }
+
+    if (typeof data === 'string' && /^[a-h][1-8][a-h][1-8]$/.test(data)) {
+      const from = data.slice(0, 2);
+      const to = data.slice(2, 4);
+      simulateMove(from, to);
+    } else {
       alert(`Prochain coup reçu : ${evt.data}`);
     }
   }
