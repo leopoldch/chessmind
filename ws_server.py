@@ -87,22 +87,27 @@ async def handle_client(ws: websockets.WebSocketServerProtocol) -> None:
                 game.make_move(start, end, (lambda p=promo: p) if promo else None)
                 last_len += 1
             elif msg_type == "moves":
-                moves = [m.replace("+", "") for m in data.get("moves", [])]
-                if len(moves) == last_len:
+                raw_moves = data.get("moves", [])
+                if len(raw_moves) == last_len:
                     continue
-                print(f"Received moves: {moves}")
+                print(f"Received moves: {raw_moves}")
                 # rebuild game from scratch to handle reconnects
                 game = ChessGame()
-                color = WHITE
-                for m in moves:
+                for entry in raw_moves:
+                    if isinstance(entry, dict):
+                        move_str = str(entry.get("move", "")).replace("+", "")
+                        color_str = str(entry.get("color", "white")).lower()
+                        color = WHITE if color_str.startswith("w") else BLACK
+                    else:
+                        move_str = str(entry).replace("+", "")
+                        color = game.current_turn
                     try:
-                        s, e, promo = parse_san(game, m, color)
+                        s, e, promo = parse_san(game, move_str, color)
                     except ValueError:
-                        print(f"Could not parse move '{m}', stopping replay.")
+                        print(f"Could not parse move '{entry}', stopping replay.")
                         return
                     game.make_move(s, e, (lambda p=promo: p) if promo else None)
-                    color = BLACK if color == WHITE else WHITE
-                last_len = len(moves)
+                last_len = len(raw_moves)
             else:
                 print(f"Unknown message type: {msg_type}")
                 continue
