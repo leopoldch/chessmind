@@ -39,7 +39,7 @@ class ChessGUI:
         if self.ai_mode:
             if messagebox.askyesno("Choose Color", "Should AI play White?"):
                 self.ai_color = WHITE
-            self.engine = Engine(depth=5)
+            self.engine = Engine(depth=4)
         else:
             self.engine = None
         # Board orientation: AI pieces always at bottom

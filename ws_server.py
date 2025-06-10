@@ -77,7 +77,7 @@ async def handle_client(ws: websockets.WebSocketServerProtocol) -> None:
             moves = [m.replace("+", "") for m in data.get("moves", [])]
             if len(moves) == last_len:
                 continue
-
+            print(f"Received moves: {moves}")
             # rebuild game from scratch to handle reconnects
             game = ChessGame()
             color = WHITE
