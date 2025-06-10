@@ -8,6 +8,8 @@ Use [Poetry](https://python-poetry.org/) to manage dependencies. Install them wi
 
 ```bash
 poetry install --no-root
+pip install cython numpy
+python setup.py build_ext --inplace
 ```
 
 ## Running the GUI
@@ -45,3 +47,15 @@ The client should send "white" or "black" to choose the AI color. Then send move
 either in coordinate format like `e2e4` or in standard algebraic notation (e.g.
 `Nf3`, `O-O`). The server replies with the engine's move using coordinate
 notation.
+
+## Cython acceleration
+
+A small Cython extension is provided to speed up move ordering. After installing dependencies run:
+
+```bash
+pip install cython numpy
+python setup.py build_ext --inplace
+```
+
+This step compiles the `engine_cython/speedups.pyx` module which the engine uses automatically if available.
+

@@ -11,6 +11,11 @@ import random
 import time
 from collections import defaultdict, OrderedDict
 
+try:
+    from engine_cython.speedups import order_moves_cython
+except Exception:  # pragma: no cover - optional Cython extension
+    order_moves_cython = None
+
 from models.game import ChessGame
 from models.board import ChessBoard
 from models.pieces import (
@@ -46,7 +51,8 @@ class Engine:
     def __init__(self, depth: int = 3, threads: int = 1) -> None:
         self.depth = depth
         self.threads = threads
-        self.tt: Dict[int, TransEntry] = {}
+        self.tt: OrderedDict[int, TransEntry] = OrderedDict()
+        self._tt_size = 50000
         self.eval_cache: OrderedDict[Tuple[int, str], int] = OrderedDict()
         self._eval_cache_size = 10000
         self.move_times: List[float] = []
@@ -79,8 +85,20 @@ class Engine:
         tt_move: Optional[Tuple[str, str]] = None,
         ply: int = 0,
     ) -> list[Tuple[str, str]]:
+        if order_moves_cython is not None:
+            return order_moves_cython(
+                board,
+                moves,
+                self.killer_moves,
+                self.history_table,
+                PIECE_VALUES,
+                tt_move,
+                ply,
+            )
         if ply >= len(self.killer_moves):
-            self.killer_moves.extend([[None, None] for _ in range(ply - len(self.killer_moves) + 1)])
+            self.killer_moves.extend(
+                [[None, None] for _ in range(ply - len(self.killer_moves) + 1)]
+            )
         ordered: list[Tuple[int, Tuple[str, str]]] = []
         for start, ends in moves.items():
             for end in ends:
@@ -276,6 +294,9 @@ class Engine:
             board.unmake_move(state)
 
         self.tt[key] = TransEntry(depth, best_score, best_move)
+        self.tt.move_to_end(key)
+        if len(self.tt) > self._tt_size:
+            self.tt.popitem(last=False)
         return best_score, best_move
 
     def _negamax_root_parallel(
