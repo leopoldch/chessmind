@@ -12,6 +12,11 @@ import time
 from collections import defaultdict, OrderedDict
 
 try:
+    from engine_cython.eval_speedups import evaluate_board_cython
+except Exception:  # pragma: no cover - optional Cython extension
+    evaluate_board_cython = None
+
+try:
     from engine_cython.speedups import order_moves_cython
 except Exception:  # pragma: no cover - optional Cython extension
     order_moves_cython = None
@@ -147,33 +152,36 @@ class Engine:
         if key in self.eval_cache:
             self.eval_cache.move_to_end(key)
             return self.eval_cache[key]
-        value = 0
-        for y in range(8):
-            for x in range(8):
-                p = board.board[y][x]
-                if p:
-                    mul = 1 if p.color == color else -1
-                    value += PIECE_VALUES[p.type] * mul
-                    if (x, y) in CENTER_SQUARES:
-                        value += mul
-                    if p.type == ChessPieceType.PAWN:
-                        advance = y if p.color == WHITE else 7 - y
-                        value += (advance // 2) * mul
-                        if (p.color == WHITE and y == 6) or (
-                            p.color == BLACK and y == 1
-                        ):
-                            value += 3 * mul
-        # simple king safety: reward castled positions
-        wk = board._king_square(WHITE)
-        bk = board._king_square(BLACK)
-        if wk in ("g1", "c1"):
-            value += 1 if color == WHITE else -1
-        if bk in ("g8", "c8"):
-            value += 1 if color == BLACK else -1
-        if board.in_check(BLACK if color == WHITE else WHITE):
-            value += 1
-        if board.in_check(color):
-            value -= 1
+        if evaluate_board_cython is not None:
+            value = evaluate_board_cython(board, color, PIECE_VALUES)
+        else:
+            value = 0
+            for y in range(8):
+                for x in range(8):
+                    p = board.board[y][x]
+                    if p:
+                        mul = 1 if p.color == color else -1
+                        value += PIECE_VALUES[p.type] * mul
+                        if (x, y) in CENTER_SQUARES:
+                            value += mul
+                        if p.type == ChessPieceType.PAWN:
+                            advance = y if p.color == WHITE else 7 - y
+                            value += (advance // 2) * mul
+                            if (p.color == WHITE and y == 6) or (
+                                p.color == BLACK and y == 1
+                            ):
+                                value += 3 * mul
+            # simple king safety: reward castled positions
+            wk = board._king_square(WHITE)
+            bk = board._king_square(BLACK)
+            if wk in ("g1", "c1"):
+                value += 1 if color == WHITE else -1
+            if bk in ("g8", "c8"):
+                value += 1 if color == BLACK else -1
+            if board.in_check(BLACK if color == WHITE else WHITE):
+                value += 1
+            if board.in_check(color):
+                value -= 1
         self.eval_cache[key] = value
         self.eval_cache.move_to_end(key)
         if len(self.eval_cache) > self._eval_cache_size:
