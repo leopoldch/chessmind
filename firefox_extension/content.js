@@ -2,15 +2,30 @@
   const WS_URL = 'ws://localhost:8765';
   let ws;
   let lastMoves = [];
+  let gameStarted = false;
+  let observer = null;
 
   if (!/^\/game\/[^\/]+$/.test(window.location.pathname)) return;
+
+  // Écoute du message venant de la popup pour démarrer la partie
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg.action === 'start_game') {
+      startGame();
+    }
+  });
+
+  function startGame() {
+    if (gameStarted) return;
+    gameStarted = true;
+    connect();
+  }
 
   function connect() {
     ws = new WebSocket(WS_URL);
     ws.addEventListener('open', () => {
       const myColor = detectColor();
       ws.send(JSON.stringify({ type: 'color', color: myColor }));
-      // On envoie la première liste de coups
+      // Envoi immédiat de la liste des coups présents
       sendMoves(getAllMoves());
       observeMoves();
     });
@@ -18,25 +33,18 @@
     ws.addEventListener('close', () => setTimeout(connect, 1000));
   }
 
-function detectColor() {
-  const svg = document.querySelector('svg.coordinates');
-  if (!svg) return null;
+  function detectColor() {
+    const svg = document.querySelector('svg.coordinates');
+    if (!svg) return null;
+    const text1 = Array.from(svg.querySelectorAll('text')).find(t => t.textContent.trim() === "1");
+    const text8 = Array.from(svg.querySelectorAll('text')).find(t => t.textContent.trim() === "8");
+    if (!text1 || !text8) return null;
+    const y1 = parseFloat(text1.getAttribute('y'));
+    const y8 = parseFloat(text8.getAttribute('y'));
+    if (y1 > y8) return 'white';
+    return 'black';
+  }
 
-  const text1 = Array.from(svg.querySelectorAll('text')).find(t => t.textContent.trim() === "1");
-  const text8 = Array.from(svg.querySelectorAll('text')).find(t => t.textContent.trim() === "8");
-  if (!text1 || !text8) return null;
-
-  const y1 = parseFloat(text1.getAttribute('y'));
-  const y8 = parseFloat(text8.getAttribute('y'));
-
-  if (y1 > y8) return 'white';
-
-  return 'black';
-
-}
-
-
-  // Cette fonction renvoie TOUS les coups sous forme de liste
   function getAllMoves() {
     const moves = [];
     document.querySelectorAll('.timestamps-with-base-time .main-line-row').forEach(row => {
@@ -48,52 +56,42 @@ function detectColor() {
     return moves;
   }
 
-  // Cette fonction extrait la notation correcte d'un élément DOM (avec figurine ou non)
   function parseMove(node) {
-    // Si le coup contient une figurine (span), on la prend, sinon c’est un pion
     const figurine = node.querySelector('.icon-font-chess');
     let piece = '';
-    if (figurine) {
-      piece = figurine.dataset.figurine || '';
-      // Conversion figurine vers lettre : N = Cavalier, B = Fou, R = Tour, Q = Dame, K = Roi
-    }
-    // On enlève l’icône du texte et on garde la case (e.g. 'c3')
-    // En supprimant tout ce qui n’est pas lettre/chiffre ou espace
+    if (figurine) piece = figurine.dataset.figurine || '';
     let casePart = node.textContent.replace(/[♔-♟]/g, '').trim().replace(/\s+/g, '');
     return (piece ? piece : '') + casePart;
   }
 
-  // On envoie la liste de tous les coups, au besoin
   function sendMoves(moves) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
     if (JSON.stringify(moves) === JSON.stringify(lastMoves)) return;
     lastMoves = moves;
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'moves', moves }));
-    }
+    ws.send(JSON.stringify({ type: 'moves', moves }));
   }
 
-  // Nouvelle fonction pour n'envoyer QUE le coup nouvellement joué
   function sendNewMove(newMove) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'move', move: newMove }));
-    }
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: 'move', move: newMove }));
   }
 
   function observeMoves() {
     const container = document.querySelector('.timestamps-with-base-time');
     if (!container) return;
-    const observer = new MutationObserver(() => {
-      // On prend la nouvelle liste
+    if (observer) observer.disconnect(); // Securité : on évite les doublons
+    observer = new MutationObserver(() => {
       const currentMoves = getAllMoves();
-      // On cherche les nouveaux coups en comparant à la dernière liste envoyée
       for (let i = lastMoves.length; i < currentMoves.length; i++) {
         const move = currentMoves[i];
-        sendNewMove(move); // Envoie immédiat
+        sendNewMove(move);
       }
-      // On update la variable de suivi
+      // Toujours mettre à jour lastMoves (sinon perte de synchro)
       lastMoves = currentMoves;
     });
     observer.observe(container, { childList: true, subtree: true });
+    // Envoi aussi à l'init, au cas où la partie a déjà des coups
+    sendMoves(getAllMoves());
   }
 
   function onMessage(evt) {
@@ -107,5 +105,6 @@ function detectColor() {
     alert(`Prochain coup reçu : ${evt.data}`);
   }
 
-  connect();
+  // Ne pas lancer connect tant que la popup n'a pas dit "start_game"
+  // connect(); // <-- On ne connecte que sur signal de la popup !
 })();
