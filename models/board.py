@@ -34,6 +34,11 @@ class MoveState:
     ep_capture_pos: Optional[Tuple[int, int]] = None
 
 
+@dataclass
+class NullMoveState:
+    prev_en_passant: Optional[Tuple[int, int]]
+
+
 class ChessBoard:
     def __init__(self) -> None:
         # 2‑D array: board[y][x]
@@ -200,6 +205,14 @@ class ChessBoard:
             WHITE: dict(state.prev_castling_rights[WHITE]),
             BLACK: dict(state.prev_castling_rights[BLACK]),
         }
+
+    def make_null_move_state(self) -> NullMoveState:
+        state = NullMoveState(self.en_passant_target)
+        self.en_passant_target = None
+        return state
+
+    def unmake_null_move(self, state: NullMoveState) -> None:
+        self.en_passant_target = state.prev_en_passant
 
     def _apply_move(self, start: str, end: str) -> None:
         piece = self[start]
