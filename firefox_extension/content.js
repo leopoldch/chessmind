@@ -13,8 +13,6 @@
       return node.dataset.uci;
     }
 
-    // For boards that don't expose the UCI data attribute, fall back to
-    // reconstructing the SAN move from the displayed figurine and text.
     const figurine = node ? node.querySelector('.icon-font-chess') : null;
     let piece = '';
     if (figurine && figurine.dataset) {
@@ -30,7 +28,6 @@
 
   if (!/^\/game\/[^\/]+$/.test(window.location.pathname)) return;
 
-  // Écoute du message venant de la popup pour démarrer/arrêter la partie
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg.action === 'start_game') {
       startGame();
@@ -69,7 +66,6 @@
       ws.addEventListener('open', () => {
           myColor = detectColor();
           ws.send(JSON.stringify({ type: 'color', color: myColor }));
-          // Envoi immédiat de la liste des coups présents
           sendMoves(getAllMoves());
           observeMoves();
       });
@@ -129,7 +125,7 @@
       const currentMoves = getAllMoves();
       for (let i = lastMoves.length; i < currentMoves.length; i++) {
         const { move, color } = currentMoves[i];
-        if (color !== myColor) { // On n’envoie que les coups de l’adversaire
+        if (color !== myColor) {
           sendNewMove(move);
         }
       }
@@ -147,68 +143,55 @@
     lastMoves = currentMoves;
   }
 
-  // ================================
-  //  PARTIE PRINCIPALE À AJOUTER ICI
-  // ================================
 
-  /**
-   * Convertit e2 (notation algébrique) en index de case Chess.com
-   * Chess.com indexe les cases de 0 à 63 de haut-gauche à bas-droite pour les blancs
-   * et inverse si on joue noir (plateau flipped)
-   */
   function algebraicToSquareIndex(square) {
-    const file = square.charCodeAt(0) - 'a'.charCodeAt(0) + 1; // a=1 ... h=8
-    const rank = parseInt(square[1], 10);                     // 1 à 8
-    return file * 10 + rank;  // file=4, rank=7 → 4*10+7 = 47 pour "d7"
+    const file = square.charCodeAt(0) - 'a'.charCodeAt(0) + 1; 
+    const rank = parseInt(square[1], 10);
+    return file * 10 + rank; 
   }
 
-  function clickSquare(idx, square) {
-    const sq = document.querySelector(`.square-${idx}`);
-    if (sq) {
-      console.log(`Clicking square: ${square} (index: ${idx})`);
-      const { left, top, width, height } = sq.getBoundingClientRect();
-      const x = left + width  / 2;
-      const y = top  + height / 2;
-      const clickEvt = new MouseEvent('click', {
-        bubbles: true, cancelable: true,
-        clientX: x, clientY: y
-      });
-      sq.dispatchEvent(clickEvt);
-      console.log(`Clicked square: ${square} at (${x}, ${y})`);
-    } else {
-      console.warn(`Square not found: ${square} (index: ${idx})`);
-      console.warn(`Falling back to click on board for square: ${square}`);
-      console.warn(`Square index: ${idx}`);
-      console.warn(`Square coordinates: ${JSON.stringify(sq ? sq.getBoundingClientRect() : {})}`);
-      // fallback : cliquer sur les coordonnées du plateau
-      const board = document.querySelector('wc-chess-board.board');
-      const rect = board.getBoundingClientRect();
-      const file = square.charCodeAt(0) - 'a'.charCodeAt(0);   // 0..7
-      const rank = parseInt(square[1], 10);                    // 1..8
-      const orientation = detectColor();
-      let fileIdx, rankIdx;
-      if (orientation === 'white') {
-        fileIdx = file;
-        rankIdx = 8 - rank;
-      } else {
-        fileIdx = 7 - file;
-        rankIdx = rank - 1;
-      }
-      const x = rect.left + (fileIdx + 0.5) * (rect.width / 8);
-      const y = rect.top  + (rankIdx + 0.5) * (rect.height / 8);
-      const clickEvt = new MouseEvent('click', {
-        bubbles: true, cancelable: true,
-        clientX: x, clientY: y
-      });
-      board.dispatchEvent(clickEvt);
-    }
+function clickSquare(idx, square) {
+  const board = document.querySelector('wc-chess-board.board');
+  const rect  = board.getBoundingClientRect();
+  const file  = square.charCodeAt(0) - 'a'.charCodeAt(0); 
+  const rank  = parseInt(square[1], 10); 
+  const orientation = detectColor();
+  let fileIdx = orientation==='white' ? file : 7 - file;
+  let rankIdx = orientation==='white' ? 8 - rank : rank - 1;
+  const x = rect.left + (fileIdx + 0.5) * (rect.width  / 8);
+  const y = rect.top  + (rankIdx + 0.5) * (rect.height / 8);
+
+  const target = document.elementFromPoint(x, y);
+
+  if (!target) {
+    console.warn("Rien sous le point", x, y);
+    return;
   }
+
+  const seq = [
+    { type: 'pointerdown', ctor: PointerEvent },
+    { type: 'mousedown',   ctor: MouseEvent   },
+    { type: 'pointerup',   ctor: PointerEvent },
+    { type: 'mouseup',     ctor: MouseEvent   },
+    { type: 'click',       ctor: MouseEvent   },
+  ];
+
+  for (const {type, ctor} of seq) {
+    const evt = new ctor(type, {
+      bubbles: true, cancelable: true,
+      clientX: x, clientY: y,
+      pointerId: 1, pointerType: 'mouse', isPrimary: true,
+      buttons: (type.includes('down') ? 1 : 0)
+    });
+    target.dispatchEvent(evt);
+  }
+}
 
   function simulateMove(from, to) {
     const fromIdx = algebraicToSquareIndex(from);
     const toIdx   = algebraicToSquareIndex(to);
     clickSquare(fromIdx, from);
-    //setTimeout(() => clickSquare(toIdx, to), 100);
+    setTimeout(() => clickSquare(toIdx, to), 100);
   }
 
 
