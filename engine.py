@@ -196,6 +196,17 @@ class Engine:
         if depth == 0:
             return self.quiescence(board, alpha, beta, color), None
 
+        if depth >= 3 and not board.in_check(color):
+            next_color = BLACK if color == WHITE else WHITE
+            nm_state = board.make_null_move_state()
+            score, _ = self.negamax(
+                board, next_color, depth - 3, -beta, -beta + 1, ply + 1
+            )
+            board.unmake_null_move(nm_state)
+            score = -score
+            if score >= beta:
+                return score, None
+
         best_score = -10_000
         best_move: Optional[Tuple[str, str]] = None
         moves = board.all_legal_moves(color)
@@ -305,10 +316,8 @@ class Engine:
 
         orig_depth = self.depth
         queen_count = game.board.piece_count(ChessPieceType.QUEEN)
-        if queen_count == 1 and self.depth < 5:
+        if queen_count <= 1 and self.depth < 5:
             self.depth = 5
-        elif queen_count == 0 and self.depth < 7:
-            self.depth = 7
 
         start_time = time.perf_counter()
         guess = 0
@@ -317,6 +326,10 @@ class Engine:
         move_count = sum(len(v) for v in moves_root.values())
         max_depth = self.depth + extra_depth
         if move_count <= 10:
+            max_depth += 1
+        if queen_count == 0 and move_count <= 6:
+            max_depth += 1
+        if queen_count == 0 and move_count <= 3:
             max_depth += 1
         for d in range(1, max_depth + 1):
             window = 50
