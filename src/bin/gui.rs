@@ -1,6 +1,7 @@
 use chessmind::{game::Game, board::Board, engine::Engine, pieces::{Piece, PieceType, Color}};
 use eframe::{egui, App, Frame};
 use egui::Color32;
+use std::time::{Duration, Instant};
 
 pub struct GuiApp {
     game: Game,
@@ -9,6 +10,7 @@ pub struct GuiApp {
     ai_color: Color,
     dragging: Option<(usize, usize, Piece)>,
     drag_pos: egui::Pos2,
+    last_ai_time: Option<Duration>,
 }
 
 impl GuiApp {
@@ -20,6 +22,7 @@ impl GuiApp {
             ai_color: Color::Black,
             dragging: None,
             drag_pos: egui::Pos2::ZERO,
+            last_ai_time: None,
         }
     }
 
@@ -28,8 +31,12 @@ impl GuiApp {
             && self.game.result.is_none()
             && self.game.current_turn == self.ai_color
         {
+            let start = Instant::now();
             if let Some((s, e)) = self.engine.best_move(&mut self.game) {
+                let duration = start.elapsed();
                 self.game.make_move(&s, &e);
+                self.last_ai_time = Some(duration);
+                println!("AI move {s}{e} in {:?} (depth {})", duration, self.engine.depth);
             }
         }
     }
@@ -67,6 +74,9 @@ impl App for GuiApp {
                 ui.label("AI plays:");
                 ui.radio_value(&mut self.ai_color, Color::White, "White");
                 ui.radio_value(&mut self.ai_color, Color::Black, "Black");
+                if let Some(t) = self.last_ai_time {
+                    ui.label(format!("Last AI move: {:.2?} (depth {})", t, self.engine.depth));
+                }
             }
         });
 
@@ -82,7 +92,9 @@ impl App for GuiApp {
                 self.drag_pos = pos;
             }
 
-            if response.drag_stopped() {
+            let drag_released = response.drag_stopped() ||
+                (self.dragging.is_some() && !ctx.input(|i| i.pointer.any_down()));
+            if drag_released {
                 if let Some((sx, sy, piece)) = self.dragging.take() {
                     if rect.contains(self.drag_pos) {
                         let fx = ((self.drag_pos.x - rect.left()) / square_size).floor() as i32;
