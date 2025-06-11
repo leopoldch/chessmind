@@ -31,3 +31,15 @@ fn main() {
     }
 }
 ```
+
+## Graphical interface
+
+If you prefer playing locally without the WebSocket server, a simple GUI is
+available. Launch it with:
+
+```bash
+cargo run --bin gui
+```
+
+The board appears in a new window and you can move pieces by dragging them from
+one square to another.
