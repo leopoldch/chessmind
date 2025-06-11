@@ -42,4 +42,5 @@ cargo run --bin gui
 ```
 
 The board appears in a new window and you can move pieces by dragging them from
-one square to another.
+one square to another. A checkbox at the top lets you enable a simple AI
+opponent and choose whether it plays White or Black.

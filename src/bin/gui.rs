@@ -1,16 +1,37 @@
-use chessmind::{game::Game, board::Board, pieces::{Piece, PieceType, Color}};
+use chessmind::{game::Game, board::Board, engine::Engine, pieces::{Piece, PieceType, Color}};
 use eframe::{egui, App, Frame};
 use egui::Color32;
 
 pub struct GuiApp {
     game: Game,
+    engine: Engine,
+    vs_ai: bool,
+    ai_color: Color,
     dragging: Option<(usize, usize, Piece)>,
     drag_pos: egui::Pos2,
 }
 
 impl GuiApp {
     pub fn new() -> Self {
-        Self { game: Game::new(), dragging: None, drag_pos: egui::Pos2::ZERO }
+        Self {
+            game: Game::new(),
+            engine: Engine::new(3),
+            vs_ai: false,
+            ai_color: Color::Black,
+            dragging: None,
+            drag_pos: egui::Pos2::ZERO,
+        }
+    }
+
+    fn check_ai_move(&mut self) {
+        if self.vs_ai
+            && self.game.result.is_none()
+            && self.game.current_turn == self.ai_color
+        {
+            if let Some((s, e)) = self.engine.best_move(&mut self.game) {
+                self.game.make_move(&s, &e);
+            }
+        }
     }
 
     fn piece_char(piece: &Piece) -> char {
@@ -33,10 +54,19 @@ impl GuiApp {
 
 impl App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
+        self.check_ai_move();
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             if ui.button("Restart").clicked() {
                 self.game = Game::new();
                 self.dragging = None;
+                self.check_ai_move();
+            }
+            ui.separator();
+            ui.checkbox(&mut self.vs_ai, "Play vs AI");
+            if self.vs_ai {
+                ui.label("AI plays:");
+                ui.radio_value(&mut self.ai_color, Color::White, "White");
+                ui.radio_value(&mut self.ai_color, Color::Black, "Black");
             }
         });
 
@@ -64,6 +94,8 @@ impl App for GuiApp {
                             ) {
                                 if !self.game.make_move(&start, &end) {
                                     self.game.board.set_index(sx, sy, Some(piece));
+                                } else {
+                                    self.check_ai_move();
                                 }
                             }
                         } else {
