@@ -1,5 +1,10 @@
-use chessmind::{game::Game, board::Board, engine::Engine, pieces::{Piece, PieceType, Color}};
-use eframe::{egui, App, Frame};
+use chessmind::{
+    board::Board,
+    engine::Engine,
+    game::Game,
+    pieces::{Color, Piece, PieceType},
+};
+use eframe::{App, Frame, egui};
 use egui::Color32;
 use std::time::{Duration, Instant};
 
@@ -27,16 +32,16 @@ impl GuiApp {
     }
 
     fn check_ai_move(&mut self) {
-        if self.vs_ai
-            && self.game.result.is_none()
-            && self.game.current_turn == self.ai_color
-        {
+        if self.vs_ai && self.game.result.is_none() && self.game.current_turn == self.ai_color {
             let start = Instant::now();
             if let Some((s, e)) = self.engine.best_move(&mut self.game) {
                 let duration = start.elapsed();
                 self.game.make_move(&s, &e);
                 self.last_ai_time = Some(duration);
-                println!("AI move {s}{e} in {:?} (depth {})", duration, self.engine.depth);
+                println!(
+                    "AI move {s}{e} in {:?} (depth {})",
+                    duration, self.engine.depth
+                );
             }
         }
     }
@@ -75,7 +80,10 @@ impl App for GuiApp {
                 ui.radio_value(&mut self.ai_color, Color::White, "White");
                 ui.radio_value(&mut self.ai_color, Color::Black, "Black");
                 if let Some(t) = self.last_ai_time {
-                    ui.label(format!("Last AI move: {:.2?} (depth {})", t, self.engine.depth));
+                    ui.label(format!(
+                        "Last AI move: {:.2?} (depth {})",
+                        t, self.engine.depth
+                    ));
                 }
             }
         });
@@ -92,8 +100,8 @@ impl App for GuiApp {
                 self.drag_pos = pos;
             }
 
-            let drag_released = response.drag_released() ||
-                (self.dragging.is_some() && !ctx.input(|i| i.pointer.any_down()));
+            let drag_released = response.drag_released()
+                || (self.dragging.is_some() && !ctx.input(|i| i.pointer.any_down()));
             if drag_released {
                 if let Some((sx, sy, piece)) = self.dragging.take() {
                     if rect.contains(self.drag_pos) {
@@ -129,8 +137,8 @@ impl App for GuiApp {
                         ),
                         egui::vec2(square_size, square_size),
                     );
-                    let light = Color32::from_rgb(240,217,181);
-                    let dark  = Color32::from_rgb(181,136,99);
+                    let light = Color32::from_rgb(240, 217, 181);
+                    let dark = Color32::from_rgb(181, 136, 99);
                     let color = if (x + y) % 2 == 0 { light } else { dark };
                     painter.rect_filled(sq_rect, 0.0, color);
                 }
@@ -141,7 +149,9 @@ impl App for GuiApp {
                     let piece_opt = self.game.board.get_index(x, y);
                     if let Some(p) = piece_opt {
                         if let Some((dx, dy, _)) = self.dragging {
-                            if dx == x && dy == y { continue; }
+                            if dx == x && dy == y {
+                                continue;
+                            }
                         }
                         let sq_rect = egui::Rect::from_min_size(
                             egui::pos2(
@@ -155,7 +165,11 @@ impl App for GuiApp {
                             egui::Align2::CENTER_CENTER,
                             Self::piece_char(&p),
                             egui::FontId::proportional(square_size * 0.8),
-                            if p.color == Color::White { egui::Color32::BLACK } else { egui::Color32::WHITE },
+                            if p.color == Color::White {
+                                egui::Color32::BLACK
+                            } else {
+                                egui::Color32::WHITE
+                            },
                         );
                     }
                 }
@@ -163,12 +177,15 @@ impl App for GuiApp {
 
             if response.drag_started() {
                 if rect.contains(self.drag_pos) {
-                    let fx = ((self.drag_pos.x - rect.left()) / square_size).floor() as i32;
-                    let fy = 7 - ((self.drag_pos.y - rect.top()) / square_size).floor() as i32;
-                    if fx >= 0 && fx < 8 && fy >= 0 && fy < 8 {
-                        if let Some(p) = self.game.board.get_index(fx as usize, fy as usize) {
-                            self.dragging = Some((fx as usize, fy as usize, p));
-                            self.game.board.set_index(fx as usize, fy as usize, None);
+                    // on convertit tout de suite en usize, c’est plus simple
+                    let fx = ((self.drag_pos.x - rect.left()) / square_size).floor() as usize;
+                    let fy = 7 - ((self.drag_pos.y - rect.top()) / square_size).floor() as usize;
+
+                    if fx < 8 && fy < 8 {
+                        // plus besoin de vérifier < 0
+                        if let Some(p) = self.game.board.get_index(fx, fy) {
+                            self.dragging = Some((fx, fy, p)); // on mémorise la pièce
+                            // plus de self.game.board.set_index(...) ici !
                         }
                     }
                 }
@@ -180,7 +197,11 @@ impl App for GuiApp {
                     egui::Align2::CENTER_CENTER,
                     Self::piece_char(&p),
                     egui::FontId::proportional(square_size * 0.8),
-                    if p.color == Color::White { egui::Color32::BLACK } else { egui::Color32::WHITE },
+                    if p.color == Color::White {
+                        egui::Color32::BLACK
+                    } else {
+                        egui::Color32::WHITE
+                    },
                 );
             }
         });
@@ -189,5 +210,10 @@ impl App for GuiApp {
 
 fn main() {
     let options = eframe::NativeOptions::default();
-    eframe::run_native("Chessmind", options, Box::new(|_cc| Box::new(GuiApp::new()))).unwrap();
+    eframe::run_native(
+        "Chessmind",
+        options,
+        Box::new(|_cc| Box::new(GuiApp::new())),
+    )
+    .unwrap();
 }
