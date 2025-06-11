@@ -3,3 +3,8 @@ __pycache__
 *.so
 *.c
 build/
+
+
+# Added by cargo
+
+/target

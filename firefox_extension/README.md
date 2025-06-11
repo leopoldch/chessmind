@@ -12,7 +12,7 @@ This extension connects to a local WebSocket server and reports your color and t
 Run the WebSocket server from this repository:
 
 ```bash
-python ws_server.py
+cargo run --bin ws_server
 ```
 
 Open a game on Chess.com. The extension waits for the board and move list to
