@@ -2,6 +2,7 @@ pub mod pieces;
 pub mod board;
 pub mod game;
 pub mod engine;
+pub mod san;
 
 #[cfg(test)]
 mod tests {
