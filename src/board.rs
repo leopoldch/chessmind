@@ -12,22 +12,39 @@ pub struct MoveState {
 
 #[derive(Clone)]
 pub struct Board {
-    squares: [[Option<Piece>; 8]; 8],
-    en_passant: Option<(usize, usize)>,
-    castling: [[bool; 2]; 2],
+    pub squares: [[Option<Piece>; 8]; 8],
+    pub bitboards: [[u64; 6]; 2],
+    pub en_passant: Option<(usize, usize)>,
+    pub castling: [[bool; 2]; 2],
 }
 
-fn color_idx(color: Color) -> usize {
+pub fn color_idx(color: Color) -> usize {
     match color {
         Color::White => 0,
         Color::Black => 1,
     }
 }
 
+pub fn piece_index(pt: PieceType) -> usize {
+    match pt {
+        PieceType::Pawn => 0,
+        PieceType::Knight => 1,
+        PieceType::Bishop => 2,
+        PieceType::Rook => 3,
+        PieceType::Queen => 4,
+        PieceType::King => 5,
+    }
+}
+
+fn sq_mask(x: usize, y: usize) -> u64 {
+    1u64 << (y * 8 + x)
+}
+
 impl Board {
     pub fn new() -> Self {
         Self {
             squares: [[None; 8]; 8],
+            bitboards: [[0u64; 6]; 2],
             en_passant: None,
             castling: [[true, true], [true, true]],
         }
@@ -39,6 +56,7 @@ impl Board {
                 self.squares[y][x] = None;
             }
         }
+        self.bitboards = [[0u64; 6]; 2];
         let back = [
             PieceType::Rook,
             PieceType::Knight,
@@ -60,7 +78,18 @@ impl Board {
     }
 
     pub fn set_index(&mut self, x: usize, y: usize, piece: Option<Piece>) {
+        let mask = sq_mask(x, y);
+        if let Some(old) = self.squares[y][x] {
+            let c = color_idx(old.color);
+            let p = piece_index(old.piece_type);
+            self.bitboards[c][p] &= !mask;
+        }
         self.squares[y][x] = piece;
+        if let Some(pce) = piece {
+            let c = color_idx(pce.color);
+            let p = piece_index(pce.piece_type);
+            self.bitboards[c][p] |= mask;
+        }
     }
 
     pub fn get_index(&self, x: usize, y: usize) -> Option<Piece> {
@@ -360,6 +389,30 @@ impl Board {
                             for m in self.pseudo_legal_moves(&pos) {
                                 if self.is_legal(&pos, &m, color) {
                                     res.push((pos.clone(), m));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        res
+    }
+
+    pub fn capture_moves(&mut self, color: Color) -> Vec<(String, String)> {
+        let mut res = Vec::new();
+        for y in 0..8 {
+            for x in 0..8 {
+                if let Some(pos) = Self::index_to_algebraic(x, y) {
+                    if let Some(p) = self.get_index(x, y) {
+                        if p.color == color {
+                            for m in self.pseudo_legal_moves(&pos) {
+                                if let Some((mx,my)) = Self::algebraic_to_index(&m) {
+                                    if self.get_index(mx,my).is_some() {
+                                        if self.is_legal(&pos, &m, color) {
+                                            res.push((pos.clone(), m));
+                                        }
+                                    }
                                 }
                             }
                         }

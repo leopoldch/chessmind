@@ -689,6 +689,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "futures-util",
+ "once_cell",
  "regex",
  "serde",
  "serde_json",

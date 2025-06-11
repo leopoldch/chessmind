@@ -3,6 +3,7 @@ pub mod board;
 pub mod game;
 pub mod engine;
 pub mod san;
+pub mod transposition;
 
 #[cfg(test)]
 mod tests {
@@ -11,7 +12,7 @@ mod tests {
     #[test]
     fn engine_returns_move() {
         let mut game = Game::new();
-        let engine = Engine::new(2);
+        let mut engine = Engine::new(2);
         let mv = engine.best_move(&mut game);
         assert!(mv.is_some());
     }
