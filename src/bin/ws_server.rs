@@ -1,17 +1,26 @@
 use std::env;
-use chessmind::{game::Game, engine::Engine};
+use chessmind::{game::Game, engine::Engine, pieces::Color};
 use futures_util::{StreamExt, SinkExt};
 use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 #[derive(Deserialize)]
-struct MoveMsg {
-    #[serde(rename = "type")]
-    msg_type: String,
+struct MoveEntry {
     #[serde(rename = "move")]
-    mov: Option<String>,
-    color: Option<String>,
+    mov: String,
+    color: String,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum ClientMsg {
+    #[serde(rename = "color")]
+    Color { color: String },
+    #[serde(rename = "move")]
+    Move { #[serde(rename = "move")] mov: String },
+    #[serde(rename = "moves")]
+    Moves { moves: Vec<MoveEntry> },
 }
 
 #[tokio::main]
@@ -30,28 +39,56 @@ async fn handle_conn(stream: tokio::net::TcpStream) {
     let (mut write, mut read) = ws_stream.split();
     let mut game = Game::new();
     let engine = Engine::new(3);
+    let mut my_color: Option<Color> = None;
     while let Some(msg) = read.next().await {
         if let Ok(msg) = msg {
             if msg.is_text() {
                 let txt = msg.to_text().unwrap();
-                if txt.len() == 4 {
-                    let start = &txt[0..2];
-                    let end = &txt[2..4];
-                    game.make_move(start, end);
-                } else if let Ok(data) = serde_json::from_str::<MoveMsg>(txt) {
-                    if data.msg_type == "move" {
-                        if let Some(m) = data.mov {
-                            if m.len() == 4 {
-                                let s = &m[0..2];
-                                let e = &m[2..4];
+                if let Ok(data) = serde_json::from_str::<ClientMsg>(txt) {
+                    match data {
+                        ClientMsg::Color { color } => {
+                            my_color = match color.as_str() {
+                                "white" => Some(Color::White),
+                                "black" => Some(Color::Black),
+                                _ => None,
+                            };
+                        }
+                        ClientMsg::Move { mov } => {
+                            if mov.len() == 4 {
+                                let s = &mov[0..2];
+                                let e = &mov[2..4];
                                 game.make_move(s, e);
                             }
                         }
+                        ClientMsg::Moves { moves } => {
+                            game = Game::new();
+                            for m in moves {
+                                if m.mov.len() == 4 {
+                                    let s = &m.mov[0..2];
+                                    let e = &m.mov[2..4];
+                                    game.make_move(s, e);
+                                }
+                            }
+                        }
                     }
+                } else if txt.len() == 4 {
+                    let start = &txt[0..2];
+                    let end = &txt[2..4];
+                    game.make_move(start, end);
                 }
-                if let Some((s, e)) = engine.best_move(&mut game) {
-                    game.make_move(&s, &e);
-                    let _ = write.send(Message::Text(format!("{}{}", s, e))).await;
+
+                if let Some(color) = my_color {
+                    if color == game.current_turn {
+                        let next = if color == Color::White && game.history.is_empty() {
+                            Some(("d2".to_string(), "d4".to_string()))
+                        } else {
+                            engine.best_move(&mut game)
+                        };
+                        if let Some((s, e)) = next {
+                            game.make_move(&s, &e);
+                            let _ = write.send(Message::Text(format!("{}{}", s, e))).await;
+                        }
+                    }
                 }
             }
         }
