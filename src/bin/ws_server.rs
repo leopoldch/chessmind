@@ -1,10 +1,18 @@
 use std::env;
 use std::time::Instant;
-use chessmind::{game::Game, engine::Engine, pieces::Color};
+use chessmind::{game::Game, engine::Engine, pieces::Color, san::parse_san};
 use futures_util::{StreamExt, SinkExt};
 use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+fn is_coordinate(mv: &str) -> bool {
+    mv.len() == 4
+        && mv.as_bytes()[0].is_ascii_lowercase()
+        && mv.as_bytes()[1].is_ascii_digit()
+        && mv.as_bytes()[2].is_ascii_lowercase()
+        && mv.as_bytes()[3].is_ascii_digit()
+}
 
 #[derive(Deserialize)]
 struct MoveEntry {
@@ -42,58 +50,96 @@ async fn handle_conn(stream: tokio::net::TcpStream, addr: std::net::SocketAddr) 
     let mut game = Game::new();
     let engine = Engine::new(3);
     let mut my_color: Option<Color> = None;
+    let mut last_len: usize = 0;
     while let Some(msg) = read.next().await {
         if let Ok(msg) = msg {
-            if msg.is_text() {
-                let txt = msg.to_text().unwrap();
-                println!("Received from {}: {}", addr, txt);
-                if let Ok(data) = serde_json::from_str::<ClientMsg>(txt) {
-                    match data {
-                        ClientMsg::Color { color } => {
-                            my_color = match color.as_str() {
-                                "white" => Some(Color::White),
-                                "black" => Some(Color::Black),
-                                _ => None,
-                            };
-                        }
-                        ClientMsg::Move { mov } => {
-                            if mov.len() == 4 {
-                                let s = &mov[0..2];
-                                let e = &mov[2..4];
-                                game.make_move(s, e);
-                            }
-                        }
-                        ClientMsg::Moves { moves } => {
-                            game = Game::new();
-                            for m in moves {
-                                if m.mov.len() == 4 {
-                                    let s = &m.mov[0..2];
-                                    let e = &m.mov[2..4];
-                                    game.make_move(s, e);
-                                }
-                            }
-                        }
-                    }
-                } else if txt.len() == 4 {
-                    let start = &txt[0..2];
-                    let end = &txt[2..4];
-                    game.make_move(start, end);
-                }
+            if !msg.is_text() {
+                continue;
+            }
+            let txt = msg.to_text().unwrap();
+            println!("Received from {}: {}", addr, txt);
 
-                if let Some(color) = my_color {
-                    if color == game.current_turn {
-                        let start_time = Instant::now();
-                        let next = if color == Color::White && game.history.is_empty() {
-                            Some(("d2".to_string(), "d4".to_string()))
-                        } else {
-                            engine.best_move(&mut game)
+            if let Ok(data) = serde_json::from_str::<ClientMsg>(txt) {
+                match data {
+                    ClientMsg::Color { color } => {
+                        my_color = match color.as_str() {
+                            "white" => Some(Color::White),
+                            _ => Some(Color::Black),
                         };
-                        println!("AI calculation took {:?}", start_time.elapsed());
-                        if let Some((s, e)) = next {
-                            game.make_move(&s, &e);
-                            let _ = write.send(Message::Text(format!("{}{}", s, e))).await;
+                        println!(
+                            "AI colour set to: {}",
+                            if my_color == Some(Color::White) { "White" } else { "Black" }
+                        );
+                        game = Game::new();
+                        last_len = 0;
+                        if my_color == Some(Color::White) && game.current_turn == Color::White {
+                            game.make_move("d2", "d4");
+                            last_len = 1;
+                            let _ = write.send(Message::Text("d2d4".into())).await;
+                        }
+                        continue;
+                    }
+                    ClientMsg::Move { mov } => {
+                        let mov = mov.replace('+', "");
+                        if is_coordinate(&mov) {
+                            game.make_move(&mov[0..2], &mov[2..4]);
+                            last_len += 1;
+                        } else {
+                            let color = game.current_turn;
+                            if let Some((s, e)) = parse_san(&mut game, &mov, color) {
+                                game.make_move(&s, &e);
+                                last_len += 1;
+                            }
                         }
                     }
+                    ClientMsg::Moves { moves } => {
+                        if moves.len() == last_len {
+                            continue;
+                        }
+                        game = Game::new();
+                        for entry in &moves {
+                            let mv = entry.mov.replace('+', "");
+                            let color = if entry.color.to_lowercase().starts_with("w") { Color::White } else { Color::Black };
+                            if is_coordinate(&mv) {
+                                game.make_move(&mv[0..2], &mv[2..4]);
+                            } else if let Some((s, e)) = parse_san(&mut game, &mv, color) {
+                                game.make_move(&s, &e);
+                            }
+                        }
+                        last_len = moves.len();
+                    }
+                }
+            } else if is_coordinate(txt) {
+                game.make_move(&txt[0..2], &txt[2..4]);
+                last_len += 1;
+            } else {
+                let color = game.current_turn;
+                if let Some((s, e)) = parse_san(&mut game, txt, color) {
+                    game.make_move(&s, &e);
+                    last_len += 1;
+                }
+            }
+
+            if let Some(color) = my_color {
+                if let Some(res) = game.result {
+                    let result = if res == Color::White { "white" } else { "black" };
+                    let _ = write.send(Message::Text(format!("{{\"result\":\"{}\"}}", result))).await;
+                    break;
+                }
+                if game.current_turn != color {
+                    continue;
+                }
+                let start_time = Instant::now();
+                let next = if color == Color::White && last_len == 0 {
+                    Some(("d2".to_string(), "d4".to_string()))
+                } else {
+                    engine.best_move(&mut game)
+                };
+                println!("AI calculation took {:?}", start_time.elapsed());
+                if let Some((s, e)) = next {
+                    game.make_move(&s, &e);
+                    last_len += 1;
+                    let _ = write.send(Message::Text(format!("{}{}", s, e))).await;
                 }
             }
         }
