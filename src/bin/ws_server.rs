@@ -1,4 +1,5 @@
 use std::env;
+use std::time::Instant;
 use chessmind::{game::Game, engine::Engine, pieces::Color};
 use futures_util::{StreamExt, SinkExt};
 use serde::Deserialize;
@@ -29,12 +30,13 @@ async fn main() {
     let addr = format!("127.0.0.1:{}", port);
     let listener = TcpListener::bind(&addr).await.expect("bind");
     println!("WebSocket server on ws://{}", addr);
-    while let Ok((stream, _)) = listener.accept().await {
-        tokio::spawn(handle_conn(stream));
+    while let Ok((stream, addr)) = listener.accept().await {
+        println!("Client connected: {}", addr);
+        tokio::spawn(handle_conn(stream, addr));
     }
 }
 
-async fn handle_conn(stream: tokio::net::TcpStream) {
+async fn handle_conn(stream: tokio::net::TcpStream, addr: std::net::SocketAddr) {
     let ws_stream = accept_async(stream).await.expect("ws accept");
     let (mut write, mut read) = ws_stream.split();
     let mut game = Game::new();
@@ -44,6 +46,7 @@ async fn handle_conn(stream: tokio::net::TcpStream) {
         if let Ok(msg) = msg {
             if msg.is_text() {
                 let txt = msg.to_text().unwrap();
+                println!("Received from {}: {}", addr, txt);
                 if let Ok(data) = serde_json::from_str::<ClientMsg>(txt) {
                     match data {
                         ClientMsg::Color { color } => {
@@ -79,11 +82,13 @@ async fn handle_conn(stream: tokio::net::TcpStream) {
 
                 if let Some(color) = my_color {
                     if color == game.current_turn {
+                        let start_time = Instant::now();
                         let next = if color == Color::White && game.history.is_empty() {
                             Some(("d2".to_string(), "d4".to_string()))
                         } else {
                             engine.best_move(&mut game)
                         };
+                        println!("AI calculation took {:?}", start_time.elapsed());
                         if let Some((s, e)) = next {
                             game.make_move(&s, &e);
                             let _ = write.send(Message::Text(format!("{}{}", s, e))).await;
@@ -93,4 +98,5 @@ async fn handle_conn(stream: tokio::net::TcpStream) {
             }
         }
     }
+    println!("Client disconnected: {}", addr);
 }
