@@ -88,11 +88,11 @@ impl App for GuiApp {
                 egui::Sense::click_and_drag(),
             );
 
-            if let Some(pos) = response.interact_pointer_pos() {
+            if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
                 self.drag_pos = pos;
             }
 
-            let drag_released = response.drag_stopped() ||
+            let drag_released = response.drag_released() ||
                 (self.dragging.is_some() && !ctx.input(|i| i.pointer.any_down()));
             if drag_released {
                 if let Some((sx, sy, piece)) = self.dragging.take() {
