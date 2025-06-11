@@ -1,8 +1,9 @@
 use crate::board::{Board, color_idx};
 use crate::pieces::{Color, PieceType};
 use crate::game::Game;
-use crate::transposition::{Table, TTEntry, Bound};
+use crate::transposition::{Table, TTEntry, Bound, TABLE_SIZE};
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 
 pub struct Engine {
     pub depth: u32,
@@ -15,7 +16,7 @@ impl Engine {
     pub fn new(depth: u32) -> Self {
         Self {
             depth,
-            tt: HashMap::new(),
+            tt: Table::new(NonZeroUsize::new(TABLE_SIZE).unwrap()),
             killers: vec![[None, None]; (depth as usize)+1],
             history: HashMap::new(),
         }
@@ -139,7 +140,7 @@ impl Engine {
         }
 
         let bound = if best <= alpha_orig { Bound::Upper } else if best >= beta { Bound::Lower } else { Bound::Exact };
-        self.tt.insert(hash, TTEntry { depth, value: best, bound, best: best_move });
+        self.tt.put(hash, TTEntry { depth, value: best, bound, best: best_move });
         best
     }
 

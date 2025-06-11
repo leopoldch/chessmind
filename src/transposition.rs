@@ -1,5 +1,5 @@
 use once_cell::sync::Lazy;
-use std::collections::HashMap;
+use lru::LruCache;
 use crate::pieces::Color;
 use crate::board::Board;
 
@@ -55,4 +55,6 @@ impl Board {
     }
 }
 
-pub type Table = HashMap<u64, TTEntry>;
+pub type Table = LruCache<u64, TTEntry>;
+
+pub const TABLE_SIZE: usize = 100_000;
