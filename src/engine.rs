@@ -87,7 +87,9 @@ pub struct Engine {
     pub depth: u32,
     tt: Table,
     killers: Vec<[Option<(String,String)>;2]>,
-    history: HashMap<(String,String), i32>,
+    quiet_history: HashMap<(String,String), i32>,
+    capture_history: HashMap<(String,String), i32>,
+    cont_history: HashMap<((String,String),(String,String)), i32>,
 }
 
 impl Engine {
@@ -96,7 +98,9 @@ impl Engine {
             depth,
             tt: Table::new(NonZeroUsize::new(TABLE_SIZE).unwrap()),
             killers: vec![[None, None]; (depth as usize)+1],
-            history: HashMap::new(),
+            quiet_history: HashMap::new(),
+            capture_history: HashMap::new(),
+            cont_history: HashMap::new(),
         }
     }
 
@@ -145,16 +149,39 @@ impl Engine {
     }
 
     #[inline(always)]
-    fn move_score(&self, board: &Board, s: &String, e: &String, ply: usize) -> i32 {
-        let mut score = *self.history.get(&(s.clone(), e.clone())).unwrap_or(&0);
-        if let Some(k) = self.killers.get(ply) {
-            if let Some(m) = &k[0] { if m.0 == *s && m.1 == *e { score += 10_000; } }
-            if let Some(m) = &k[1] { if m.0 == *s && m.1 == *e { score += 9_000; } }
-        }
-        if let Some((ex,ey)) = Board::algebraic_to_index(e) {
-            if let Some(p) = board.get_index(ex,ey) {
-                score += Self::piece_value(p.piece_type) * 10;
+    fn static_exchange_eval(&self, board: &Board, s: &String, e: &String) -> i32 {
+        if let (Some((sx,sy)), Some((ex,ey))) = (Board::algebraic_to_index(s), Board::algebraic_to_index(e)) {
+            if let (Some(att), Some(def)) = (board.get_index(sx,sy), board.get_index(ex,ey)) {
+                return Self::piece_value(def.piece_type) - Self::piece_value(att.piece_type);
             }
+        }
+        0
+    }
+
+    fn move_score(&self, board: &Board, s: &String, e: &String, ply: usize, prev: Option<&(String,String)>) -> i32 {
+        let mut score = 0;
+        let capture = if let Some((ex,ey)) = Board::algebraic_to_index(e) {
+            board.get_index(ex,ey).is_some()
+        } else { false };
+        if capture {
+            score += *self.capture_history.get(&(s.clone(), e.clone())).unwrap_or(&0);
+            if let Some((ex,ey)) = Board::algebraic_to_index(e) {
+                if let Some(p) = board.get_index(ex,ey) {
+                    score += Self::piece_value(p.piece_type) * 10;
+                }
+            }
+            if self.static_exchange_eval(board,s,e) < 0 {
+                score -= 1000;
+            }
+        } else {
+            score += *self.quiet_history.get(&(s.clone(), e.clone())).unwrap_or(&0);
+            if let Some(k) = self.killers.get(ply) {
+                if let Some(m) = &k[0] { if m.0 == *s && m.1 == *e { score += 10_000; } }
+                if let Some(m) = &k[1] { if m.0 == *s && m.1 == *e { score += 9_000; } }
+            }
+        }
+        if let Some(pmv) = prev {
+            score += *self.cont_history.get(&(pmv.clone(), (s.clone(),e.clone()))).unwrap_or(&0);
         }
         score
     }
@@ -176,7 +203,7 @@ impl Engine {
         alpha
     }
 
-    fn negamax(&mut self, board: &mut Board, color: Color, depth: u32, mut alpha: i32, beta: i32, ply: usize) -> i32 {
+    fn negamax(&mut self, board: &mut Board, color: Color, depth: u32, mut alpha: i32, beta: i32, ply: usize, prev_move: Option<(String,String)>) -> i32 {
         let alpha_orig = alpha;
         let hash = board.hash(color);
         let mut tt_best: Option<(String, String)> = None;
@@ -196,17 +223,31 @@ impl Engine {
 
         if depth >= 3 && !board.in_check(color) {
             let ep = board.en_passant;
-            let score = -self.negamax(board, opposite(color), depth - 1 - 2, -beta, -beta + 1, ply + 1);
+            let score = -self.negamax(board, opposite(color), depth - 1 - 2, -beta, -beta + 1, ply + 1, prev_move.clone());
             board.en_passant = ep;
             if score >= beta { return beta; }
         }
 
-        let mut moves = board.all_legal_moves_fast(color);
-        if moves.is_empty() {
+        let all_moves = board.all_legal_moves_fast(color);
+        if all_moves.is_empty() {
             if board.in_check(color) { return -10000 + ply as i32; }
             return 0;
         }
-        moves.sort_by_key(|(s,e)| -self.move_score(board,s,e,ply));
+        let mut captures = Vec::new();
+        let mut quiets = Vec::new();
+        for m in all_moves {
+            if let Some((ex,ey)) = Board::algebraic_to_index(&m.1) {
+                if board.get_index(ex,ey).is_some() {
+                    captures.push(m);
+                } else {
+                    quiets.push(m);
+                }
+            }
+        }
+        captures.sort_by_key(|(s,e)| -self.move_score(board,s,e,ply,prev_move.as_ref()));
+        quiets.sort_by_key(|(s,e)| -self.move_score(board,s,e,ply,prev_move.as_ref()));
+        let mut moves = captures;
+        moves.extend(quiets);
         if let Some((bs, be)) = tt_best {
             if let Some(pos) = moves.iter().position(|(s,e)| *s == bs && *e == be) {
                 moves.swap(0, pos);
@@ -221,7 +262,7 @@ impl Engine {
                 if idx >= 3 && depth > 2 && !capture {
                     new_depth = new_depth.saturating_sub(1);
                 }
-                let score = -self.negamax(board, opposite(color), new_depth, -beta, -alpha, ply + 1);
+                let score = -self.negamax(board, opposite(color), new_depth, -beta, -alpha, ply + 1, Some((s.clone(),e.clone())));
                 board.unmake_move(state);
                 if score >= beta {
                     if !capture {
@@ -231,7 +272,14 @@ impl Engine {
                             k[0] = Some((s.clone(),e.clone()));
                         }
                     }
-                    *self.history.entry((s.clone(),e.clone())).or_insert(0) += (depth * depth) as i32;
+                    if capture {
+                        *self.capture_history.entry((s.clone(),e.clone())).or_insert(0) += (depth * depth) as i32;
+                    } else {
+                        *self.quiet_history.entry((s.clone(),e.clone())).or_insert(0) += (depth * depth) as i32;
+                    }
+                    if let Some(pmv) = &prev_move {
+                        *self.cont_history.entry((pmv.clone(), (s.clone(),e.clone()))).or_insert(0) += (depth * depth) as i32;
+                    }
                     self.tt.put(hash, TTEntry { depth, value: beta, bound: Bound::Lower, best: Some((s.clone(), e.clone())) });
                     return beta;
                 }
@@ -264,7 +312,7 @@ impl Engine {
 
             loop {
                 let mut board = game.board.clone();
-                let score = self.negamax(&mut board, color, d, alpha, beta, 0);
+                let score = self.negamax(&mut board, color, d, alpha, beta, 0, None);
 
                 if score <= alpha {
                     alpha -= ASPIRATION;
