@@ -176,6 +176,7 @@ impl Engine {
     fn negamax(&mut self, board: &mut Board, color: Color, depth: u32, mut alpha: i32, beta: i32, ply: usize) -> i32 {
         let alpha_orig = alpha;
         let hash = board.hash(color);
+        let mut tt_best: Option<(String, String)> = None;
         if let Some(entry) = self.tt.get(&hash) {
             if entry.depth >= depth {
                 match entry.bound {
@@ -185,6 +186,7 @@ impl Engine {
                 }
                 if alpha >= beta { return entry.value; }
             }
+            tt_best = entry.best.clone();
         }
 
         if depth == 0 { return self.quiescence(board, color, alpha, beta); }
@@ -202,6 +204,11 @@ impl Engine {
             return 0;
         }
         moves.sort_by_key(|(s,e)| -self.move_score(board,s,e,ply));
+        if let Some((bs, be)) = tt_best {
+            if let Some(pos) = moves.iter().position(|(s,e)| *s == bs && *e == be) {
+                moves.swap(0, pos);
+            }
+        }
 
         let mut best_move = None;
         let mut best = -100000;
