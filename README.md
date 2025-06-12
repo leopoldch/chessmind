@@ -1,6 +1,7 @@
 # chessmind
 
 Rust implementation of a simple chess engine. This crate contains the core engine logic used by the Firefox extension in `firefox_extension/`. The engine keeps a transposition table backed by an LRU cache to reuse previous evaluations and speed up searches.
+To avoid draws by repetition, game states are tracked and the AI skips moves that would repeat the same position a third time.
 
 ## Building
 
