@@ -225,7 +225,16 @@ impl Engine {
         alpha
     }
 
-    fn pvs(&mut self, board: &mut Board, color: Color, depth: u32, mut alpha: i32, beta: i32, ply: usize, prev_move: Option<(String,String)>) -> i32 {
+    fn pvs(&mut self, board: &mut Board, color: Color, depth: u32, mut alpha: i32, beta: i32, ply: usize, prev_move: Option<(String,String)>, use_iir: bool) -> i32 {
+        if use_iir && depth >= 5 && !board.in_check(color) {
+            let mut d = depth - 2;
+            let mut score = self.pvs(board, color, d, alpha, beta, ply, prev_move.clone(), false);
+            while d < depth && score > alpha && score < beta {
+                d += 1;
+                score = self.pvs(board, color, d, alpha, beta, ply, prev_move.clone(), false);
+            }
+            return score;
+        }
         let alpha_orig = alpha;
         let hash = board.hash(color);
         let mut tt_best: Option<(String, String)> = None;
@@ -249,7 +258,7 @@ impl Engine {
 
         if depth >= 3 && !board.in_check(color) {
             let ep = board.en_passant;
-            let score = -self.pvs(board, opposite(color), depth - 1 - 2, -beta, -beta + 1, ply + 1, prev_move.clone());
+            let score = -self.pvs(board, opposite(color), depth - 1 - 2, -beta, -beta + 1, ply + 1, prev_move.clone(), true);
             board.en_passant = ep;
             if score >= beta { return beta; }
         }
@@ -290,11 +299,11 @@ impl Engine {
                 }
                 let mut score;
                 if idx == 0 {
-                    score = -self.pvs(board, opposite(color), new_depth, -beta, -alpha, ply + 1, Some((s.clone(),e.clone())));
+                    score = -self.pvs(board, opposite(color), new_depth, -beta, -alpha, ply + 1, Some((s.clone(),e.clone())), true);
                 } else {
-                    score = -self.pvs(board, opposite(color), new_depth, -alpha-1, -alpha, ply + 1, Some((s.clone(),e.clone())));
+                    score = -self.pvs(board, opposite(color), new_depth, -alpha-1, -alpha, ply + 1, Some((s.clone(),e.clone())), true);
                     if score > alpha && score < beta {
-                        score = -self.pvs(board, opposite(color), new_depth, -beta, -alpha, ply + 1, Some((s.clone(),e.clone())));
+                        score = -self.pvs(board, opposite(color), new_depth, -beta, -alpha, ply + 1, Some((s.clone(),e.clone())), true);
                     }
                 }
                 board.unmake_move(state);
@@ -339,7 +348,7 @@ impl Engine {
 
     #[allow(dead_code)]
     fn negamax(&mut self, board: &mut Board, color: Color, depth: u32, alpha: i32, beta: i32, ply: usize, prev_move: Option<(String,String)>) -> i32 {
-        self.pvs(board, color, depth, alpha, beta, ply, prev_move)
+        self.pvs(board, color, depth, alpha, beta, ply, prev_move, true)
     }
 
     fn best_move_single(&mut self, game: &mut Game) -> Option<(String, String)> {
@@ -359,7 +368,7 @@ impl Engine {
 
             loop {
                 let mut board = game.board.clone();
-                let score = self.pvs(&mut board, color, d, alpha, beta, 0, None);
+                let score = self.pvs(&mut board, color, d, alpha, beta, 0, None, true);
 
                 if score <= alpha {
                     alpha -= ASPIRATION;
@@ -404,7 +413,7 @@ impl Engine {
                     let mut engine = self.clone();
                     let mut board = game.board.clone();
                     if let Some(state) = board.make_move_state(s,e) {
-                        let score = -engine.pvs(&mut board, opposite(color), depth - 1, -100000, 100000, 0, None);
+                        let score = -engine.pvs(&mut board, opposite(color), depth - 1, -100000, 100000, 0, None, true);
                         board.unmake_move(state);
                         (score, s.clone(), e.clone())
                     } else {
