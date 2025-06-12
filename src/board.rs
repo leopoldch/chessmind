@@ -434,4 +434,15 @@ impl Board {
         }
         c
     }
+
+    pub fn piece_count_color(&self, piece_type: PieceType, color: Color) -> usize {
+        let cidx = color_idx(color);
+        let mut count = 0;
+        let mut bb = self.bitboards[cidx][piece_index(piece_type)];
+        while bb != 0 {
+            count += 1;
+            bb &= bb - 1;
+        }
+        count
+    }
 }
