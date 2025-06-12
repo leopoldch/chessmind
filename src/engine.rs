@@ -85,6 +85,7 @@ const BISHOP_PAIR: i32 = 30;
 #[derive(Clone)]
 pub struct Engine {
     pub depth: u32,
+    pub threads: usize,
     tt: Table,
     killers: Vec<[Option<(String,String)>;2]>,
     quiet_history: HashMap<(String,String), i32>,
@@ -94,14 +95,23 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(depth: u32) -> Self {
+        Self::with_threads(depth, 1)
+    }
+
+    pub fn with_threads(depth: u32, threads: usize) -> Self {
         Self {
             depth,
+            threads,
             tt: Table::new(NonZeroUsize::new(TABLE_SIZE).unwrap()),
             killers: vec![[None, None]; (depth as usize)+1],
             quiet_history: HashMap::new(),
             capture_history: HashMap::new(),
             cont_history: HashMap::new(),
         }
+    }
+
+    pub fn set_threads(&mut self, threads: usize) {
+        self.threads = threads;
     }
 
     #[inline(always)]
@@ -295,7 +305,7 @@ impl Engine {
         alpha
     }
 
-    pub fn best_move(&mut self, game: &mut Game) -> Option<(String, String)> {
+    fn best_move_single(&mut self, game: &mut Game) -> Option<(String, String)> {
         const ASPIRATION: i32 = 50;
         let color = game.current_turn;
         let root_hash = game.board.hash(color);
@@ -332,6 +342,42 @@ impl Engine {
         }
 
         best_move
+    }
+
+    fn best_move_parallel(&self, game: &mut Game) -> Option<(String, String)> {
+        use rayon::prelude::*;
+        let color = game.current_turn;
+        let moves = game.board.all_legal_moves_fast(color);
+        if moves.is_empty() { return None; }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(self.threads)
+            .build()
+            .expect("thread pool");
+        let depth = self.depth;
+        let res = pool.install(|| {
+            moves.par_iter()
+                .map(|(s,e)| {
+                    let mut engine = self.clone();
+                    let mut board = game.board.clone();
+                    if let Some(state) = board.make_move_state(s,e) {
+                        let score = -engine.negamax(&mut board, opposite(color), depth - 1, -100000, 100000, 0, None);
+                        board.unmake_move(state);
+                        (score, s.clone(), e.clone())
+                    } else {
+                        (i32::MIN, s.clone(), e.clone())
+                    }
+                })
+                .max_by_key(|(sc,_,_)| *sc)
+        });
+        res.map(|(_,s,e)| (s,e))
+    }
+
+    pub fn best_move(&mut self, game: &mut Game) -> Option<(String, String)> {
+        if self.threads <= 1 {
+            self.best_move_single(game)
+        } else {
+            self.best_move_parallel(game)
+        }
     }
 }
 
