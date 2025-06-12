@@ -161,7 +161,7 @@ impl Engine {
         let stand_pat = Self::evaluate(board, color);
         if stand_pat >= beta { return beta; }
         if stand_pat > alpha { alpha = stand_pat; }
-        let moves = board.capture_moves(color);
+        let moves = board.capture_moves_fast(color);
         for (s,e) in moves {
             if let Some(state) = board.make_move_state(&s,&e) {
                 let score = -self.quiescence(board, opposite(color), -beta, -alpha);
@@ -198,7 +198,7 @@ impl Engine {
             if score >= beta { return beta; }
         }
 
-        let mut moves = board.all_legal_moves(color);
+        let mut moves = board.all_legal_moves_fast(color);
         if moves.is_empty() {
             if board.in_check(color) { return -10000 + ply as i32; }
             return 0;
@@ -246,7 +246,7 @@ impl Engine {
     }
 
     pub fn best_move(&mut self, game: &mut Game) -> Option<(String, String)> {
-        let moves = game.board.all_legal_moves(game.current_turn);
+        let moves = game.board.all_legal_moves_fast(game.current_turn);
         let base_engine = self.clone();
 
         let results: Vec<((String, String), i32, Engine)> = moves
