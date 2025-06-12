@@ -467,11 +467,76 @@ impl Board {
         count
     }
 
-    pub fn piece_count_total(&self, color: Color) -> usize {
+pub fn piece_count_total(&self, color: Color) -> usize {
         let cidx = color_idx(color);
         self.bitboards[cidx]
             .iter()
             .map(|bb| bb.count_ones() as usize)
             .sum()
+    }
+
+    pub fn piece_count_all(&self) -> usize {
+        self.bitboards
+            .iter()
+            .flat_map(|b| b.iter())
+            .map(|bb| bb.count_ones() as usize)
+            .sum()
+    }
+
+    pub fn to_fen(&self, turn: Color) -> String {
+        let mut fen = String::new();
+        for rank in (0..8).rev() {
+            let mut empty = 0;
+            for file in 0..8 {
+                if let Some(piece) = self.get_index(file, rank) {
+                    if empty > 0 {
+                        fen.push_str(&empty.to_string());
+                        empty = 0;
+                    }
+                    let mut ch = match piece.piece_type {
+                        PieceType::Pawn => 'p',
+                        PieceType::Knight => 'n',
+                        PieceType::Bishop => 'b',
+                        PieceType::Rook => 'r',
+                        PieceType::Queen => 'q',
+                        PieceType::King => 'k',
+                    };
+                    if piece.color == Color::White {
+                        ch = ch.to_ascii_uppercase();
+                    }
+                    fen.push(ch);
+                } else {
+                    empty += 1;
+                }
+            }
+            if empty > 0 {
+                fen.push_str(&empty.to_string());
+            }
+            if rank > 0 {
+                fen.push('/');
+            }
+        }
+        fen.push(' ');
+        fen.push(if turn == Color::White { 'w' } else { 'b' });
+        fen.push(' ');
+        let mut castle = String::new();
+        if self.castling[0][0] { castle.push('K'); }
+        if self.castling[0][1] { castle.push('Q'); }
+        if self.castling[1][0] { castle.push('k'); }
+        if self.castling[1][1] { castle.push('q'); }
+        if castle.is_empty() { castle.push('-'); }
+        fen.push_str(&castle);
+        fen.push(' ');
+        if let Some((x,y)) = self.en_passant {
+            if let Some(ep) = Self::index_to_algebraic(x,y) {
+                fen.push_str(&ep);
+            } else {
+                fen.push('-');
+            }
+        } else {
+            fen.push('-');
+        }
+        fen.push_str(" 0 1");
+        fen
     }
 }
