@@ -39,6 +39,10 @@ pub static ZOBRIST_SIDE: Lazy<u64> = Lazy::new(|| 0x9d39247e33776d41);
 
 impl Board {
     pub fn hash(&self, side: Color) -> u64 {
+        if side == Color::White { self.hash ^ *ZOBRIST_SIDE } else { self.hash }
+    }
+
+    pub fn recompute_hash(&mut self) {
         let mut h = 0u64;
         for c in 0..2 {
             for p in 0..6 {
@@ -50,8 +54,7 @@ impl Board {
                 }
             }
         }
-        if side == Color::White { h ^= *ZOBRIST_SIDE; }
-        h
+        self.hash = h;
     }
 }
 
