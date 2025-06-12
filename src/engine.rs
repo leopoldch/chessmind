@@ -101,6 +101,7 @@ impl Engine {
         }
     }
 
+    #[inline(always)]
     fn piece_value(t: PieceType) -> i32 {
         match t {
             PieceType::Pawn => 100,
@@ -111,6 +112,7 @@ impl Engine {
         }
     }
 
+    #[inline(always)]
     fn evaluate(board: &Board, color: Color) -> i32 {
         const VALUES: [i32;6] = [100,320,330,500,900,0];
         let mut score = 0;
@@ -143,6 +145,7 @@ impl Engine {
         score
     }
 
+    #[inline(always)]
     fn move_score(&self, board: &Board, s: &String, e: &String, ply: usize) -> i32 {
         let mut score = *self.history.get(&(s.clone(), e.clone())).unwrap_or(&0);
         if let Some(k) = self.killers.get(ply) {
@@ -157,6 +160,7 @@ impl Engine {
         score
     }
 
+    #[inline(always)]
     fn quiescence(&mut self, board: &mut Board, color: Color, mut alpha: i32, beta: i32) -> i32 {
         let stand_pat = Self::evaluate(board, color);
         if stand_pat >= beta { return beta; }
@@ -193,7 +197,7 @@ impl Engine {
 
         if depth >= 3 && !board.in_check(color) {
             let ep = board.en_passant;
-            let score = -self.negamax(board, opposite(color), depth - 1 - 2, -beta, -beta+1, ply+1);
+            let score = -self.negamax(board, opposite(color), depth - 1 - 2, -beta, -beta + 1, ply + 1);
             board.en_passant = ep;
             if score >= beta { return beta; }
         }
@@ -211,22 +215,16 @@ impl Engine {
         }
 
         let mut best_move = None;
-        let mut best = -100000;
         for (idx,(s,e)) in moves.iter().enumerate() {
             if let Some(state) = board.make_move_state(s,e) {
-                let mut new_depth = depth -1;
+                let mut new_depth = depth - 1;
                 let capture = board.get_index(state.end.0,state.end.1).is_some();
                 if idx >= 3 && depth > 2 && !capture {
                     new_depth = new_depth.saturating_sub(1);
                 }
-                let score = -self.negamax(board, opposite(color), new_depth, -beta, -alpha, ply+1);
+                let score = -self.negamax(board, opposite(color), new_depth, -beta, -alpha, ply + 1);
                 board.unmake_move(state);
-                if score > best {
-                    best = score;
-                    best_move = Some((s.clone(), e.clone()));
-                }
-                if score > alpha { alpha = score; }
-                if alpha >= beta {
+                if score >= beta {
                     if !capture {
                         let k = &mut self.killers[ply];
                         if k[0].as_ref() != Some(&(s.clone(),e.clone())) {
@@ -234,15 +232,20 @@ impl Engine {
                             k[0] = Some((s.clone(),e.clone()));
                         }
                     }
-                    *self.history.entry((s.clone(),e.clone())).or_insert(0) += (depth*depth) as i32;
-                    break;
+                    *self.history.entry((s.clone(),e.clone())).or_insert(0) += (depth * depth) as i32;
+                    self.tt.put(hash, TTEntry { depth, value: beta, bound: Bound::Lower, best: Some((s.clone(), e.clone())) });
+                    return beta;
+                }
+                if score > alpha {
+                    alpha = score;
+                    best_move = Some((s.clone(), e.clone()));
                 }
             }
         }
 
-        let bound = if best <= alpha_orig { Bound::Upper } else if best >= beta { Bound::Lower } else { Bound::Exact };
-        self.tt.put(hash, TTEntry { depth, value: best, bound, best: best_move });
-        best
+        let bound = if alpha <= alpha_orig { Bound::Upper } else { Bound::Exact };
+        self.tt.put(hash, TTEntry { depth, value: alpha, bound, best: best_move });
+        alpha
     }
 
     pub fn best_move(&mut self, game: &mut Game) -> Option<(String, String)> {
@@ -279,6 +282,7 @@ impl Engine {
     }
 }
 
+#[inline(always)]
 fn opposite(c: Color) -> Color {
     match c { Color::White => Color::Black, Color::Black => Color::White }
 }
