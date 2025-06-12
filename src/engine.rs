@@ -85,6 +85,8 @@ const RFP_MARGIN: [i32; 4] = [0, 200, 300, 400];
 // Parameters for History Leaf Pruning
 const HLP_THRESHOLD: u32 = 2;
 const HLP_BASE: i32 = -50;
+// Move count thresholds for Late Move Pruning by depth (index 0 unused)
+const LMP_LIMITS: [usize; 5] = [0, 6, 8, 12, 16];
 
 pub struct Engine {
     pub depth: u32,
@@ -331,6 +333,9 @@ impl Engine {
             let capture_flag = if let Some((ex,ey)) = Board::algebraic_to_index(e) {
                 board.get_index(ex,ey).is_some()
             } else { false };
+            if !in_check_now && !capture_flag && depth <= 4 && idx >= LMP_LIMITS[depth as usize] {
+                continue;
+            }
             if skip_quiets && !capture_flag { continue; }
             if !in_check_now && !capture_flag && depth <= HLP_THRESHOLD && idx > 0 {
                 let mv_score = self.move_score(board,s,e,ply,prev_move.as_ref());
