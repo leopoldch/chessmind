@@ -6,6 +6,7 @@ use chessmind::{
 };
 use eframe::{App, Frame, egui};
 use egui::Color32;
+use num_cpus;
 use std::time::{Duration, Instant};
 
 pub struct GuiApp {
@@ -22,7 +23,7 @@ impl GuiApp {
     pub fn new() -> Self {
         Self {
             game: Game::new(),
-            engine: Engine::new(3),
+            engine: Engine::with_threads(3, num_cpus::get()),
             vs_ai: false,
             ai_color: Color::Black,
             dragging: None,

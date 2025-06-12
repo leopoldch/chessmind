@@ -3,8 +3,10 @@ use std::time::Instant;
 use chessmind::{game::Game, engine::Engine, pieces::Color, san::parse_san};
 use futures_util::{StreamExt, SinkExt};
 use serde::Deserialize;
+use serde_json;
 use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
+use num_cpus;
 
 fn is_coordinate(mv: &str) -> bool {
     mv.len() == 4
@@ -48,7 +50,7 @@ async fn handle_conn(stream: tokio::net::TcpStream, addr: std::net::SocketAddr) 
     let ws_stream = accept_async(stream).await.expect("ws accept");
     let (mut write, mut read) = ws_stream.split();
     let mut game = Game::new();
-    let mut engine = Engine::new(3);
+    let mut engine = Engine::with_threads(3, num_cpus::get());
     let mut my_color: Option<Color> = None;
     let mut last_len: usize = 0;
     while let Some(msg) = read.next().await {
@@ -139,7 +141,8 @@ async fn handle_conn(stream: tokio::net::TcpStream, addr: std::net::SocketAddr) 
                 if let Some((s, e)) = next {
                     game.make_move(&s, &e);
                     last_len += 1;
-                    let _ = write.send(Message::Text(format!("{}{}", s, e))).await;
+                    let msg = serde_json::json!({"next_move": format!("{}{}", s, e)}).to_string();
+                    let _ = write.send(Message::Text(msg)).await;
                 }
             }
         }
