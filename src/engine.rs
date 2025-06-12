@@ -225,7 +225,7 @@ impl Engine {
         alpha
     }
 
-    fn negamax(&mut self, board: &mut Board, color: Color, depth: u32, mut alpha: i32, beta: i32, ply: usize, prev_move: Option<(String,String)>) -> i32 {
+    fn pvs(&mut self, board: &mut Board, color: Color, depth: u32, mut alpha: i32, beta: i32, ply: usize, prev_move: Option<(String,String)>) -> i32 {
         let alpha_orig = alpha;
         let hash = board.hash(color);
         let mut tt_best: Option<(String, String)> = None;
@@ -249,7 +249,7 @@ impl Engine {
 
         if depth >= 3 && !board.in_check(color) {
             let ep = board.en_passant;
-            let score = -self.negamax(board, opposite(color), depth - 1 - 2, -beta, -beta + 1, ply + 1, prev_move.clone());
+            let score = -self.pvs(board, opposite(color), depth - 1 - 2, -beta, -beta + 1, ply + 1, prev_move.clone());
             board.en_passant = ep;
             if score >= beta { return beta; }
         }
@@ -288,7 +288,15 @@ impl Engine {
                 if idx >= 3 && depth > 2 && !capture {
                     new_depth = new_depth.saturating_sub(1);
                 }
-                let score = -self.negamax(board, opposite(color), new_depth, -beta, -alpha, ply + 1, Some((s.clone(),e.clone())));
+                let mut score;
+                if idx == 0 {
+                    score = -self.pvs(board, opposite(color), new_depth, -beta, -alpha, ply + 1, Some((s.clone(),e.clone())));
+                } else {
+                    score = -self.pvs(board, opposite(color), new_depth, -alpha-1, -alpha, ply + 1, Some((s.clone(),e.clone())));
+                    if score > alpha && score < beta {
+                        score = -self.pvs(board, opposite(color), new_depth, -beta, -alpha, ply + 1, Some((s.clone(),e.clone())));
+                    }
+                }
                 board.unmake_move(state);
                 if score >= beta {
                     if !capture {
@@ -329,6 +337,11 @@ impl Engine {
         alpha
     }
 
+    #[allow(dead_code)]
+    fn negamax(&mut self, board: &mut Board, color: Color, depth: u32, alpha: i32, beta: i32, ply: usize, prev_move: Option<(String,String)>) -> i32 {
+        self.pvs(board, color, depth, alpha, beta, ply, prev_move)
+    }
+
     fn best_move_single(&mut self, game: &mut Game) -> Option<(String, String)> {
         const ASPIRATION: i32 = 50;
         let color = game.current_turn;
@@ -346,7 +359,7 @@ impl Engine {
 
             loop {
                 let mut board = game.board.clone();
-                let score = self.negamax(&mut board, color, d, alpha, beta, 0, None);
+                let score = self.pvs(&mut board, color, d, alpha, beta, 0, None);
 
                 if score <= alpha {
                     alpha -= ASPIRATION;
@@ -391,7 +404,7 @@ impl Engine {
                     let mut engine = self.clone();
                     let mut board = game.board.clone();
                     if let Some(state) = board.make_move_state(s,e) {
-                        let score = -engine.negamax(&mut board, opposite(color), depth - 1, -100000, 100000, 0, None);
+                        let score = -engine.pvs(&mut board, opposite(color), depth - 1, -100000, 100000, 0, None);
                         board.unmake_move(state);
                         (score, s.clone(), e.clone())
                     } else {
