@@ -80,6 +80,8 @@ const PST: [[i32;64];6] = [
 ];
 
 const BISHOP_PAIR: i32 = 30;
+// Margins used for Reverse Futility Pruning by depth (index 0 unused)
+const RFP_MARGIN: [i32; 4] = [0, 200, 300, 400];
 
 pub struct Engine {
     pub depth: u32,
@@ -268,6 +270,14 @@ impl Engine {
         }
 
         if depth == 0 { return self.quiescence(board, color, alpha, beta); }
+
+        // Reverse Futility Pruning
+        if depth <= 3 && !board.in_check(color) {
+            let eval = Self::evaluate(board, color);
+            if eval - RFP_MARGIN[depth as usize] >= beta {
+                return eval;
+            }
+        }
 
         if depth >= 3 && !board.in_check(color) && board.piece_count_total(color) > 3 {
             let r = if depth > 6 { 3 } else { 2 };
