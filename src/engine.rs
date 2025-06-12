@@ -180,6 +180,19 @@ impl Engine {
         0
     }
 
+    #[inline(always)]
+    fn lmr_value(depth: u32, idx: usize) -> u32 {
+        if depth < 3 || idx < 3 {
+            return 0;
+        }
+        let d = (depth as f64).ln();
+        let m = ((idx + 1) as f64).ln();
+        let mut r = (d * m / 1.5) as i32;
+        if r < 1 { r = 1; }
+        if r as u32 > depth - 1 { r = (depth - 1) as i32; }
+        r as u32
+    }
+
     fn move_score(&self, board: &Board, s: &String, e: &String, ply: usize, prev: Option<&(String,String)>) -> i32 {
         let mut score = 0;
         let capture = if let Some((ex,ey)) = Board::algebraic_to_index(e) {
@@ -290,12 +303,15 @@ impl Engine {
         }
 
         let mut best_move = None;
+        let in_check_now = board.in_check(color);
         for (idx,(s,e)) in moves.iter().enumerate() {
             if let Some(state) = board.make_move_state(s,e) {
                 let mut new_depth = depth - 1;
-                let capture = board.get_index(state.end.0,state.end.1).is_some();
-                if idx >= 3 && depth > 2 && !capture {
-                    new_depth = new_depth.saturating_sub(1);
+                let capture = state.captured.is_some();
+                if depth > 2 && !capture && !in_check_now {
+                    let mut r = Self::lmr_value(depth, idx + 1);
+                    if board.in_check(opposite(color)) { r = r.saturating_sub(1); }
+                    new_depth = new_depth.saturating_sub(r);
                 }
                 let mut score;
                 if idx == 0 {
