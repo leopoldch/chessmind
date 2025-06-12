@@ -4,7 +4,86 @@ use crate::game::Game;
 use crate::transposition::{Table, TTEntry, Bound, TABLE_SIZE};
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use rayon::prelude::*;
 
+const PAWN_PST: [i32; 64] = [
+    0, 0, 0, 0, 0, 0, 0, 0,
+    5, 10, 10, -20, -20, 10, 10, 5,
+    5, -5, -10, 0, 0, -10, -5, 5,
+    0, 0, 0, 20, 20, 0, 0, 0,
+    5, 5, 10, 25, 25, 10, 5, 5,
+    10, 10, 20, 30, 30, 20, 10, 10,
+    50, 50, 50, 50, 50, 50, 50, 50,
+    0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+const KNIGHT_PST: [i32; 64] = [
+    -50,-40,-30,-30,-30,-30,-40,-50,
+    -40,-20,0,0,0,0,-20,-40,
+    -30,0,10,15,15,10,0,-30,
+    -30,5,15,20,20,15,5,-30,
+    -30,0,15,20,20,15,0,-30,
+    -30,5,10,15,15,10,5,-30,
+    -40,-20,0,5,5,0,-20,-40,
+    -50,-40,-30,-30,-30,-30,-40,-50,
+];
+
+const BISHOP_PST: [i32; 64] = [
+    -20,-10,-10,-10,-10,-10,-10,-20,
+    -10,0,0,0,0,0,0,-10,
+    -10,0,5,10,10,5,0,-10,
+    -10,5,5,10,10,5,5,-10,
+    -10,0,10,10,10,10,0,-10,
+    -10,10,10,10,10,10,10,-10,
+    -10,5,0,0,0,0,5,-10,
+    -20,-10,-10,-10,-10,-10,-10,-20,
+];
+
+const ROOK_PST: [i32; 64] = [
+    0,0,0,0,0,0,0,0,
+    5,10,10,10,10,10,10,5,
+    -5,0,0,0,0,0,0,-5,
+    -5,0,0,0,0,0,0,-5,
+    -5,0,0,0,0,0,0,-5,
+    -5,0,0,0,0,0,0,-5,
+    -5,0,0,0,0,0,0,-5,
+    0,0,0,5,5,0,0,0,
+];
+
+const QUEEN_PST: [i32; 64] = [
+    -20,-10,-10,-5,-5,-10,-10,-20,
+    -10,0,0,0,0,0,0,-10,
+    -10,0,5,5,5,5,0,-10,
+    -5,0,5,5,5,5,0,-5,
+    0,0,5,5,5,5,0,-5,
+    -10,5,5,5,5,5,0,-10,
+    -10,0,5,0,0,0,0,-10,
+    -20,-10,-10,-5,-5,-10,-10,-20,
+];
+
+const KING_PST: [i32; 64] = [
+    -30,-40,-40,-50,-50,-40,-40,-30,
+    -30,-40,-40,-50,-50,-40,-40,-30,
+    -30,-40,-40,-50,-50,-40,-40,-30,
+    -30,-40,-40,-50,-50,-40,-40,-30,
+    -20,-30,-30,-40,-40,-30,-30,-20,
+    -10,-20,-20,-20,-20,-20,-20,-10,
+    20,20,0,0,0,0,20,20,
+    20,30,10,0,0,10,30,20,
+];
+
+const PST: [[i32;64];6] = [
+    PAWN_PST,
+    KNIGHT_PST,
+    BISHOP_PST,
+    ROOK_PST,
+    QUEEN_PST,
+    KING_PST,
+];
+
+const BISHOP_PAIR: i32 = 30;
+
+#[derive(Clone)]
 pub struct Engine {
     pub depth: u32,
     tt: Table,
@@ -33,18 +112,33 @@ impl Engine {
     }
 
     fn evaluate(board: &Board, color: Color) -> i32 {
-        const VALUES: [i32;6] = [100,320,320,500,900,0];
+        const VALUES: [i32;6] = [100,320,330,500,900,0];
         let mut score = 0;
-        for c in 0..2 {
-            let sign = if c == color_idx(color) { 1 } else { -1 };
+        for c in [Color::White, Color::Black] {
+            let sign = if c == color { 1 } else { -1 };
+            let cidx = color_idx(c);
             for p in 0..6 {
-                let mut bb = board.bitboards[c][p];
+                let mut bb = board.bitboards[cidx][p];
                 let val = VALUES[p];
                 while bb != 0 {
-                    score += sign * val;
+                    let sq = bb.trailing_zeros() as usize;
+                    let idx = if c == Color::White {
+                        sq
+                    } else {
+                        let x = sq % 8;
+                        let y = sq / 8;
+                        (7 - y) * 8 + x
+                    };
+                    score += sign * (val + PST[p][idx]);
                     bb &= bb - 1;
                 }
             }
+        }
+        if board.piece_count_color(PieceType::Bishop, Color::White) >= 2 {
+            score += if color == Color::White { BISHOP_PAIR } else { -BISHOP_PAIR };
+        }
+        if board.piece_count_color(PieceType::Bishop, Color::Black) >= 2 {
+            score += if color == Color::Black { BISHOP_PAIR } else { -BISHOP_PAIR };
         }
         score
     }
@@ -146,24 +240,35 @@ impl Engine {
 
     pub fn best_move(&mut self, game: &mut Game) -> Option<(String, String)> {
         let moves = game.board.all_legal_moves(game.current_turn);
-        let mut best = None;
-        let mut best_score = -100000;
-        for (s,e) in moves {
-            if let Some(state) = game.board.make_move_state(&s,&e) {
-                let hash = game.board.hash(opposite(game.current_turn));
+        let base_engine = self.clone();
+
+        let results: Vec<((String, String), i32, Engine)> = moves
+            .into_par_iter()
+            .filter_map(|(s, e)| {
+                let mut board = game.board.clone();
+                if board.make_move_state(&s, &e).is_none() {
+                    return None;
+                }
+                let hash = board.hash(opposite(game.current_turn));
                 if game.repetition_count(hash) >= 2 {
-                    game.board.unmake_move(state);
-                    continue;
+                    return None;
                 }
-                let score = -self.negamax(&mut game.board, opposite(game.current_turn), self.depth-1, -100000, 100000, 1);
-                game.board.unmake_move(state);
-                if score > best_score {
-                    best_score = score;
-                    best = Some((s,e));
-                }
-            }
+                let mut eng = base_engine.clone();
+                let score = -eng.negamax(&mut board, opposite(game.current_turn), eng.depth-1, -100000, 100000, 1);
+                Some(((s, e), score, eng))
+            })
+            .collect();
+
+        let best = results
+            .into_iter()
+            .max_by_key(|(_, score, _)| *score);
+
+        if let Some(((s, e), _score, eng)) = best {
+            *self = eng;
+            Some((s, e))
+        } else {
+            None
         }
-        best
     }
 }
 
