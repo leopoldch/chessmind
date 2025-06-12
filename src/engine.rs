@@ -3,7 +3,6 @@ use crate::pieces::{Color, PieceType};
 use crate::game::Game;
 use crate::transposition::{Table, TTEntry, Bound, TABLE_SIZE};
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
 
 const PAWN_PST: [i32; 64] = [
     0, 0, 0, 0, 0, 0, 0, 0,
@@ -82,7 +81,6 @@ const PST: [[i32;64];6] = [
 
 const BISHOP_PAIR: i32 = 30;
 
-#[derive(Clone)]
 pub struct Engine {
     pub depth: u32,
     pub threads: usize,
@@ -91,6 +89,20 @@ pub struct Engine {
     quiet_history: HashMap<(String,String), i32>,
     capture_history: HashMap<(String,String), i32>,
     cont_history: HashMap<((String,String),(String,String)), i32>,
+}
+
+impl Clone for Engine {
+    fn clone(&self) -> Self {
+        Self {
+            depth: self.depth,
+            threads: self.threads,
+            tt: self.tt.clone(),
+            killers: self.killers.clone(),
+            quiet_history: self.quiet_history.clone(),
+            capture_history: self.capture_history.clone(),
+            cont_history: self.cont_history.clone(),
+        }
+    }
 }
 
 impl Engine {
@@ -102,7 +114,7 @@ impl Engine {
         Self {
             depth,
             threads,
-            tt: Table::new(NonZeroUsize::new(TABLE_SIZE).unwrap()),
+            tt: Table::new(TABLE_SIZE),
             killers: vec![[None, None]; (depth as usize)+1],
             quiet_history: HashMap::new(),
             capture_history: HashMap::new(),
@@ -217,7 +229,7 @@ impl Engine {
         let alpha_orig = alpha;
         let hash = board.hash(color);
         let mut tt_best: Option<(String, String)> = None;
-        if let Some(entry) = self.tt.get(&hash) {
+        if let Some(entry) = self.tt.get(hash) {
             if entry.depth >= depth {
                 match entry.bound {
                     Bound::Exact => return entry.value,
@@ -226,7 +238,11 @@ impl Engine {
                 }
                 if alpha >= beta { return entry.value; }
             }
-            tt_best = entry.best.clone();
+            if let Some((fs,ts)) = entry.best {
+                let f = Board::index_to_algebraic((fs % 8) as usize, (fs / 8) as usize);
+                let t = Board::index_to_algebraic((ts % 8) as usize, (ts / 8) as usize);
+                if let (Some(ff), Some(tt)) = (f,t) { tt_best = Some((ff,tt)); }
+            }
         }
 
         if depth == 0 { return self.quiescence(board, color, alpha, beta); }
@@ -290,7 +306,10 @@ impl Engine {
                     if let Some(pmv) = &prev_move {
                         *self.cont_history.entry((pmv.clone(), (s.clone(),e.clone()))).or_insert(0) += (depth * depth) as i32;
                     }
-                    self.tt.put(hash, TTEntry { depth, value: beta, bound: Bound::Lower, best: Some((s.clone(), e.clone())) });
+                    let best_idx = Board::algebraic_to_index(s).and_then(|(sx,sy)| {
+                        Board::algebraic_to_index(e).map(|(ex,ey)| ((sy*8+sx) as u8, (ey*8+ex) as u8))
+                    });
+                    self.tt.store(hash, TTEntry { depth, value: beta, bound: Bound::Lower, best: best_idx });
                     return beta;
                 }
                 if score > alpha {
@@ -301,7 +320,12 @@ impl Engine {
         }
 
         let bound = if alpha <= alpha_orig { Bound::Upper } else { Bound::Exact };
-        self.tt.put(hash, TTEntry { depth, value: alpha, bound, best: best_move });
+        let best_idx = best_move.as_ref().and_then(|(s,e)| {
+            let fs = Board::algebraic_to_index(s)?;
+            let ts = Board::algebraic_to_index(e)?;
+            Some(((fs.1*8 + fs.0) as u8, (ts.1*8 + ts.0) as u8))
+        });
+        self.tt.store(hash, TTEntry { depth, value: alpha, bound, best: best_idx });
         alpha
     }
 
@@ -334,8 +358,15 @@ impl Engine {
                 }
 
                 guess = score;
-                if let Some(entry) = self.tt.get(&root_hash) {
-                    best_move = entry.best.clone();
+                if let Some(entry) = self.tt.get(root_hash) {
+                    if let Some((fs,ts)) = entry.best {
+                        if let (Some(f), Some(t)) = (
+                            Board::index_to_algebraic((fs % 8) as usize, (fs / 8) as usize),
+                            Board::index_to_algebraic((ts % 8) as usize, (ts / 8) as usize),
+                        ) {
+                            best_move = Some((f,t));
+                        }
+                    }
                 }
                 break;
             }
@@ -373,6 +404,7 @@ impl Engine {
     }
 
     pub fn best_move(&mut self, game: &mut Game) -> Option<(String, String)> {
+        self.tt.next_age();
         if self.threads <= 1 {
             self.best_move_single(game)
         } else {
