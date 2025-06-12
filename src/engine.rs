@@ -269,9 +269,10 @@ impl Engine {
 
         if depth == 0 { return self.quiescence(board, color, alpha, beta); }
 
-        if depth >= 3 && !board.in_check(color) {
+        if depth >= 3 && !board.in_check(color) && board.piece_count_total(color) > 3 {
+            let r = if depth > 6 { 3 } else { 2 };
             let ep = board.en_passant;
-            let score = -self.pvs(board, opposite(color), depth - 1 - 2, -beta, -beta + 1, ply + 1, prev_move.clone(), true);
+            let score = -self.pvs(board, opposite(color), depth - 1 - r, -beta, -beta + 1, ply + 1, prev_move.clone(), true);
             board.en_passant = ep;
             if score >= beta { return beta; }
         }

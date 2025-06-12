@@ -466,4 +466,12 @@ impl Board {
         }
         count
     }
+
+    pub fn piece_count_total(&self, color: Color) -> usize {
+        let cidx = color_idx(color);
+        self.bitboards[cidx]
+            .iter()
+            .map(|bb| bb.count_ones() as usize)
+            .sum()
+    }
 }
