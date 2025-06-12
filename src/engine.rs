@@ -4,7 +4,6 @@ use crate::game::Game;
 use crate::transposition::{Table, TTEntry, Bound, TABLE_SIZE};
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use rayon::prelude::*;
 
 const PAWN_PST: [i32; 64] = [
     0, 0, 0, 0, 0, 0, 0, 0,
@@ -249,36 +248,42 @@ impl Engine {
     }
 
     pub fn best_move(&mut self, game: &mut Game) -> Option<(String, String)> {
-        let moves = game.board.all_legal_moves_fast(game.current_turn);
-        let base_engine = self.clone();
+        const ASPIRATION: i32 = 50;
+        let color = game.current_turn;
+        let root_hash = game.board.hash(color);
+        let mut guess = 0;
+        let mut best_move = None;
 
-        let results: Vec<((String, String), i32, Engine)> = moves
-            .into_par_iter()
-            .filter_map(|(s, e)| {
+        for d in 1..=self.depth {
+            let mut alpha = -100000;
+            let mut beta = 100000;
+            if d > 1 {
+                alpha = guess - ASPIRATION;
+                beta = guess + ASPIRATION;
+            }
+
+            loop {
                 let mut board = game.board.clone();
-                if board.make_move_state(&s, &e).is_none() {
-                    return None;
-                }
-                let hash = board.hash(opposite(game.current_turn));
-                if game.repetition_count(hash) >= 2 {
-                    return None;
-                }
-                let mut eng = base_engine.clone();
-                let score = -eng.negamax(&mut board, opposite(game.current_turn), eng.depth-1, -100000, 100000, 1);
-                Some(((s, e), score, eng))
-            })
-            .collect();
+                let score = self.negamax(&mut board, color, d, alpha, beta, 0);
 
-        let best = results
-            .into_iter()
-            .max_by_key(|(_, score, _)| *score);
+                if score <= alpha {
+                    alpha -= ASPIRATION;
+                    continue;
+                }
+                if score >= beta {
+                    beta += ASPIRATION;
+                    continue;
+                }
 
-        if let Some(((s, e), _score, eng)) = best {
-            *self = eng;
-            Some((s, e))
-        } else {
-            None
+                guess = score;
+                if let Some(entry) = self.tt.get(&root_hash) {
+                    best_move = entry.best.clone();
+                }
+                break;
+            }
         }
+
+        best_move
     }
 }
 
