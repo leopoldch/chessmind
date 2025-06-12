@@ -3,6 +3,9 @@ use crate::pieces::{Color, PieceType};
 use crate::game::Game;
 use crate::transposition::{Table, TTEntry, Bound, TABLE_SIZE};
 use std::collections::HashMap;
+use std::sync::Arc;
+use shakmaty::{Chess, CastlingMode, fen::Fen};
+use shakmaty_syzygy::{Tablebase, Wdl};
 
 const PAWN_PST: [i32; 64] = [
     0, 0, 0, 0, 0, 0, 0, 0,
@@ -87,6 +90,7 @@ const HLP_THRESHOLD: u32 = 2;
 const HLP_BASE: i32 = -50;
 // Move count thresholds for Late Move Pruning by depth (index 0 unused)
 const LMP_LIMITS: [usize; 5] = [0, 6, 8, 12, 16];
+const SINGULAR_MARGIN: i32 = 200;
 
 pub struct Engine {
     pub depth: u32,
@@ -96,6 +100,7 @@ pub struct Engine {
     quiet_history: HashMap<(String,String), i32>,
     capture_history: HashMap<(String,String), i32>,
     cont_history: HashMap<((String,String),(String,String)), i32>,
+    tb: Option<Arc<Tablebase<Chess>>>,
 }
 
 impl Clone for Engine {
@@ -108,6 +113,7 @@ impl Clone for Engine {
             quiet_history: self.quiet_history.clone(),
             capture_history: self.capture_history.clone(),
             cont_history: self.cont_history.clone(),
+            tb: self.tb.clone(),
         }
     }
 }
@@ -126,11 +132,19 @@ impl Engine {
             quiet_history: HashMap::new(),
             capture_history: HashMap::new(),
             cont_history: HashMap::new(),
+            tb: None,
         }
     }
 
     pub fn set_threads(&mut self, threads: usize) {
         self.threads = threads;
+    }
+
+    pub fn load_syzygy(&mut self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let mut tb = Tablebase::new();
+        tb.add_directory(path)?;
+        self.tb = Some(Arc::new(tb));
+        Ok(())
     }
 
     #[inline(always)]
@@ -198,6 +212,21 @@ impl Engine {
         if r < 1 { r = 1; }
         if r as u32 > depth - 1 { r = (depth - 1) as i32; }
         r as u32
+    }
+
+    fn probe_syzygy(&self, board: &Board, color: Color, ply: usize) -> Option<i32> {
+        let tb = self.tb.as_ref()?;
+        if board.piece_count_all() > tb.max_pieces() {
+            return None;
+        }
+        let fen = board.to_fen(color);
+        let pos: Chess = fen.parse::<Fen>().ok()?.into_position(CastlingMode::Standard).ok()?;
+        let wdl = tb.probe_wdl(&pos).ok()?.after_zeroing();
+        Some(match wdl {
+            Wdl::Win | Wdl::CursedWin => 10000 - ply as i32,
+            Wdl::Loss | Wdl::BlessedLoss => -10000 + ply as i32,
+            Wdl::Draw => 0,
+        })
     }
 
     fn move_score(&self, board: &Board, s: &String, e: &String, ply: usize, prev: Option<&(String,String)>) -> i32 {
@@ -282,6 +311,10 @@ impl Engine {
             }
         }
 
+        if let Some(tb_val) = self.probe_syzygy(board, color, ply) {
+            return tb_val;
+        }
+
         if depth == 0 { return self.quiescence(board, color, alpha, beta); }
 
         // Reverse Futility Pruning
@@ -360,6 +393,11 @@ impl Engine {
                     if score > alpha && score < beta {
                         score = -self.pvs(board, opposite(color), new_depth, -beta, -alpha, ply + 1, Some((s.clone(),e.clone())), true);
                     }
+                }
+                if depth > 1 && score >= beta - SINGULAR_MARGIN {
+                    let ext_depth = new_depth.saturating_add(1);
+                    let ext_score = -self.pvs(board, opposite(color), ext_depth, -beta, -alpha, ply + 1, Some((s.clone(),e.clone())), true);
+                    score = ext_score;
                 }
                 board.unmake_move(state);
                 if score >= beta {

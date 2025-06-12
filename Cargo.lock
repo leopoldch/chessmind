@@ -556,6 +556,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "btoi"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b5ab9db53bcda568284df0fd39f6eac24ad6f7ba7ff1168b9e76eba6576b976"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -696,6 +705,8 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "shakmaty",
+ "shakmaty-syzygy",
  "tokio",
  "tokio-tungstenite",
 ]
@@ -2793,6 +2804,35 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest",
+]
+
+[[package]]
+name = "shakmaty"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3065bdba026d0a3a6eb452ff174dbbd258452643a71383153abb91a8a4fc1abc"
+dependencies = [
+ "arrayvec",
+ "bitflags 2.9.1",
+ "btoi",
+ "nohash-hasher",
+ "serde",
+]
+
+[[package]]
+name = "shakmaty-syzygy"
+version = "0.26.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88977d580771609b3104acd618b3098470bb9d37fc9a3f1dd5cf54d30cf32aa3"
+dependencies = [
+ "arrayvec",
+ "bitflags 2.9.1",
+ "byteorder",
+ "libc",
+ "once_cell",
+ "rustc-hash 2.1.1",
+ "shakmaty",
+ "tracing",
 ]
 
 [[package]]
