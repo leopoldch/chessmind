@@ -150,6 +150,11 @@ impl Engine {
         let mut best_score = -100000;
         for (s,e) in moves {
             if let Some(state) = game.board.make_move_state(&s,&e) {
+                let hash = game.board.hash(opposite(game.current_turn));
+                if game.repetition_count(hash) >= 2 {
+                    game.board.unmake_move(state);
+                    continue;
+                }
                 let score = -self.negamax(&mut game.board, opposite(game.current_turn), self.depth-1, -100000, 100000, 1);
                 game.board.unmake_move(state);
                 if score > best_score {
