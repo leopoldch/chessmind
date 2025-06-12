@@ -6,6 +6,7 @@ pub struct Game {
     pub current_turn: Color,
     pub history: Vec<(String, String)>,
     pub hash_history: Vec<u64>,
+    pub hash_counts: std::collections::HashMap<u64, usize>,
     pub result: Option<Color>,
 }
 
@@ -19,6 +20,11 @@ impl Game {
             current_turn: Color::White,
             history: Vec::new(),
             hash_history: vec![hash],
+            hash_counts: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(hash, 1);
+                m
+            },
             result: None,
         }
     }
@@ -30,7 +36,9 @@ impl Game {
         if self.board.make_move_state(start, end).is_some() {
             self.history.push((start.to_string(), end.to_string()));
             self.current_turn = if self.current_turn == Color::White { Color::Black } else { Color::White };
-            self.hash_history.push(self.board.hash(self.current_turn));
+            let h = self.board.hash(self.current_turn);
+            self.hash_history.push(h);
+            *self.hash_counts.entry(h).or_insert(0) += 1;
             if self.board.all_legal_moves(self.current_turn).is_empty() {
                 if self.board.in_check(self.current_turn) {
                     self.result = Some(if self.current_turn == Color::White { Color::Black } else { Color::White });
@@ -47,6 +55,6 @@ impl Game {
     }
 
     pub fn repetition_count(&self, hash: u64) -> usize {
-        self.hash_history.iter().filter(|&&h| h == hash).count()
+        *self.hash_counts.get(&hash).unwrap_or(&0)
     }
 }

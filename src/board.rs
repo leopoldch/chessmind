@@ -1,4 +1,5 @@
 use crate::pieces::{Color, Piece, PieceType};
+use crate::transposition::ZOBRIST;
 
 #[derive(Clone)]
 pub struct MoveState {
@@ -14,6 +15,7 @@ pub struct MoveState {
 pub struct Board {
     pub squares: [[Option<Piece>; 8]; 8],
     pub bitboards: [[u64; 6]; 2],
+    pub hash: u64,
     pub en_passant: Option<(usize, usize)>,
     pub castling: [[bool; 2]; 2],
 }
@@ -45,12 +47,14 @@ impl Board {
         Self {
             squares: [[None; 8]; 8],
             bitboards: [[0u64; 6]; 2],
+            hash: 0,
             en_passant: None,
             castling: [[true, true], [true, true]],
         }
     }
 
     pub fn setup_standard(&mut self) {
+        self.hash = 0;
         for y in 0..8 {
             for x in 0..8 {
                 self.squares[y][x] = None;
@@ -83,12 +87,14 @@ impl Board {
             let c = color_idx(old.color);
             let p = piece_index(old.piece_type);
             self.bitboards[c][p] &= !mask;
+            self.hash ^= ZOBRIST[c][p][y * 8 + x];
         }
         self.squares[y][x] = piece;
         if let Some(pce) = piece {
             let c = color_idx(pce.color);
             let p = piece_index(pce.piece_type);
             self.bitboards[c][p] |= mask;
+            self.hash ^= ZOBRIST[c][p][y * 8 + x];
         }
     }
 
