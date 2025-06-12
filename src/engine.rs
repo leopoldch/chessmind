@@ -82,6 +82,9 @@ const PST: [[i32;64];6] = [
 const BISHOP_PAIR: i32 = 30;
 // Margins used for Reverse Futility Pruning by depth (index 0 unused)
 const RFP_MARGIN: [i32; 4] = [0, 200, 300, 400];
+// Parameters for History Leaf Pruning
+const HLP_THRESHOLD: u32 = 2;
+const HLP_BASE: i32 = -50;
 
 pub struct Engine {
     pub depth: u32,
@@ -323,7 +326,19 @@ impl Engine {
 
         let mut best_move = None;
         let in_check_now = board.in_check(color);
+        let mut skip_quiets = false;
         for (idx,(s,e)) in moves.iter().enumerate() {
+            let capture_flag = if let Some((ex,ey)) = Board::algebraic_to_index(e) {
+                board.get_index(ex,ey).is_some()
+            } else { false };
+            if skip_quiets && !capture_flag { continue; }
+            if !in_check_now && !capture_flag && depth <= HLP_THRESHOLD && idx > 0 {
+                let mv_score = self.move_score(board,s,e,ply,prev_move.as_ref());
+                if mv_score < HLP_BASE {
+                    skip_quiets = true;
+                    continue;
+                }
+            }
             if let Some(state) = board.make_move_state(s,e) {
                 let mut new_depth = depth - 1;
                 let capture = state.captured.is_some();
@@ -363,6 +378,15 @@ impl Engine {
                     });
                     self.tt.store(hash, TTEntry { depth, value: beta, bound: Bound::Lower, best: best_idx });
                     return beta;
+                } else {
+                    if capture {
+                        *self.capture_history.entry((s.clone(),e.clone())).or_insert(0) -= (depth * depth) as i32;
+                    } else {
+                        *self.quiet_history.entry((s.clone(),e.clone())).or_insert(0) -= (depth * depth) as i32;
+                    }
+                    if let Some(pmv) = &prev_move {
+                        *self.cont_history.entry((pmv.clone(), (s.clone(),e.clone()))).or_insert(0) -= (depth * depth) as i32;
+                    }
                 }
                 if score > alpha {
                     alpha = score;
