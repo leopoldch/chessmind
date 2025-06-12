@@ -405,6 +405,10 @@ impl Board {
         res
     }
 
+    pub fn all_legal_moves_fast(&mut self, color: Color) -> Vec<(String, String)> {
+        crate::movegen::generate_moves(self, color)
+    }
+
     pub fn capture_moves(&mut self, color: Color) -> Vec<(String, String)> {
         let mut res = Vec::new();
         for y in 0..8 {
@@ -427,6 +431,17 @@ impl Board {
             }
         }
         res
+    }
+
+    pub fn capture_moves_fast(&mut self, color: Color) -> Vec<(String, String)> {
+        self.all_legal_moves_fast(color)
+            .into_iter()
+            .filter(|(_, e)| {
+                if let Some((ex,ey)) = Board::algebraic_to_index(e) {
+                    self.get_index(ex,ey).is_some()
+                } else { false }
+            })
+            .collect()
     }
 
     pub fn piece_count(&self, piece_type: PieceType) -> usize {

@@ -4,6 +4,7 @@ pub mod game;
 pub mod engine;
 pub mod san;
 pub mod transposition;
+pub mod movegen;
 
 #[cfg(test)]
 mod tests {

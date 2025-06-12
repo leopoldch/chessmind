@@ -39,7 +39,7 @@ impl Game {
             let h = self.board.hash(self.current_turn);
             self.hash_history.push(h);
             *self.hash_counts.entry(h).or_insert(0) += 1;
-            if self.board.all_legal_moves(self.current_turn).is_empty() {
+            if self.board.all_legal_moves_fast(self.current_turn).is_empty() {
                 if self.board.in_check(self.current_turn) {
                     self.result = Some(if self.current_turn == Color::White { Color::Black } else { Color::White });
                 }
@@ -51,7 +51,7 @@ impl Game {
     }
 
     pub fn legal_moves(&mut self) -> Vec<(String, String)> {
-        self.board.all_legal_moves(self.current_turn)
+        self.board.all_legal_moves_fast(self.current_turn)
     }
 
     pub fn repetition_count(&self, hash: u64) -> usize {
