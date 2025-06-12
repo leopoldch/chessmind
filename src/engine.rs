@@ -240,7 +240,15 @@ impl Engine {
         alpha
     }
 
-    fn pvs(&mut self, board: &mut Board, color: Color, depth: u32, mut alpha: i32, beta: i32, ply: usize, prev_move: Option<(String,String)>, use_iir: bool) -> i32 {
+    fn pvs(&mut self, board: &mut Board, color: Color, depth: u32, mut alpha: i32, mut beta: i32, ply: usize, prev_move: Option<(String,String)>, use_iir: bool) -> i32 {
+        const MATE_VALUE: i32 = 10000;
+
+        // Mate Distance Pruning
+        let mate_max = MATE_VALUE - ply as i32;
+        if beta > mate_max { beta = mate_max; }
+        let mate_min = -mate_max;
+        if alpha < mate_min { alpha = mate_min; }
+        if alpha >= beta { return alpha; }
         if use_iir && depth >= 5 && !board.in_check(color) {
             let mut d = depth - 2;
             let mut score = self.pvs(board, color, d, alpha, beta, ply, prev_move.clone(), false);
