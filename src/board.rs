@@ -362,7 +362,7 @@ impl Board {
         false
     }
 
-    fn find_king(&self, color: Color) -> Option<(usize, usize)> {
+    pub fn find_king(&self, color: Color) -> Option<(usize, usize)> {
         for y in 0..8 {
             for x in 0..8 {
                 if let Some(p) = self.get_index(x, y) {

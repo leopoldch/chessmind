@@ -1,5 +1,5 @@
-use crate::board::{Board, color_idx};
-use crate::pieces::{Color, PieceType};
+use crate::board::{Board, color_idx, piece_index};
+use crate::pieces::{Color, PieceType, Piece};
 use crate::game::Game;
 use crate::transposition::{Table, TTEntry, Bound, TABLE_SIZE};
 use std::collections::HashMap;
@@ -84,13 +84,13 @@ const PST: [[i32;64];6] = [
 
 const BISHOP_PAIR: i32 = 30;
 // Margins used for Reverse Futility Pruning by depth (index 0 unused)
-const RFP_MARGIN: [i32; 4] = [0, 200, 300, 400];
+const RFP_MARGIN: [i32; 4] = [0, 150, 250, 350];
 // Parameters for History Leaf Pruning
-const HLP_THRESHOLD: u32 = 2;
+const HLP_THRESHOLD: u32 = 3;
 const HLP_BASE: i32 = -50;
 // Move count thresholds for Late Move Pruning by depth (index 0 unused)
-const LMP_LIMITS: [usize; 5] = [0, 6, 8, 12, 16];
-const SINGULAR_MARGIN: i32 = 200;
+const LMP_LIMITS: [usize; 5] = [0, 5, 7, 10, 14];
+const SINGULAR_MARGIN: i32 = 150;
 
 pub struct Engine {
     pub depth: u32,
@@ -158,6 +158,12 @@ impl Engine {
         }
     }
 
+    const MOBILITY_WEIGHT: i32 = 2;
+    const DOUBLED_PAWN_PENALTY: i32 = 8;
+    const ISOLATED_PAWN_PENALTY: i32 = 10;
+    const PASSED_PAWN_BONUS: i32 = 20;
+    const KING_SAFETY_PENALTY: i32 = 10;
+
     #[inline(always)]
     fn evaluate(board: &Board, color: Color) -> i32 {
         const VALUES: [i32;6] = [100,320,330,500,900,0];
@@ -178,7 +184,88 @@ impl Engine {
                         (7 - y) * 8 + x
                     };
                     score += sign * (val + PST[p][idx]);
+                    if p != piece_index(PieceType::Pawn) && p != piece_index(PieceType::King) {
+                        if let Some(pos) = Board::index_to_algebraic(sq % 8, sq / 8) {
+                            let mob = board.pseudo_legal_moves(&pos).len() as i32;
+                            score += sign * Self::MOBILITY_WEIGHT * mob;
+                        }
+                    }
                     bb &= bb - 1;
+                }
+            }
+
+            // Pawn structure evaluation
+            let pawns = board.bitboards[cidx][piece_index(PieceType::Pawn)];
+            let opp_pawns = board.bitboards[color_idx(opposite(c))][piece_index(PieceType::Pawn)];
+            for file in 0usize..8 {
+                let mut count = 0;
+                for rank in 0usize..8 {
+                    let sq = rank * 8 + file;
+                    if (pawns >> sq) & 1 != 0 { count += 1; }
+                }
+                if count > 1 {
+                    score -= sign * Self::DOUBLED_PAWN_PENALTY * (count as i32 - 1);
+                }
+            }
+            for rank in 0usize..8 {
+                for file in 0usize..8 {
+                    let sq = rank * 8 + file;
+                    if (pawns >> sq) & 1 == 0 { continue; }
+                    let mut isolated = true;
+                    if file > 0 {
+                        for r in 0usize..8 {
+                            let idx = r * 8 + (file - 1);
+                            if (pawns >> idx) & 1 != 0 { isolated = false; break; }
+                        }
+                    }
+                    if file < 7 {
+                        for r in 0usize..8 {
+                            let idx = r * 8 + (file + 1);
+                            if (pawns >> idx) & 1 != 0 { isolated = false; break; }
+                        }
+                    }
+                    if isolated {
+                        score -= sign * Self::ISOLATED_PAWN_PENALTY;
+                    }
+                    let mut blocked = false;
+                    if c == Color::White {
+                        for r in (rank+1)..8 {
+                            for f in file.saturating_sub(1usize)..=usize::min(file+1,7) {
+                                let idx = r * 8 + f;
+                                if (opp_pawns >> idx) & 1 != 0 { blocked = true; break; }
+                            }
+                            if blocked { break; }
+                        }
+                    } else {
+                        for r in (0..rank).rev() {
+                            for f in file.saturating_sub(1usize)..=usize::min(file+1,7) {
+                                let idx = r * 8 + f;
+                                if (opp_pawns >> idx) & 1 != 0 { blocked = true; break; }
+                            }
+                            if blocked { break; }
+                        }
+                    }
+                    if !blocked {
+                        score += sign * Self::PASSED_PAWN_BONUS;
+                    }
+                }
+            }
+
+            // King safety
+            if let Some((kx, ky)) = board.find_king(c) {
+                let dir: isize = if c == Color::White { 1 } else { -1 };
+                let ny = ky as isize + dir;
+                if ny >= 0 && ny < 8 {
+                    for dx in -1..=1 {
+                        let nx = kx as isize + dx;
+                        if nx >= 0 && nx < 8 {
+                            let px = nx as usize;
+                            let py = ny as usize;
+                            if board.get_index(px, py).filter(|p| p.piece_type == PieceType::Pawn && p.color == c).is_none() {
+                                score -= sign * Self::KING_SAFETY_PENALTY;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -191,11 +278,49 @@ impl Engine {
         score
     }
 
+    fn cheapest_attacker(board: &mut Board, color: Color, tx: usize, ty: usize) -> Option<((usize,usize), Piece)> {
+        let target = Board::index_to_algebraic(tx, ty)?;
+        let mut best: Option<((usize,usize), Piece)> = None;
+        for y in 0..8 { for x in 0..8 {
+            if let Some(p) = board.get_index(x,y) {
+                if p.color == color {
+                    if let Some(from) = Board::index_to_algebraic(x,y) {
+                        if board.pseudo_legal_moves(&from).iter().any(|m| m == &target) && board.is_legal(&from, &target, color) {
+                            if best.as_ref().map_or(true, |(_,bp)| Self::piece_value(p.piece_type) < Self::piece_value(bp.piece_type)) {
+                                best = Some(((x,y), p));
+                            }
+                        }
+                    }
+                }
+            }
+        }}
+        best
+    }
+
+    fn see_rec(&self, board: &mut Board, color: Color, tx: usize, ty: usize) -> i32 {
+        if let Some(((sx,sy), _piece)) = Self::cheapest_attacker(board, color, tx, ty) {
+            let from = Board::index_to_algebraic(sx, sy).unwrap();
+            let to = Board::index_to_algebraic(tx, ty).unwrap();
+            if let Some(state) = board.make_move_state(&from, &to) {
+                let gain = Self::piece_value(state.captured.unwrap().piece_type) - self.see_rec(board, opposite(color), tx, ty);
+                board.unmake_move(state);
+                return gain.max(0);
+            }
+        }
+        0
+    }
+
     #[inline(always)]
     fn static_exchange_eval(&self, board: &Board, s: &String, e: &String) -> i32 {
         if let (Some((sx,sy)), Some((ex,ey))) = (Board::algebraic_to_index(s), Board::algebraic_to_index(e)) {
-            if let (Some(att), Some(def)) = (board.get_index(sx,sy), board.get_index(ex,ey)) {
-                return Self::piece_value(def.piece_type) - Self::piece_value(att.piece_type);
+            if board.get_index(sx,sy).is_none() || board.get_index(ex,ey).is_none() { return 0; }
+            let mut b = board.clone();
+            let from = Board::index_to_algebraic(sx, sy).unwrap();
+            let to = Board::index_to_algebraic(ex, ey).unwrap();
+            if let Some(state) = b.make_move_state(&from, &to) {
+                let gain = Self::piece_value(state.captured.unwrap().piece_type) - self.see_rec(&mut b, opposite(board.get_index(sx,sy).unwrap().color), ex, ey);
+                b.unmake_move(state);
+                return gain;
             }
         }
         0
