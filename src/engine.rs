@@ -402,6 +402,9 @@ impl Engine {
                 board.unmake_move(state);
                 if score >= beta {
                     if !capture {
+                        if self.killers.len() <= ply {
+                            self.killers.resize(ply + 1, [None, None]);
+                        }
                         let k = &mut self.killers[ply];
                         if k[0].as_ref() != Some(&(s.clone(),e.clone())) {
                             k[1] = k[0].clone();
