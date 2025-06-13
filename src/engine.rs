@@ -520,9 +520,11 @@ impl Engine {
                     }
                 }
                 if depth > 1 && score >= beta - SINGULAR_MARGIN {
-                    let ext_depth = new_depth.saturating_add(1);
-                    let ext_score = -self.pvs(board, opposite(color), ext_depth, -beta, -alpha, ply + 1, Some((s.clone(),e.clone())), true);
-                    score = ext_score;
+                    let ext_depth = std::cmp::min(new_depth.saturating_add(1), depth - 1);
+                    if ext_depth > 0 {
+                        let ext_score = -self.pvs(board, opposite(color), ext_depth, -beta, -alpha, ply + 1, Some((s.clone(),e.clone())), true);
+                        score = ext_score;
+                    }
                 }
                 board.unmake_move(state);
                 if score >= beta {
