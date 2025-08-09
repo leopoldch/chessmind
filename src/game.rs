@@ -30,6 +30,9 @@ impl Game {
     }
 
     pub fn make_move(&mut self, start: &str, end: &str) -> bool {
+        if start == end{
+            return false;
+        }
         if !self.board.is_legal(start, end, self.current_turn) {
             return false;
         }

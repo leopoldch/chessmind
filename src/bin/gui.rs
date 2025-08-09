@@ -23,7 +23,7 @@ impl GuiApp {
     pub fn new() -> Self {
         Self {
             game: Game::new(),
-            engine: Engine::with_threads(3, num_cpus::get()),
+            engine: Engine::with_threads(6, num_cpus::get()),
             vs_ai: false,
             ai_color: Color::Black,
             dragging: None,
@@ -77,7 +77,7 @@ impl App for GuiApp {
             ui.separator();
             ui.checkbox(&mut self.vs_ai, "Play vs AI");
             if self.vs_ai {
-                ui.label("AI plays:");
+                ui.label("Choose AI color :");
                 ui.radio_value(&mut self.ai_color, Color::White, "White");
                 ui.radio_value(&mut self.ai_color, Color::Black, "Black");
                 if let Some(t) = self.last_ai_time {
@@ -167,9 +167,9 @@ impl App for GuiApp {
                             Self::piece_char(&p),
                             egui::FontId::proportional(square_size * 0.8),
                             if p.color == Color::White {
-                                egui::Color32::BLACK
-                            } else {
                                 egui::Color32::WHITE
+                            } else {
+                                egui::Color32::BLACK
                             },
                         );
                     }
@@ -199,9 +199,9 @@ impl App for GuiApp {
                     Self::piece_char(&p),
                     egui::FontId::proportional(square_size * 0.8),
                     if p.color == Color::White {
-                        egui::Color32::BLACK
-                    } else {
                         egui::Color32::WHITE
+                    } else {
+                        egui::Color32::BLACK
                     },
                 );
             }

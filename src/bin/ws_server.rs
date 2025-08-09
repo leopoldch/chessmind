@@ -50,7 +50,7 @@ async fn handle_conn(stream: tokio::net::TcpStream, addr: std::net::SocketAddr) 
     let ws_stream = accept_async(stream).await.expect("ws accept");
     let (mut write, mut read) = ws_stream.split();
     let mut game = Game::new();
-    let mut engine = Engine::with_threads(3, num_cpus::get());
+    let mut engine = Engine::with_threads(6, num_cpus::get());
     let mut my_color: Option<Color> = None;
     let mut last_len: usize = 0;
     while let Some(msg) = read.next().await {

@@ -1,3 +1,5 @@
+use core::option::Option::None;
+
 use crate::pieces::{Color, Piece, PieceType};
 use crate::transposition::ZOBRIST;
 
@@ -376,6 +378,17 @@ impl Board {
     }
 
     pub fn is_legal(&mut self, start: &str, end: &str, color: Color) -> bool {
+        // if a piece is already there we should not be able to make a move
+        let (ex, ey) = match Self::algebraic_to_index(end) {
+            Some(v) => v,
+            None => return false,
+        };
+
+        let piece = self.get_index(ex, ey);
+        if piece.is_some() && piece.unwrap().color == color {
+            return false;
+        }
+
         if let Some(state) = self.make_move_state(start, end) {
             let check = self.in_check(color);
             self.unmake_move(state);
