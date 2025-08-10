@@ -8,6 +8,7 @@ pub struct MoveState {
     pub start: (usize, usize),
     pub end: (usize, usize),
     pub captured: Option<Piece>,
+    pub captured_sq: Option<(usize, usize)>,
     pub prev_en_passant: Option<(usize, usize)>,
     pub prev_castling: [[bool; 2]; 2],
     pub rook_move: Option<((usize, usize), (usize, usize))>,
@@ -74,10 +75,38 @@ impl Board {
             PieceType::Rook,
         ];
         for (x, &pt) in back.iter().enumerate() {
-            self.set_index(x, 0, Some(Piece { piece_type: pt, color: Color::White }));
-            self.set_index(x, 7, Some(Piece { piece_type: pt, color: Color::Black }));
-            self.set_index(x, 1, Some(Piece { piece_type: PieceType::Pawn, color: Color::White }));
-            self.set_index(x, 6, Some(Piece { piece_type: PieceType::Pawn, color: Color::Black }));
+            self.set_index(
+                x,
+                0,
+                Some(Piece {
+                    piece_type: pt,
+                    color: Color::White,
+                }),
+            );
+            self.set_index(
+                x,
+                7,
+                Some(Piece {
+                    piece_type: pt,
+                    color: Color::Black,
+                }),
+            );
+            self.set_index(
+                x,
+                1,
+                Some(Piece {
+                    piece_type: PieceType::Pawn,
+                    color: Color::White,
+                }),
+            );
+            self.set_index(
+                x,
+                6,
+                Some(Piece {
+                    piece_type: PieceType::Pawn,
+                    color: Color::Black,
+                }),
+            );
         }
         self.en_passant = None;
         self.castling = [[true, true], [true, true]];
@@ -107,7 +136,9 @@ impl Board {
     pub fn get(&self, pos: &str) -> Option<Piece> {
         if let Some((x, y)) = Self::algebraic_to_index(pos) {
             self.get_index(x, y)
-        } else { None }
+        } else {
+            None
+        }
     }
 
     pub fn set(&mut self, pos: &str, piece: Option<Piece>) -> bool {
@@ -124,6 +155,11 @@ impl Board {
         let (ex, ey) = Self::algebraic_to_index(end)?;
         let piece = self.get_index(sx, sy)?;
         let captured = self.get_index(ex, ey);
+        let mut captured_sq = if captured.is_some() {
+            Some((ex, ey))
+        } else {
+            None
+        };
         let prev_ep = self.en_passant;
         let prev_castling = self.castling;
         let mut rook_move = None;
@@ -134,12 +170,14 @@ impl Board {
             PieceType::King => {
                 self.castling[cidx] = [false, false];
                 if (sx as isize - ex as isize).abs() == 2 {
-                    if ex == 6 { // king side
+                    if ex == 6 {
+                        // king side
                         rook_move = Some(((7, sy), (5, sy)));
                         let rook = self.get_index(7, sy);
                         self.set_index(5, sy, rook);
                         self.set_index(7, sy, None);
-                    } else if ex == 2 { // queen side
+                    } else if ex == 2 {
+                        // queen side
                         rook_move = Some(((0, sy), (3, sy)));
                         let rook = self.get_index(0, sy);
                         self.set_index(3, sy, rook);
@@ -148,8 +186,12 @@ impl Board {
                 }
             }
             PieceType::Rook => {
-                if sx == 0 { self.castling[cidx][1] = false; }
-                if sx == 7 { self.castling[cidx][0] = false; }
+                if sx == 0 {
+                    self.castling[cidx][1] = false;
+                }
+                if sx == 7 {
+                    self.castling[cidx][0] = false;
+                }
             }
             _ => {}
         }
@@ -158,15 +200,33 @@ impl Board {
         self.en_passant = None;
         if piece.piece_type == PieceType::Pawn {
             let dir_y: isize = if piece.color == Color::White { 1 } else { -1 };
-            if (sy as isize + 2 * dir_y) as usize == ey && sx == ex && self.get_index(ex, ey).is_none() {
+            if (sy as isize + 2 * dir_y) as usize == ey
+                && sx == ex
+                && self.get_index(ex, ey).is_none()
+            {
                 self.en_passant = Some((sx, (sy as isize + dir_y) as usize));
             }
             if let Some((epx, epy)) = prev_ep {
                 if ex == epx && ey == epy && self.get_index(ex, ey).is_none() {
-                    let cap_y = if piece.color == Color::White { ey - 1 } else { ey + 1 };
+                    let cap_y = if piece.color == Color::White {
+                        ey - 1
+                    } else {
+                        ey + 1
+                    };
                     let cap = self.get_index(ex, cap_y);
                     self.set_index(ex, cap_y, None);
-                    return Some(MoveState { start: (sx, sy), end: (ex, ey), captured: cap, prev_en_passant: prev_ep, prev_castling, rook_move });
+                    self.set_index(ex, ey, Some(piece));
+                    self.set_index(sx, sy, None);
+                    captured_sq = Some((ex, cap_y));
+                    return Some(MoveState {
+                        start: (sx, sy),
+                        end: (ex, ey),
+                        captured: cap,
+                        captured_sq,
+                        prev_en_passant: prev_ep,
+                        prev_castling,
+                        rook_move,
+                    });
                 }
             }
         }
@@ -174,12 +234,24 @@ impl Board {
         self.set_index(ex, ey, Some(piece));
         self.set_index(sx, sy, None);
 
-        Some(MoveState { start: (sx, sy), end: (ex, ey), captured, prev_en_passant: prev_ep, prev_castling, rook_move })
+        Some(MoveState {
+            start: (sx, sy),
+            end: (ex, ey),
+            captured,
+            captured_sq,
+            prev_en_passant: prev_ep,
+            prev_castling,
+            rook_move,
+        })
     }
 
     pub fn unmake_move(&mut self, state: MoveState) {
-        self.set_index(state.start.0, state.start.1, self.get_index(state.end.0, state.end.1));
-        self.set_index(state.end.0, state.end.1, state.captured);
+        let moving = self.get_index(state.end.0, state.end.1);
+        self.set_index(state.start.0, state.start.1, moving);
+        self.set_index(state.end.0, state.end.1, None);
+        if let Some((cx, cy)) = state.captured_sq {
+            self.set_index(cx, cy, state.captured);
+        }
         if let Some(((rsx, rsy), (rex, rey))) = state.rook_move {
             let rook = self.get_index(rex, rey);
             self.set_index(rsx, rsy, rook);
@@ -190,7 +262,9 @@ impl Board {
     }
 
     pub fn algebraic_to_index(pos: &str) -> Option<(usize, usize)> {
-        if pos.len() != 2 { return None; }
+        if pos.len() != 2 {
+            return None;
+        }
         let bytes = pos.as_bytes();
         let file = bytes[0] as char;
         let rank = bytes[1] as char;
@@ -232,43 +306,80 @@ impl Board {
         let color = piece.color;
         match piece.piece_type {
             PieceType::Knight => {
-                for (dx, dy) in [(-2,-1),(-2,1),(-1,-2),(-1,2),(1,-2),(1,2),(2,-1),(2,1)] {
+                for (dx, dy) in [
+                    (-2, -1),
+                    (-2, 1),
+                    (-1, -2),
+                    (-1, 2),
+                    (1, -2),
+                    (1, 2),
+                    (2, -1),
+                    (2, 1),
+                ] {
                     let nx = x as isize + dx;
                     let ny = y as isize + dy;
                     if Self::inside(nx, ny) {
                         if let Some(tgt) = self.get_index(nx as usize, ny as usize) {
                             if tgt.color != color {
-                                if let Some(s) = Self::index_to_algebraic(nx as usize, ny as usize) { moves.push(s); }
+                                if let Some(s) = Self::index_to_algebraic(nx as usize, ny as usize)
+                                {
+                                    moves.push(s);
+                                }
                             }
-                        } else if let Some(s) = Self::index_to_algebraic(nx as usize, ny as usize) { moves.push(s); }
+                        } else if let Some(s) = Self::index_to_algebraic(nx as usize, ny as usize) {
+                            moves.push(s);
+                        }
                     }
                 }
             }
             PieceType::Bishop => {
-                for (dx, dy) in [(-1,-1),(-1,1),(1,-1),(1,1)] {
+                for (dx, dy) in [(-1, -1), (-1, 1), (1, -1), (1, 1)] {
                     self.add_ray(x, y, dx, dy, color, &mut moves);
                 }
             }
             PieceType::Rook => {
-                for (dx, dy) in [(0,1),(0,-1),(1,0),(-1,0)] {
+                for (dx, dy) in [(0, 1), (0, -1), (1, 0), (-1, 0)] {
                     self.add_ray(x, y, dx, dy, color, &mut moves);
                 }
             }
             PieceType::Queen => {
-                for (dx, dy) in [(-1,-1),(-1,1),(1,-1),(1,1),(0,1),(0,-1),(1,0),(-1,0)] {
+                for (dx, dy) in [
+                    (-1, -1),
+                    (-1, 1),
+                    (1, -1),
+                    (1, 1),
+                    (0, 1),
+                    (0, -1),
+                    (1, 0),
+                    (-1, 0),
+                ] {
                     self.add_ray(x, y, dx, dy, color, &mut moves);
                 }
             }
             PieceType::King => {
-                for (dx, dy) in [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)] {
+                for (dx, dy) in [
+                    (-1, -1),
+                    (-1, 0),
+                    (-1, 1),
+                    (0, -1),
+                    (0, 1),
+                    (1, -1),
+                    (1, 0),
+                    (1, 1),
+                ] {
                     let nx = x as isize + dx;
                     let ny = y as isize + dy;
                     if Self::inside(nx, ny) {
                         if let Some(tgt) = self.get_index(nx as usize, ny as usize) {
                             if tgt.color != color {
-                                if let Some(s) = Self::index_to_algebraic(nx as usize, ny as usize) { moves.push(s); }
+                                if let Some(s) = Self::index_to_algebraic(nx as usize, ny as usize)
+                                {
+                                    moves.push(s);
+                                }
                             }
-                        } else if let Some(s) = Self::index_to_algebraic(nx as usize, ny as usize) { moves.push(s); }
+                        } else if let Some(s) = Self::index_to_algebraic(nx as usize, ny as usize) {
+                            moves.push(s);
+                        }
                     }
                 }
                 let rank = if color == Color::White { 0 } else { 7 };
@@ -277,14 +388,18 @@ impl Board {
                     && self.get_index(5, rank).is_none()
                     && self.get_index(6, rank).is_none()
                 {
-                    if let Some(s) = Self::index_to_algebraic(6, rank) { moves.push(s); }
+                    if let Some(s) = Self::index_to_algebraic(6, rank) {
+                        moves.push(s);
+                    }
                 }
                 if self.castling[cidx][1]
                     && self.get_index(1, rank).is_none()
                     && self.get_index(2, rank).is_none()
                     && self.get_index(3, rank).is_none()
                 {
-                    if let Some(s) = Self::index_to_algebraic(2, rank) { moves.push(s); }
+                    if let Some(s) = Self::index_to_algebraic(2, rank) {
+                        moves.push(s);
+                    }
                 }
             }
             PieceType::Pawn => {
@@ -292,11 +407,17 @@ impl Board {
                 let start_rank: usize = if color == Color::White { 1 } else { 6 };
                 let ny = y as isize + dir_y;
                 if Self::inside(x as isize, ny) && self.get_index(x, ny as usize).is_none() {
-                    if let Some(s) = Self::index_to_algebraic(x, ny as usize) { moves.push(s); }
+                    if let Some(s) = Self::index_to_algebraic(x, ny as usize) {
+                        moves.push(s);
+                    }
                     if y == start_rank {
                         let ny2 = y as isize + 2 * dir_y;
-                        if Self::inside(x as isize, ny2) && self.get_index(x, ny2 as usize).is_none() {
-                            if let Some(s) = Self::index_to_algebraic(x, ny2 as usize) { moves.push(s); }
+                        if Self::inside(x as isize, ny2)
+                            && self.get_index(x, ny2 as usize).is_none()
+                        {
+                            if let Some(s) = Self::index_to_algebraic(x, ny2 as usize) {
+                                moves.push(s);
+                            }
                         }
                     }
                 }
@@ -305,11 +426,17 @@ impl Board {
                     if Self::inside(nx, ny) {
                         if let Some(tgt) = self.get_index(nx as usize, ny as usize) {
                             if tgt.color != color {
-                                if let Some(s) = Self::index_to_algebraic(nx as usize, ny as usize) { moves.push(s); }
+                                if let Some(s) = Self::index_to_algebraic(nx as usize, ny as usize)
+                                {
+                                    moves.push(s);
+                                }
                             }
                         } else if let Some((epx, epy)) = self.en_passant {
                             if epx as isize == nx && epy as isize == ny {
-                                if let Some(s) = Self::index_to_algebraic(nx as usize, ny as usize) { moves.push(s); }
+                                if let Some(s) = Self::index_to_algebraic(nx as usize, ny as usize)
+                                {
+                                    moves.push(s);
+                                }
                             }
                         }
                     }
@@ -319,17 +446,29 @@ impl Board {
         moves
     }
 
-    fn add_ray(&self, x: usize, y: usize, dx: isize, dy: isize, color: Color, acc: &mut Vec<String>) {
+    fn add_ray(
+        &self,
+        x: usize,
+        y: usize,
+        dx: isize,
+        dy: isize,
+        color: Color,
+        acc: &mut Vec<String>,
+    ) {
         let mut nx = x as isize + dx;
         let mut ny = y as isize + dy;
         while Self::inside(nx, ny) {
             match self.get_index(nx as usize, ny as usize) {
                 None => {
-                    if let Some(s) = Self::index_to_algebraic(nx as usize, ny as usize) { acc.push(s); }
+                    if let Some(s) = Self::index_to_algebraic(nx as usize, ny as usize) {
+                        acc.push(s);
+                    }
                 }
                 Some(p) => {
                     if p.color != color {
-                        if let Some(s) = Self::index_to_algebraic(nx as usize, ny as usize) { acc.push(s); }
+                        if let Some(s) = Self::index_to_algebraic(nx as usize, ny as usize) {
+                            acc.push(s);
+                        }
                     }
                     break;
                 }
@@ -339,11 +478,38 @@ impl Board {
         }
     }
 
+    pub fn square_attacked(&mut self, x: usize, y: usize, by_color: Color) -> bool {
+        for yy in 0..8 {
+            for xx in 0..8 {
+                if let Some(p) = self.get_index(xx, yy) {
+                    if p.color == by_color {
+                        if let Some(pos) = Self::index_to_algebraic(xx, yy) {
+                            for m in self.pseudo_legal_moves(&pos) {
+                                if let Some((tx, ty)) = Self::algebraic_to_index(&m) {
+                                    if tx == x && ty == y {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
     pub fn in_check(&mut self, color: Color) -> bool {
         let king_sq = self.find_king(color);
-        if king_sq.is_none() { return false; }
+        if king_sq.is_none() {
+            return false;
+        }
         let k = king_sq.unwrap();
-        let opp = if color == Color::White { Color::Black } else { Color::White };
+        let opp = if color == Color::White {
+            Color::Black
+        } else {
+            Color::White
+        };
         for y in 0..8 {
             for x in 0..8 {
                 if let Some(p) = self.get_index(x, y) {
@@ -378,15 +544,48 @@ impl Board {
     }
 
     pub fn is_legal(&mut self, start: &str, end: &str, color: Color) -> bool {
-        // if a piece is already there we should not be able to make a move
+        let (sx, sy) = match Self::algebraic_to_index(start) {
+            Some(v) => v,
+            None => return false,
+        };
         let (ex, ey) = match Self::algebraic_to_index(end) {
             Some(v) => v,
             None => return false,
         };
 
-        let piece = self.get_index(ex, ey);
-        if piece.is_some() && piece.unwrap().color == color {
+        let piece = match self.get_index(sx, sy) {
+            Some(p) => p,
+            None => return false,
+        };
+        if piece.color != color {
             return false;
+        }
+
+        if let Some(dest) = self.get_index(ex, ey) {
+            if dest.color == color {
+                return false;
+            }
+        }
+
+        let is_castle =
+            piece.piece_type == PieceType::King && (sx as isize - ex as isize).abs() == 2;
+        if is_castle {
+            if self.in_check(color) {
+                return false;
+            }
+            let step = if ex > sx { 1 } else { -1 };
+            let opp = if color == Color::White {
+                Color::Black
+            } else {
+                Color::White
+            };
+            let mut x = sx as isize + step;
+            while x != ex as isize {
+                if self.square_attacked(x as usize, sy, opp) {
+                    return false;
+                }
+                x += step;
+            }
         }
 
         if let Some(state) = self.make_move_state(start, end) {
@@ -430,8 +629,8 @@ impl Board {
                     if let Some(p) = self.get_index(x, y) {
                         if p.color == color {
                             for m in self.pseudo_legal_moves(&pos) {
-                                if let Some((mx,my)) = Self::algebraic_to_index(&m) {
-                                    if self.get_index(mx,my).is_some() {
+                                if let Some((mx, my)) = Self::algebraic_to_index(&m) {
+                                    if self.get_index(mx, my).is_some() {
                                         if self.is_legal(&pos, &m, color) {
                                             res.push((pos.clone(), m));
                                         }
@@ -450,9 +649,11 @@ impl Board {
         self.all_legal_moves_fast(color)
             .into_iter()
             .filter(|(_, e)| {
-                if let Some((ex,ey)) = Board::algebraic_to_index(e) {
-                    self.get_index(ex,ey).is_some()
-                } else { false }
+                if let Some((ex, ey)) = Board::algebraic_to_index(e) {
+                    self.get_index(ex, ey).is_some()
+                } else {
+                    false
+                }
             })
             .collect()
     }
@@ -462,7 +663,9 @@ impl Board {
         for y in 0..8 {
             for x in 0..8 {
                 if let Some(p) = self.get_index(x, y) {
-                    if p.piece_type == piece_type { c += 1; }
+                    if p.piece_type == piece_type {
+                        c += 1;
+                    }
                 }
             }
         }
@@ -480,7 +683,7 @@ impl Board {
         count
     }
 
-pub fn piece_count_total(&self, color: Color) -> usize {
+    pub fn piece_count_total(&self, color: Color) -> usize {
         let cidx = color_idx(color);
         self.bitboards[cidx]
             .iter()
@@ -533,15 +736,25 @@ pub fn piece_count_total(&self, color: Color) -> usize {
         fen.push(if turn == Color::White { 'w' } else { 'b' });
         fen.push(' ');
         let mut castle = String::new();
-        if self.castling[0][0] { castle.push('K'); }
-        if self.castling[0][1] { castle.push('Q'); }
-        if self.castling[1][0] { castle.push('k'); }
-        if self.castling[1][1] { castle.push('q'); }
-        if castle.is_empty() { castle.push('-'); }
+        if self.castling[0][0] {
+            castle.push('K');
+        }
+        if self.castling[0][1] {
+            castle.push('Q');
+        }
+        if self.castling[1][0] {
+            castle.push('k');
+        }
+        if self.castling[1][1] {
+            castle.push('q');
+        }
+        if castle.is_empty() {
+            castle.push('-');
+        }
         fen.push_str(&castle);
         fen.push(' ');
-        if let Some((x,y)) = self.en_passant {
-            if let Some(ep) = Self::index_to_algebraic(x,y) {
+        if let Some((x, y)) = self.en_passant {
+            if let Some(ep) = Self::index_to_algebraic(x, y) {
                 fen.push_str(&ep);
             } else {
                 fen.push('-');
