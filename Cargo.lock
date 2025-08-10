@@ -701,6 +701,7 @@ dependencies = [
  "lru",
  "num_cpus",
  "once_cell",
+ "rand",
  "rayon",
  "regex",
  "serde",
