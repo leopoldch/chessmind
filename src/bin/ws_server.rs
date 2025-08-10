@@ -126,7 +126,10 @@ async fn handle_conn(stream: tokio::net::TcpStream, addr: std::net::SocketAddr) 
                 if let Some(res) = game.result {
                     let result = if res == Color::White { "white" } else { "black" };
                     let _ = write.send(Message::Text(format!("{{\"result\":\"{}\"}}", result))).await;
-                    break;
+                    game = Game::new();
+                    last_len = 0;
+                    my_color = None;
+                    continue;
                 }
                 if game.current_turn != color {
                     continue;
