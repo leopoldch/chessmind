@@ -30,7 +30,7 @@ impl Game {
     }
 
     pub fn make_move(&mut self, start: &str, end: &str) -> bool {
-        if start == end{
+        if start == end {
             return false;
         }
         if !self.board.is_legal(start, end, self.current_turn) {
@@ -38,13 +38,25 @@ impl Game {
         }
         if self.board.make_move_state(start, end).is_some() {
             self.history.push((start.to_string(), end.to_string()));
-            self.current_turn = if self.current_turn == Color::White { Color::Black } else { Color::White };
+            self.current_turn = if self.current_turn == Color::White {
+                Color::Black
+            } else {
+                Color::White
+            };
             let h = self.board.hash(self.current_turn);
             self.hash_history.push(h);
             *self.hash_counts.entry(h).or_insert(0) += 1;
-            if self.board.all_legal_moves_fast(self.current_turn).is_empty() {
+            if self
+                .board
+                .all_legal_moves_fast(self.current_turn)
+                .is_empty()
+            {
                 if self.board.in_check(self.current_turn) {
-                    self.result = Some(if self.current_turn == Color::White { Color::Black } else { Color::White });
+                    self.result = Some(if self.current_turn == Color::White {
+                        Color::Black
+                    } else {
+                        Color::White
+                    });
                 }
             }
             true

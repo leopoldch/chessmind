@@ -1,9 +1,9 @@
 use once_cell::sync::Lazy;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering, AtomicU8};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, Ordering};
 
-use crate::pieces::Color;
 use crate::board::Board;
+use crate::pieces::Color;
 
 #[derive(Clone, Copy)]
 pub enum Bound {
@@ -48,7 +48,10 @@ impl Table {
     pub fn new(size: usize) -> Self {
         let mut entries = Vec::with_capacity(size);
         entries.resize_with(size, RawEntry::default);
-        Self(Arc::new(Inner { entries, age: AtomicU8::new(0) }))
+        Self(Arc::new(Inner {
+            entries,
+            age: AtomicU8::new(0),
+        }))
     }
 
     fn current_age(&self) -> u8 {
@@ -75,7 +78,12 @@ impl Table {
             let from = ((packed >> 8) & 0xFF) as u8;
             let to = (packed & 0xFF) as u8;
             let best = if from == 0xFF { None } else { Some((from, to)) };
-            Some(TTEntry { depth, value, bound, best })
+            Some(TTEntry {
+                depth,
+                value,
+                bound,
+                best,
+            })
         } else {
             None
         }
@@ -87,7 +95,12 @@ impl Table {
         let age = self.current_age();
         let packed_new = ((entry.depth as u64) << 32)
             | ((age as u64) << 24)
-            | (((match entry.bound { Bound::Exact => 0, Bound::Lower => 1, Bound::Upper => 2 }) as u64) << 16)
+            | (((match entry.bound {
+                Bound::Exact => 0,
+                Bound::Lower => 1,
+                Bound::Upper => 2,
+            }) as u64)
+                << 16)
             | ((entry.best.map(|b| b.0).unwrap_or(0xFF) as u64) << 8)
             | (entry.best.map(|b| b.1).unwrap_or(0xFF) as u64);
 
@@ -133,7 +146,11 @@ pub static ZOBRIST_SIDE: Lazy<u64> = Lazy::new(|| 0x9d39247e33776d41);
 
 impl Board {
     pub fn hash(&self, side: Color) -> u64 {
-        if side == Color::White { self.hash ^ *ZOBRIST_SIDE } else { self.hash }
+        if side == Color::White {
+            self.hash ^ *ZOBRIST_SIDE
+        } else {
+            self.hash
+        }
     }
 
     pub fn recompute_hash(&mut self) {
@@ -152,4 +169,4 @@ impl Board {
     }
 }
 
-pub const TABLE_SIZE: usize = 100_000;
+pub const TABLE_SIZE: usize = 4_194_304;

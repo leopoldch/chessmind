@@ -3,7 +3,7 @@ use chessmind::{
     game::Game,
     pieces::{Color, Piece, PieceType},
 };
-use eframe::{egui, App, Frame};
+use eframe::{App, Frame, egui};
 use egui::Color32;
 use num_cpus;
 use rand::seq::SliceRandom;
@@ -32,7 +32,13 @@ pub struct ArenaApp {
 impl ArenaApp {
     pub fn new() -> Self {
         Self {
-            engine: Engine::with_threads(6, num_cpus::get()),
+            engine: {
+                let mut eng = Engine::from_env(6, num_cpus::get());
+                if let Ok(Some(path)) = eng.load_syzygy_from_env() {
+                    println!("Loaded Syzygy tablebases from {}", path);
+                }
+                eng
+            },
             game: Game::new(),
             opponent: Opponent::AiVsAi,
             num_games: 10,
@@ -147,10 +153,8 @@ impl App for ArenaApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             let board_size = ui.available_width().min(ui.available_height());
             let square_size = board_size / 8.0;
-            let (rect, _) = ui.allocate_exact_size(
-                egui::vec2(board_size, board_size),
-                egui::Sense::hover(),
-            );
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(board_size, board_size), egui::Sense::hover());
 
             let painter = ui.painter();
             for x in 0..8 {
@@ -206,11 +210,5 @@ impl App for ArenaApp {
 
 fn main() {
     let options = eframe::NativeOptions::default();
-    eframe::run_native(
-        "Arena",
-        options,
-        Box::new(|_| Box::new(ArenaApp::new())),
-    )
-    .unwrap();
+    eframe::run_native("Arena", options, Box::new(|_| Box::new(ArenaApp::new()))).unwrap();
 }
-

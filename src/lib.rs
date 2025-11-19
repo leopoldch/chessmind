@@ -1,14 +1,15 @@
-pub mod pieces;
 pub mod board;
-pub mod game;
 pub mod engine;
+pub mod game;
+pub mod movegen;
+pub mod opening;
+pub mod pieces;
 pub mod san;
 pub mod transposition;
-pub mod movegen;
 
 #[cfg(test)]
 mod tests {
-    use crate::{game::Game, engine::Engine};
+    use crate::{engine::Engine, game::Game};
     use num_cpus;
 
     #[test]
