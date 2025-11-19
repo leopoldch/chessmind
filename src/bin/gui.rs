@@ -23,7 +23,13 @@ impl GuiApp {
     pub fn new() -> Self {
         Self {
             game: Game::new(),
-            engine: Engine::with_threads(6, num_cpus::get()),
+            engine: {
+                let mut eng = Engine::from_env(6, num_cpus::get());
+                if let Ok(Some(path)) = eng.load_syzygy_from_env() {
+                    println!("Loaded Syzygy tablebases from {}", path);
+                }
+                eng
+            },
             vs_ai: false,
             ai_color: Color::Black,
             dragging: None,

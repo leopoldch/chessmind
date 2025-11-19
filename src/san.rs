@@ -1,5 +1,8 @@
+use crate::{
+    game::Game,
+    pieces::{Color, PieceType},
+};
 use regex::Regex;
-use crate::{game::Game, pieces::{Color, PieceType}};
 
 pub fn parse_san(game: &mut Game, san: &str, color: Color) -> Option<(String, String)> {
     let mut san = san.replace("0", "O");
@@ -22,7 +25,8 @@ pub fn parse_san(game: &mut Game, san: &str, color: Color) -> Option<(String, St
     let drank = caps.get(3).map(|m| m.as_str());
     let dest = caps.get(4)?.as_str();
     if let Some(pl) = piece_letter {
-        if pl.chars().all(|c| c.is_ascii_lowercase()) && "abcdefgh".contains(pl) && dfile.is_none() {
+        if pl.chars().all(|c| c.is_ascii_lowercase()) && "abcdefgh".contains(pl) && dfile.is_none()
+        {
             dfile = Some(pl);
             piece_letter = None;
         }
@@ -39,11 +43,23 @@ pub fn parse_san(game: &mut Game, san: &str, color: Color) -> Option<(String, St
     let moves = game.board.all_legal_moves(color);
     let mut candidates = Vec::new();
     for (start, end) in moves {
-        if end != dest { continue; }
+        if end != dest {
+            continue;
+        }
         if let Some(piece) = game.board.get(&start) {
-            if piece.piece_type != ptype { continue; }
-            if let Some(df) = dfile { if &start[0..1] != df { continue; } }
-            if let Some(dr) = drank { if &start[1..2] != dr { continue; } }
+            if piece.piece_type != ptype {
+                continue;
+            }
+            if let Some(df) = dfile {
+                if &start[0..1] != df {
+                    continue;
+                }
+            }
+            if let Some(dr) = drank {
+                if &start[1..2] != dr {
+                    continue;
+                }
+            }
             candidates.push(start);
         }
     }

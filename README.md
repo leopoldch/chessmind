@@ -32,12 +32,30 @@ use chessmind::{game::Game, engine::Engine};
 
 fn main() {
     let mut game = Game::new();
-    let mut engine = Engine::with_threads(3, 4); // depth 3 using 4 threads
+    let mut engine = Engine::from_env(3, 4); // depth 3 using 4 threads by default
     if let Some((from, to)) = engine.best_move(&mut game) {
         println!("{} -> {}", from, to);
     }
 }
 ```
+
+### Opening book
+
+To stabilise the engine's play in the first moves (and quickly reach roughly 1000 Elo without extra tuning), the engine now
+ships with a tiny built-in opening book covering a handful of solid classical systems (Italian, Queen's Gambit Declined,
+Sicilian, English, King's Indian, French, and Caro-Kann setups). If the current game history matches one of the book
+lines, the next move is played instantly instead of searching, preventing early blunders and saving time for the middlegame.
+
+### Optional tuning via environment variables
+
+The engine can be configured without code changes via environment variables:
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `CHESSMIND_DEPTH` | Search depth in plies. | Value passed to `from_env` (e.g. `6`). |
+| `CHESSMIND_THREADS` | Number of worker threads for Lazy-SMP. | Value passed to `from_env` (e.g. all logical cores). |
+| `CHESSMIND_TT_SIZE` | Transposition table size (number of entries). | `4_194_304`. |
+| `SYZYGY_PATH` | Path to Syzygy tablebases to enable endgame probing. | Disabled if not set. |
 
 ## Graphical interface
 

@@ -1,12 +1,12 @@
-use std::env;
-use std::time::Instant;
-use chessmind::{game::Game, engine::Engine, pieces::Color, san::parse_san};
-use futures_util::{StreamExt, SinkExt};
+use chessmind::{engine::Engine, game::Game, pieces::Color, san::parse_san};
+use futures_util::{SinkExt, StreamExt};
+use num_cpus;
 use serde::Deserialize;
 use serde_json;
+use std::env;
+use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
-use num_cpus;
 
 fn is_coordinate(mv: &str) -> bool {
     mv.len() == 4
@@ -29,7 +29,10 @@ enum ClientMsg {
     #[serde(rename = "color")]
     Color { color: String },
     #[serde(rename = "move")]
-    Move { #[serde(rename = "move")] mov: String },
+    Move {
+        #[serde(rename = "move")]
+        mov: String,
+    },
     #[serde(rename = "moves")]
     Moves { moves: Vec<MoveEntry> },
 }
@@ -50,7 +53,10 @@ async fn handle_conn(stream: tokio::net::TcpStream, addr: std::net::SocketAddr) 
     let ws_stream = accept_async(stream).await.expect("ws accept");
     let (mut write, mut read) = ws_stream.split();
     let mut game = Game::new();
-    let mut engine = Engine::with_threads(6, num_cpus::get());
+    let mut engine = Engine::from_env(6, num_cpus::get());
+    if let Ok(Some(path)) = engine.load_syzygy_from_env() {
+        println!("Loaded Syzygy tablebases from {}", path);
+    }
     let mut my_color: Option<Color> = None;
     let mut last_len: usize = 0;
     while let Some(msg) = read.next().await {
@@ -70,14 +76,18 @@ async fn handle_conn(stream: tokio::net::TcpStream, addr: std::net::SocketAddr) 
                         };
                         println!(
                             "AI colour set to: {}",
-                            if my_color == Some(Color::White) { "White" } else { "Black" }
+                            if my_color == Some(Color::White) {
+                                "White"
+                            } else {
+                                "Black"
+                            }
                         );
                         game = Game::new();
                         last_len = 0;
                         if my_color == Some(Color::White) && game.current_turn == Color::White {
-                            game.make_move("d2", "d4");
+                            game.make_move("e2", "e4");
                             last_len = 1;
-                            let _ = write.send(Message::Text("d2d4".into())).await;
+                            let _ = write.send(Message::Text("e2e4".into())).await;
                         }
                         continue;
                     }
@@ -101,7 +111,11 @@ async fn handle_conn(stream: tokio::net::TcpStream, addr: std::net::SocketAddr) 
                         game = Game::new();
                         for entry in &moves {
                             let mv = entry.mov.replace('+', "");
-                            let color = if entry.color.to_lowercase().starts_with("w") { Color::White } else { Color::Black };
+                            let color = if entry.color.to_lowercase().starts_with("w") {
+                                Color::White
+                            } else {
+                                Color::Black
+                            };
                             if is_coordinate(&mv) {
                                 game.make_move(&mv[0..2], &mv[2..4]);
                             } else if let Some((s, e)) = parse_san(&mut game, &mv, color) {
@@ -124,8 +138,14 @@ async fn handle_conn(stream: tokio::net::TcpStream, addr: std::net::SocketAddr) 
 
             if let Some(color) = my_color {
                 if let Some(res) = game.result {
-                    let result = if res == Color::White { "white" } else { "black" };
-                    let _ = write.send(Message::Text(format!("{{\"result\":\"{}\"}}", result))).await;
+                    let result = if res == Color::White {
+                        "white"
+                    } else {
+                        "black"
+                    };
+                    let _ = write
+                        .send(Message::Text(format!("{{\"result\":\"{}\"}}", result)))
+                        .await;
                     game = Game::new();
                     last_len = 0;
                     my_color = None;
