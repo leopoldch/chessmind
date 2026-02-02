@@ -1,6 +1,6 @@
 # chessmind
 
-Rust implementation of a simple chess engine. This crate contains the core engine logic used by the Firefox extension in `firefox_extension/`. The engine keeps a transposition table backed by an LRU cache to reuse previous evaluations and speed up searches.
+Rust implementation of a simple chess engine. This crate contains the core engine logic used by the Firefox extension in `firefox_extension/`. The engine uses Principal Variation Search (PVS) with quiescence search and keeps a transposition table backed by an LRU cache to reuse previous evaluations.
 To avoid draws by repetition, game states are tracked and the AI skips moves that would repeat the same position a third time. The search can run on multiple threads thanks to a simple Lazy-SMP implementation.
 
 
@@ -25,7 +25,7 @@ cargo test
 
 ## Example usage
 
-The engine exposes simple structures to manipulate a chess game. A best move can be searched with alpha-beta as follows:
+The engine exposes simple structures to manipulate a chess game. A best move can be searched with PVS as follows:
 
 ```rust
 use chessmind::{game::Game, engine::Engine};
