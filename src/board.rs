@@ -2,6 +2,7 @@ use core::option::Option::None;
 
 use crate::pieces::{Color, Piece, PieceType};
 use crate::transposition::ZOBRIST;
+use crate::types::{Move, UndoState};
 
 #[derive(Clone)]
 pub struct MoveState {
@@ -164,20 +165,17 @@ impl Board {
         let prev_castling = self.castling;
         let mut rook_move = None;
 
-        // castling rights updates
         let cidx = color_idx(piece.color);
         match piece.piece_type {
             PieceType::King => {
                 self.castling[cidx] = [false, false];
                 if (sx as isize - ex as isize).abs() == 2 {
                     if ex == 6 {
-                        // king side
                         rook_move = Some(((7, sy), (5, sy)));
                         let rook = self.get_index(7, sy);
                         self.set_index(5, sy, rook);
                         self.set_index(7, sy, None);
                     } else if ex == 2 {
-                        // queen side
                         rook_move = Some(((0, sy), (3, sy)));
                         let rook = self.get_index(0, sy);
                         self.set_index(3, sy, rook);
@@ -196,7 +194,6 @@ impl Board {
             _ => {}
         }
 
-        // en passant updates and captures
         self.en_passant = None;
         if piece.piece_type == PieceType::Pawn {
             let dir_y: isize = if piece.color == Color::White { 1 } else { -1 };
@@ -764,5 +761,645 @@ impl Board {
         }
         fen.push_str(" 0 1");
         fen
+    }
+
+    #[inline]
+    pub fn make_move_fast(&mut self, mv: Move, color: Color) -> UndoState {
+        let from_sq = mv.from_sq();
+        let to_sq = mv.to_sq();
+        let from_x = (from_sq % 8) as usize;
+        let from_y = (from_sq / 8) as usize;
+        let to_x = (to_sq % 8) as usize;
+        let to_y = (to_sq / 8) as usize;
+
+        let piece = self.get_index(from_x, from_y).unwrap();
+        let captured = self.get_index(to_x, to_y);
+
+        let prev_ep = self
+            .en_passant
+            .map(|(x, y)| (y * 8 + x) as u8)
+            .unwrap_or(UndoState::NO_EP);
+        let prev_castling = self.pack_castling();
+        let prev_hash = self.hash;
+
+        let mut captured_piece_idx = UndoState::NO_CAPTURE;
+        let mut captured_sq = to_sq;
+
+        if mv.is_ep() {
+            let cap_y = if color == Color::White {
+                to_y - 1
+            } else {
+                to_y + 1
+            };
+            captured_sq = (cap_y * 8 + to_x) as u8;
+            let cap_piece = self.get_index(to_x, cap_y).unwrap();
+            captured_piece_idx = piece_index(cap_piece.piece_type) as u8;
+            self.set_index(to_x, cap_y, None);
+        } else if let Some(cap) = captured {
+            captured_piece_idx = piece_index(cap.piece_type) as u8;
+        }
+
+        let cidx = color_idx(color);
+        match piece.piece_type {
+            PieceType::King => {
+                self.castling[cidx] = [false, false];
+            }
+            PieceType::Rook => {
+                if from_x == 0 {
+                    self.castling[cidx][1] = false; // Queen-side
+                }
+                if from_x == 7 {
+                    self.castling[cidx][0] = false; // King-side
+                }
+            }
+            _ => {}
+        }
+
+        if captured.is_some() {
+            let opp = 1 - cidx;
+            if to_x == 0 && (to_y == 0 || to_y == 7) {
+                let rank = if opp == 0 { 0 } else { 7 };
+                if to_y == rank {
+                    self.castling[opp][1] = false;
+                }
+            }
+            if to_x == 7 && (to_y == 0 || to_y == 7) {
+                let rank = if opp == 0 { 0 } else { 7 };
+                if to_y == rank {
+                    self.castling[opp][0] = false;
+                }
+            }
+        }
+
+        self.en_passant = None;
+
+        if mv.is_castle() {
+            let rank = from_y;
+            if mv.flags() == Move::FLAG_KING_CASTLE {
+                let rook = self.get_index(7, rank);
+                self.set_index(5, rank, rook);
+                self.set_index(7, rank, None);
+            } else {
+                let rook = self.get_index(0, rank);
+                self.set_index(3, rank, rook);
+                self.set_index(0, rank, None);
+            }
+        }
+
+        if mv.is_double_push() {
+            let ep_y = if color == Color::White {
+                from_y + 1
+            } else {
+                from_y - 1
+            };
+            self.en_passant = Some((from_x, ep_y));
+        }
+
+        let moving_piece = if let Some(promo_type) = mv.promotion_piece() {
+            Piece {
+                piece_type: promo_type,
+                color,
+            }
+        } else {
+            piece
+        };
+
+        self.set_index(to_x, to_y, Some(moving_piece));
+        self.set_index(from_x, from_y, None);
+
+        UndoState {
+            mv,
+            captured: captured_piece_idx,
+            captured_sq,
+            prev_ep,
+            prev_castling,
+            prev_hash,
+        }
+    }
+
+    #[inline]
+    pub fn unmake_move_fast(&mut self, state: UndoState, color: Color) {
+        let mv = state.mv;
+        let from_sq = mv.from_sq();
+        let to_sq = mv.to_sq();
+        let from_x = (from_sq % 8) as usize;
+        let from_y = (from_sq / 8) as usize;
+        let to_x = (to_sq % 8) as usize;
+        let to_y = (to_sq / 8) as usize;
+
+        let mut moving_piece = self.get_index(to_x, to_y).unwrap();
+
+        if mv.is_promotion() {
+            moving_piece.piece_type = PieceType::Pawn;
+        }
+
+        self.set_index(from_x, from_y, Some(moving_piece));
+        self.set_index(to_x, to_y, None);
+
+        if state.has_capture() {
+            let cap_sq = state.captured_sq;
+            let cap_x = (cap_sq % 8) as usize;
+            let cap_y = (cap_sq / 8) as usize;
+            let opp_color = if color == Color::White {
+                Color::Black
+            } else {
+                Color::White
+            };
+            let cap_type = Self::piece_type_from_idx(state.captured as usize);
+            self.set_index(
+                cap_x,
+                cap_y,
+                Some(Piece {
+                    piece_type: cap_type,
+                    color: opp_color,
+                }),
+            );
+        }
+
+        if mv.is_castle() {
+            let rank = from_y;
+            if mv.flags() == Move::FLAG_KING_CASTLE {
+                let rook = self.get_index(5, rank);
+                self.set_index(7, rank, rook);
+                self.set_index(5, rank, None);
+            } else {
+                let rook = self.get_index(3, rank);
+                self.set_index(0, rank, rook);
+                self.set_index(3, rank, None);
+            }
+        }
+
+        self.en_passant = if state.prev_ep == UndoState::NO_EP {
+            None
+        } else {
+            Some(((state.prev_ep % 8) as usize, (state.prev_ep / 8) as usize))
+        };
+
+        self.unpack_castling(state.prev_castling);
+
+        self.hash = state.prev_hash;
+    }
+
+    #[inline(always)]
+    fn pack_castling(&self) -> u8 {
+        let mut c = 0u8;
+        if self.castling[0][0] {
+            c |= 1;
+        } // White king-side
+        if self.castling[0][1] {
+            c |= 2;
+        } // White queen-side
+        if self.castling[1][0] {
+            c |= 4;
+        } // Black king-side
+        if self.castling[1][1] {
+            c |= 8;
+        } // Black queen-side
+        c
+    }
+
+    #[inline(always)]
+    fn unpack_castling(&mut self, c: u8) {
+        self.castling[0][0] = (c & 1) != 0;
+        self.castling[0][1] = (c & 2) != 0;
+        self.castling[1][0] = (c & 4) != 0;
+        self.castling[1][1] = (c & 8) != 0;
+    }
+
+    #[inline(always)]
+    fn piece_type_from_idx(idx: usize) -> PieceType {
+        match idx {
+            0 => PieceType::Pawn,
+            1 => PieceType::Knight,
+            2 => PieceType::Bishop,
+            3 => PieceType::Rook,
+            4 => PieceType::Queen,
+            _ => PieceType::King,
+        }
+    }
+
+    #[inline(always)]
+    pub fn all_pieces(&self, color: Color) -> u64 {
+        let cidx = color_idx(color);
+        self.bitboards[cidx].iter().fold(0, |a, &b| a | b)
+    }
+
+    #[inline(always)]
+    pub fn occupied(&self) -> u64 {
+        self.all_pieces(Color::White) | self.all_pieces(Color::Black)
+    }
+
+    #[inline]
+    pub fn is_square_attacked_by(&self, sq: u8, by_color: Color) -> bool {
+        let cidx = color_idx(by_color);
+        let sq_bb = 1u64 << sq;
+        let occ = self.occupied();
+
+        let pawn_attacks = if by_color == Color::White {
+            let pawns = self.bitboards[cidx][0];
+            ((pawns & !0x0101010101010101) << 7) | ((pawns & !0x8080808080808080) << 9)
+        } else {
+            let pawns = self.bitboards[cidx][0];
+            ((pawns & !0x8080808080808080) >> 7) | ((pawns & !0x0101010101010101) >> 9)
+        };
+        if (pawn_attacks & sq_bb) != 0 {
+            return true;
+        }
+
+        let knights = self.bitboards[cidx][1];
+        if (crate::movegen::KNIGHT_TABLE[sq as usize] & knights) != 0 {
+            return true;
+        }
+
+        let kings = self.bitboards[cidx][5];
+        if (crate::movegen::KING_TABLE[sq as usize] & kings) != 0 {
+            return true;
+        }
+
+        let bishops_queens = self.bitboards[cidx][2] | self.bitboards[cidx][4];
+        let rooks_queens = self.bitboards[cidx][3] | self.bitboards[cidx][4];
+
+        if self.diagonal_attacks(sq, occ) & bishops_queens != 0 {
+            return true;
+        }
+
+        if self.straight_attacks(sq, occ) & rooks_queens != 0 {
+            return true;
+        }
+
+        false
+    }
+
+    #[inline]
+    fn diagonal_attacks(&self, sq: u8, occ: u64) -> u64 {
+        let x = (sq % 8) as isize;
+        let y = (sq / 8) as isize;
+        let mut attacks = 0u64;
+
+        for (dx, dy) in [(1, 1), (1, -1), (-1, 1), (-1, -1)] {
+            let mut nx = x + dx;
+            let mut ny = y + dy;
+            while nx >= 0 && nx < 8 && ny >= 0 && ny < 8 {
+                let idx = (ny * 8 + nx) as usize;
+                attacks |= 1u64 << idx;
+                if (occ & (1u64 << idx)) != 0 {
+                    break;
+                }
+                nx += dx;
+                ny += dy;
+            }
+        }
+        attacks
+    }
+
+    #[inline]
+    fn straight_attacks(&self, sq: u8, occ: u64) -> u64 {
+        let x = (sq % 8) as isize;
+        let y = (sq / 8) as isize;
+        let mut attacks = 0u64;
+
+        for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            let mut nx = x + dx;
+            let mut ny = y + dy;
+            while nx >= 0 && nx < 8 && ny >= 0 && ny < 8 {
+                let idx = (ny * 8 + nx) as usize;
+                attacks |= 1u64 << idx;
+                if (occ & (1u64 << idx)) != 0 {
+                    break;
+                }
+                nx += dx;
+                ny += dy;
+            }
+        }
+        attacks
+    }
+
+    #[inline]
+    pub fn in_check_fast(&self, color: Color) -> bool {
+        let cidx = color_idx(color);
+        let king_bb = self.bitboards[cidx][5];
+        if king_bb == 0 {
+            return false;
+        }
+        let king_sq = king_bb.trailing_zeros() as u8;
+        let opp = if color == Color::White {
+            Color::Black
+        } else {
+            Color::White
+        };
+        self.is_square_attacked_by(king_sq, opp)
+    }
+
+    #[inline(always)]
+    pub fn piece_at_sq(&self, sq: u8) -> Option<(PieceType, Color)> {
+        let x = (sq % 8) as usize;
+        let y = (sq / 8) as usize;
+        self.get_index(x, y).map(|p| (p.piece_type, p.color))
+    }
+
+    #[inline(always)]
+    pub fn piece_type_idx_at(&self, sq: u8) -> usize {
+        let x = (sq % 8) as usize;
+        let y = (sq / 8) as usize;
+        match self.get_index(x, y) {
+            Some(p) => piece_index(p.piece_type),
+            None => 6,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup_board() -> Board {
+        let mut board = Board::new();
+        board.setup_standard();
+        board
+    }
+
+    #[test]
+    fn test_make_unmake_normal_move() {
+        let mut board = setup_board();
+        let original_hash = board.hash;
+
+        let state = board.make_move_state("e2", "e4").unwrap();
+        assert!(board.get("e2").is_none());
+        assert!(board.get("e4").is_some());
+
+        board.unmake_move(state);
+        assert!(board.get("e2").is_some());
+        assert!(board.get("e4").is_none());
+        assert_eq!(
+            board.hash, original_hash,
+            "Zobrist hash not restored after unmake"
+        );
+    }
+
+    #[test]
+    fn test_make_unmake_capture() {
+        let mut board = setup_board();
+
+        board.make_move_state("e2", "e4");
+        board.make_move_state("d7", "d5");
+        let hash_before_capture = board.hash;
+
+        let state = board.make_move_state("e4", "d5").unwrap();
+        assert!(state.captured.is_some());
+        assert_eq!(state.captured.unwrap().piece_type, PieceType::Pawn);
+
+        board.unmake_move(state);
+        assert!(board.get("e4").is_some());
+        assert!(board.get("d5").is_some()); // Black pawn restored
+        assert_eq!(
+            board.hash, hash_before_capture,
+            "Zobrist hash not restored after capture unmake"
+        );
+    }
+
+    #[test]
+    fn test_make_unmake_kingside_castling() {
+        let mut board = setup_board();
+
+        board.set("f1", None);
+        board.set("g1", None);
+
+        let original_hash = board.hash;
+        let original_castling = board.castling;
+
+        let state = board.make_move_state("e1", "g1").unwrap();
+
+        assert!(board.get("e1").is_none());
+        assert!(board.get("g1").is_some());
+        assert_eq!(board.get("g1").unwrap().piece_type, PieceType::King);
+        assert!(board.get("f1").is_some());
+        assert_eq!(board.get("f1").unwrap().piece_type, PieceType::Rook);
+        assert!(board.get("h1").is_none());
+
+        board.unmake_move(state);
+        assert!(board.get("e1").is_some());
+        assert!(board.get("h1").is_some());
+        assert!(board.get("f1").is_none());
+        assert!(board.get("g1").is_none());
+        assert_eq!(
+            board.castling, original_castling,
+            "Castling rights not restored"
+        );
+    }
+
+    #[test]
+    fn test_make_unmake_queenside_castling() {
+        let mut board = setup_board();
+
+        board.set("b1", None);
+        board.set("c1", None);
+        board.set("d1", None);
+
+        let state = board.make_move_state("e1", "c1").unwrap();
+
+        assert!(board.get("c1").is_some());
+        assert_eq!(board.get("c1").unwrap().piece_type, PieceType::King);
+        assert!(board.get("d1").is_some());
+        assert_eq!(board.get("d1").unwrap().piece_type, PieceType::Rook);
+
+        board.unmake_move(state);
+        assert!(board.get("e1").is_some());
+        assert!(board.get("a1").is_some());
+    }
+
+    #[test]
+    fn test_make_unmake_en_passant() {
+        let mut board = setup_board();
+
+        board.make_move_state("e2", "e4");
+        board.make_move_state("a7", "a6"); // Black move
+        board.make_move_state("e4", "e5");
+
+        board.make_move_state("d7", "d5");
+
+        let hash_before_ep = board.hash;
+
+        let state = board.make_move_state("e5", "d6").unwrap();
+
+        assert!(board.get("d5").is_none());
+        assert!(board.get("d6").is_some());
+        assert_eq!(board.get("d6").unwrap().color, Color::White);
+
+        board.unmake_move(state);
+        assert!(board.get("e5").is_some());
+        assert!(board.get("d5").is_some()); // Black pawn restored
+        assert!(board.get("d6").is_none());
+    }
+
+    #[test]
+    fn test_make_unmake_promotion() {
+        let mut board = Board::new();
+
+        board.set(
+            "e7",
+            Some(Piece {
+                piece_type: PieceType::Pawn,
+                color: Color::White,
+            }),
+        );
+        board.set(
+            "h8",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::Black,
+            }),
+        );
+        board.set(
+            "e1",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::White,
+            }),
+        );
+
+        let original_hash = board.hash;
+
+        let state = board.make_move_state("e7", "e8").unwrap();
+
+        let piece = board.get("e8").unwrap();
+        assert_eq!(piece.color, Color::White);
+        assert!(board.get("e7").is_none());
+
+        board.unmake_move(state);
+        let pawn = board.get("e7").unwrap();
+        assert_eq!(pawn.piece_type, PieceType::Pawn);
+        assert!(board.get("e8").is_none());
+    }
+
+    #[test]
+    fn test_zobrist_hash_consistency() {
+        let mut board = setup_board();
+        let original_hash = board.hash;
+
+        let s1 = board.make_move_state("e2", "e4").unwrap();
+        let h1 = board.hash;
+        let s2 = board.make_move_state("e7", "e5").unwrap();
+        let h2 = board.hash;
+        let s3 = board.make_move_state("g1", "f3").unwrap();
+        let h3 = board.hash;
+
+        assert_ne!(original_hash, h1);
+        assert_ne!(h1, h2);
+        assert_ne!(h2, h3);
+
+        board.unmake_move(s3);
+        assert_eq!(board.hash, h2);
+        board.unmake_move(s2);
+        assert_eq!(board.hash, h1);
+        board.unmake_move(s1);
+        assert_eq!(board.hash, original_hash);
+    }
+
+    #[test]
+    fn test_in_check_detection() {
+        let mut board = Board::new();
+
+        board.set(
+            "e1",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::White,
+            }),
+        );
+        board.set(
+            "e8",
+            Some(Piece {
+                piece_type: PieceType::Queen,
+                color: Color::Black,
+            }),
+        );
+        board.set(
+            "h8",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::Black,
+            }),
+        );
+
+        assert!(board.in_check(Color::White));
+        assert!(!board.in_check(Color::Black));
+    }
+
+    #[test]
+    fn test_is_legal_blocks_king_in_check() {
+        let mut board = Board::new();
+
+        board.set(
+            "e1",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::White,
+            }),
+        );
+        board.set(
+            "e8",
+            Some(Piece {
+                piece_type: PieceType::Rook,
+                color: Color::Black,
+            }),
+        );
+        board.set(
+            "d2",
+            Some(Piece {
+                piece_type: PieceType::Pawn,
+                color: Color::White,
+            }),
+        );
+        board.set(
+            "h8",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::Black,
+            }),
+        );
+
+        assert!(!board.is_legal("d2", "d3", Color::White));
+
+        assert!(board.is_legal("e1", "d1", Color::White));
+    }
+
+    #[test]
+    fn test_to_fen_starting_position() {
+        let mut board = Board::new();
+        board.setup_standard();
+
+        let fen = board.to_fen(Color::White);
+        assert!(fen.starts_with("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR"));
+    }
+
+    #[test]
+    fn test_piece_count() {
+        let mut board = Board::new();
+        board.setup_standard();
+
+        assert_eq!(board.piece_count(PieceType::Pawn), 16);
+        assert_eq!(board.piece_count(PieceType::Knight), 4);
+        assert_eq!(board.piece_count(PieceType::Bishop), 4);
+        assert_eq!(board.piece_count(PieceType::Rook), 4);
+        assert_eq!(board.piece_count(PieceType::Queen), 2);
+        assert_eq!(board.piece_count(PieceType::King), 2);
+        assert_eq!(board.piece_count_all(), 32);
+    }
+
+    #[test]
+    fn test_make_move_fast_and_unmake() {
+        let mut board = setup_board();
+        let original_hash = board.hash;
+
+        let mv = Move::new(12, 28, Move::FLAG_DOUBLE_PUSH); // e2=12, e4=28
+
+        let undo = board.make_move_fast(mv, Color::White);
+        assert!(board.get("e2").is_none());
+        assert!(board.get("e4").is_some());
+
+        board.unmake_move_fast(undo, Color::White);
+        assert!(board.get("e2").is_some());
+        assert!(board.get("e4").is_none());
+        assert_eq!(board.hash, original_hash);
     }
 }

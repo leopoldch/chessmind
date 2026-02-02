@@ -85,7 +85,6 @@ mod tests {
     #[test]
     fn queen_move() {
         let mut game = Game::new();
-        // open path for queen
         game.make_move("d2", "d4");
         game.make_move("d7", "d5");
         let mv = parse_san(&mut game, "Qd3", Color::White).unwrap();

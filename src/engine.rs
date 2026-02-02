@@ -1,74 +1,239 @@
-use crate::board::{Board, color_idx, piece_index};
+use crate::board::Board; // Removed color_idx, UndoState
 use crate::game::Game;
 use crate::opening::book_move;
 use crate::pieces::{Color, Piece, PieceType};
 use crate::transposition::{Bound, TABLE_SIZE, TTEntry, Table};
+use crate::types::{Move, mvv_lva_score}; // Import Move, mvv_lva_score
 use shakmaty::{CastlingMode, Chess, fen::Fen};
 use shakmaty_syzygy::{Tablebase, Wdl};
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 
-const PAWN_PST: [i32; 64] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 5, 10, 10, -20, -20, 10, 10, 5, 5, -5, -10, 0, 0, -10, -5, 5, 0, 0, 0,
-    20, 20, 0, 0, 0, 5, 5, 10, 25, 25, 10, 5, 5, 10, 10, 20, 30, 30, 20, 10, 10, 50, 50, 50, 50,
-    50, 50, 50, 50, 0, 0, 0, 0, 0, 0, 0, 0,
-];
+#[derive(Clone, Debug, Default)]
+pub struct TimeConfig {
+    pub wtime: Option<u64>,
+    pub btime: Option<u64>,
+    pub winc: Option<u64>,
+    pub binc: Option<u64>,
+    pub movestogo: Option<u32>,
+    pub depth: Option<u32>,
+    pub movetime: Option<u64>,
+    pub infinite: bool,
+}
 
-const KNIGHT_PST: [i32; 64] = [
-    -50, -40, -30, -30, -30, -30, -40, -50, -40, -20, 0, 0, 0, 0, -20, -40, -30, 0, 10, 15, 15, 10,
-    0, -30, -30, 5, 15, 20, 20, 15, 5, -30, -30, 0, 15, 20, 20, 15, 0, -30, -30, 5, 10, 15, 15, 10,
-    5, -30, -40, -20, 0, 5, 5, 0, -20, -40, -50, -40, -30, -30, -30, -30, -40, -50,
-];
+impl TimeConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-const BISHOP_PST: [i32; 64] = [
-    -20, -10, -10, -10, -10, -10, -10, -20, -10, 0, 0, 0, 0, 0, 0, -10, -10, 0, 5, 10, 10, 5, 0,
-    -10, -10, 5, 5, 10, 10, 5, 5, -10, -10, 0, 10, 10, 10, 10, 0, -10, -10, 10, 10, 10, 10, 10, 10,
-    -10, -10, 5, 0, 0, 0, 0, 5, -10, -20, -10, -10, -10, -10, -10, -10, -20,
-];
+    pub fn fixed_depth(depth: u32) -> Self {
+        Self {
+            depth: Some(depth),
+            ..Default::default()
+        }
+    }
 
-const ROOK_PST: [i32; 64] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 5, 10, 10, 10, 10, 10, 10, 5, -5, 0, 0, 0, 0, 0, 0, -5, -5, 0, 0, 0, 0,
-    0, 0, -5, -5, 0, 0, 0, 0, 0, 0, -5, -5, 0, 0, 0, 0, 0, 0, -5, -5, 0, 0, 0, 0, 0, 0, -5, 0, 0,
-    0, 5, 5, 0, 0, 0,
-];
+    pub fn fixed_time(ms: u64) -> Self {
+        Self {
+            movetime: Some(ms),
+            ..Default::default()
+        }
+    }
 
-const QUEEN_PST: [i32; 64] = [
-    -20, -10, -10, -5, -5, -10, -10, -20, -10, 0, 0, 0, 0, 0, 0, -10, -10, 0, 5, 5, 5, 5, 0, -10,
-    -5, 0, 5, 5, 5, 5, 0, -5, 0, 0, 5, 5, 5, 5, 0, -5, -10, 5, 5, 5, 5, 5, 0, -10, -10, 0, 5, 0, 0,
-    0, 0, -10, -20, -10, -10, -5, -5, -10, -10, -20,
-];
+    pub fn infinite() -> Self {
+        Self {
+            infinite: true,
+            ..Default::default()
+        }
+    }
+}
 
-const KING_PST: [i32; 64] = [
-    -30, -40, -40, -50, -50, -40, -40, -30, -30, -40, -40, -50, -50, -40, -40, -30, -30, -40, -40,
-    -50, -50, -40, -40, -30, -30, -40, -40, -50, -50, -40, -40, -30, -20, -30, -30, -40, -40, -30,
-    -30, -20, -10, -20, -20, -20, -20, -20, -20, -10, 20, 20, 0, 0, 0, 0, 20, 20, 20, 30, 10, 0, 0,
-    10, 30, 20,
-];
+#[allow(dead_code)]
+struct TimeManager {
+    start_time: Instant,
+    allocated_time_ms: u64,
+    max_time_ms: u64,
+    in_crisis: bool,
+    stop_flag: Arc<AtomicBool>,
+    node_count: Arc<AtomicU64>,
+}
 
-const PST: [[i32; 64]; 6] = [
-    PAWN_PST, KNIGHT_PST, BISHOP_PST, ROOK_PST, QUEEN_PST, KING_PST,
-];
+#[allow(dead_code)]
+impl TimeManager {
+    fn new(config: &TimeConfig, color: Color, stop_flag: Arc<AtomicBool>) -> Self {
+        let node_count = Arc::new(AtomicU64::new(0));
 
-const BISHOP_PAIR: i32 = 30;
-// Margins used for Reverse Futility Pruning by depth (index 0 unused)
+        if let Some(movetime) = config.movetime {
+            return Self {
+                start_time: Instant::now(),
+                allocated_time_ms: movetime,
+                max_time_ms: movetime,
+                in_crisis: false,
+                stop_flag,
+                node_count,
+            };
+        }
+
+        if config.infinite || config.depth.is_some() {
+            return Self {
+                start_time: Instant::now(),
+                allocated_time_ms: u64::MAX,
+                max_time_ms: u64::MAX,
+                in_crisis: false,
+                stop_flag,
+                node_count,
+            };
+        }
+
+        let our_time = match color {
+            Color::White => config.wtime.unwrap_or(60000),
+            Color::Black => config.btime.unwrap_or(60000),
+        };
+
+        let increment = match color {
+            Color::White => config.winc.unwrap_or(0),
+            Color::Black => config.binc.unwrap_or(0),
+        };
+
+        let (allocated, max_time, in_crisis) =
+            Self::calculate_time(our_time, increment, config.movestogo);
+
+        Self {
+            start_time: Instant::now(),
+            allocated_time_ms: allocated,
+            max_time_ms: max_time,
+            in_crisis,
+            stop_flag,
+            node_count,
+        }
+    }
+
+    fn calculate_time(
+        time_left_ms: u64,
+        increment_ms: u64,
+        moves_to_go: Option<u32>,
+    ) -> (u64, u64, bool) {
+        let estimated_moves = if let Some(mtg) = moves_to_go {
+            mtg.max(1) as u64
+        } else {
+            if time_left_ms < 30_000 {
+                15
+            } else if time_left_ms < 60_000 {
+                20
+            } else if time_left_ms < 180_000 {
+                25
+            } else if time_left_ms < 300_000 {
+                30
+            } else if time_left_ms < 600_000 {
+                35
+            } else {
+                40
+            }
+        };
+
+        let base_time = time_left_ms / estimated_moves;
+        let inc_bonus = (increment_ms * 9) / 10; // Use 90% of increment
+
+        let mut allocated = base_time + inc_bonus;
+
+        let total_time_estimate = time_left_ms + increment_ms * 20; // Rough estimate of total game time
+        let in_crisis = if total_time_estimate < 300_000 {
+            time_left_ms < 1000
+        } else {
+            time_left_ms < 5000
+        };
+
+        if in_crisis {
+            allocated = (time_left_ms / 30).max(50).min(500);
+        }
+
+        let max_time = if increment_ms > 0 {
+            (time_left_ms / 2) + increment_ms
+        } else {
+            time_left_ms * 3 / 10
+        };
+
+        allocated = allocated.min(max_time);
+
+        allocated = allocated.max(10);
+        let max_time = max_time.max(10);
+
+        (allocated, max_time, in_crisis)
+    }
+
+    #[inline(always)]
+    fn should_stop(&self) -> bool {
+        if self.stop_flag.load(Ordering::Relaxed) {
+            return true;
+        }
+
+        let elapsed = self.start_time.elapsed().as_millis() as u64;
+        elapsed >= self.allocated_time_ms
+    }
+
+    #[allow(dead_code)]
+    #[inline(always)]
+    fn time_exceeded(&self) -> bool {
+        let elapsed = self.start_time.elapsed().as_millis() as u64;
+        elapsed >= self.max_time_ms
+    }
+
+    #[allow(dead_code)]
+    fn elapsed_ms(&self) -> u64 {
+        self.start_time.elapsed().as_millis() as u64
+    }
+
+    #[allow(dead_code)]
+    fn signal_stop(&self) {
+        self.stop_flag.store(true, Ordering::Release);
+    }
+
+    #[inline(always)]
+    fn check_time(&self) -> bool {
+        let count = self.node_count.fetch_add(1, Ordering::Relaxed);
+        if count & 2047 == 0 {
+            !self.should_stop()
+        } else {
+            !self.stop_flag.load(Ordering::Relaxed)
+        }
+    }
+
+    fn nodes(&self) -> u64 {
+        self.node_count.load(Ordering::Relaxed)
+    }
+
+    fn should_continue_iterating(&self) -> bool {
+        if self.stop_flag.load(Ordering::Relaxed) {
+            return false;
+        }
+        let elapsed = self.start_time.elapsed().as_millis() as u64;
+        elapsed < self.allocated_time_ms / 2
+    }
+}
+
 const RFP_MARGIN: [i32; 4] = [0, 150, 250, 350];
-// Parameters for History Leaf Pruning
 const HLP_THRESHOLD: u32 = 3;
 const HLP_BASE: i32 = -50;
-// Move count thresholds for Late Move Pruning by depth (index 0 unused)
 const LMP_LIMITS: [usize; 5] = [0, 5, 7, 10, 14];
-const SINGULAR_MARGIN: i32 = 150;
+const MATE_VALUE: i32 = 10000;
+const MAX_PLY: usize = 128;
+const MAX_DEPTH: u32 = 64;
 
 pub struct Engine {
     pub depth: u32,
     pub threads: usize,
     tt: Table,
-    killers: Vec<[Option<(String, String)>; 2]>,
-    quiet_history: HashMap<(String, String), i32>,
-    capture_history: HashMap<(String, String), i32>,
-    cont_history: HashMap<((String, String), (String, String)), i32>,
+    killers: Vec<[Option<Move>; 2]>,
+    quiet_history: [[i32; 64]; 64],
+    capture_history: [[i32; 64]; 64],
+    cont_history: HashMap<(u16, u16), i32>,
     tb: Option<Arc<Tablebase<Chess>>>,
+    stop_flag: Arc<AtomicBool>,
+    time_manager: Option<Arc<TimeManager>>,
+    search_history: Vec<u64>,
 }
 
 impl Clone for Engine {
@@ -76,12 +241,15 @@ impl Clone for Engine {
         Self {
             depth: self.depth,
             threads: self.threads,
-            tt: self.tt.clone(),
+            tt: self.tt.clone(), // Arc clone - shares the table!
             killers: self.killers.clone(),
-            quiet_history: self.quiet_history.clone(),
-            capture_history: self.capture_history.clone(),
+            quiet_history: self.quiet_history,     // Array copy
+            capture_history: self.capture_history, // Array copy
             cont_history: self.cont_history.clone(),
             tb: self.tb.clone(),
+            stop_flag: self.stop_flag.clone(),
+            time_manager: self.time_manager.clone(),
+            search_history: self.search_history.clone(),
         }
     }
 }
@@ -100,11 +268,14 @@ impl Engine {
             depth,
             threads,
             tt: Table::new(table_size.max(1)),
-            killers: vec![[None, None]; (depth as usize) + 1],
-            quiet_history: HashMap::new(),
-            capture_history: HashMap::new(),
+            killers: vec![[None, None]; MAX_PLY],
+            quiet_history: [[0; 64]; 64],
+            capture_history: [[0; 64]; 64],
             cont_history: HashMap::new(),
             tb: None,
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            time_manager: None,
+            search_history: Vec::new(),
         }
     }
 
@@ -143,167 +314,81 @@ impl Engine {
         Ok(None)
     }
 
-    #[inline(always)]
-    fn piece_value(t: PieceType) -> i32 {
-        match t {
-            PieceType::Pawn => 100,
-            PieceType::Knight | PieceType::Bishop => 320,
-            PieceType::Rook => 500,
-            PieceType::Queen => 900,
-            PieceType::King => 0,
-        }
+    pub fn stop(&self) {
+        self.stop_flag.store(true, Ordering::Release);
     }
 
-    const MOBILITY_WEIGHT: i32 = 2;
-    const DOUBLED_PAWN_PENALTY: i32 = 8;
-    const ISOLATED_PAWN_PENALTY: i32 = 10;
-    const PASSED_PAWN_BONUS: i32 = 30;
-    const KING_SAFETY_PENALTY: i32 = 15;
+    fn reset_stop(&mut self) {
+        self.stop_flag = Arc::new(AtomicBool::new(false));
+    }
+
+    #[inline(always)]
+    fn piece_value(t: PieceType) -> i32 {
+        crate::types::PieceValues::value(t)
+    }
+
+    fn string_to_move(&self, board: &Board, s: &str, e: &str) -> Move {
+        let (sx, sy) = Board::algebraic_to_index(s).unwrap();
+        let (ex, ey) = Board::algebraic_to_index(e).unwrap();
+        let from = (sy * 8 + sx) as u8;
+        let to = (ey * 8 + ex) as u8;
+
+        let piece = board.get_index(sx, sy).unwrap();
+        let captured = board.get_index(ex, ey);
+
+        let is_capture = captured.is_some();
+        let mut flags = Move::FLAG_NORMAL;
+
+        match piece.piece_type {
+            PieceType::Pawn => {
+                let diff_y = (ey as isize - sy as isize).abs();
+                let diff_x = (ex as isize - sx as isize).abs();
+
+                if ey == 0 || ey == 7 {
+                    if is_capture {
+                        flags = Move::FLAG_PROMO_QUEEN_CAP;
+                    } else {
+                        flags = Move::FLAG_PROMO_QUEEN;
+                    }
+                } else if diff_y == 2 && diff_x == 0 {
+                    flags = Move::FLAG_DOUBLE_PUSH;
+                } else if diff_x != 0 && !is_capture {
+                    flags = Move::FLAG_EP_CAPTURE;
+                } else if is_capture {
+                    flags = Move::FLAG_CAPTURE;
+                }
+            }
+            PieceType::King => {
+                let diff_x = (ex as isize - sx as isize).abs();
+                if diff_x == 2 {
+                    if ex > sx {
+                        flags = Move::FLAG_KING_CASTLE;
+                    } else {
+                        flags = Move::FLAG_QUEEN_CASTLE;
+                    }
+                } else if is_capture {
+                    flags = Move::FLAG_CAPTURE;
+                }
+            }
+            _ => {
+                if is_capture {
+                    flags = Move::FLAG_CAPTURE;
+                }
+            }
+        }
+
+        Move::new(from, to, flags)
+    }
+
+    fn generate_legal_moves(&self, board: &mut Board, color: Color) -> crate::types::MoveList {
+        let mut list = crate::types::MoveList::new();
+        crate::movegen::generate_moves_fast(board, color, &mut list);
+        list
+    }
 
     #[inline(always)]
     fn evaluate(board: &Board, color: Color) -> i32 {
-        const VALUES: [i32; 6] = [100, 320, 330, 500, 900, 0];
-        let mut score = 0;
-        for c in [Color::White, Color::Black] {
-            let sign = if c == color { 1 } else { -1 };
-            let cidx = color_idx(c);
-            for p in 0..6 {
-                let mut bb = board.bitboards[cidx][p];
-                let val = VALUES[p];
-                while bb != 0 {
-                    let sq = bb.trailing_zeros() as usize;
-                    let idx = if c == Color::White {
-                        sq
-                    } else {
-                        let x = sq % 8;
-                        let y = sq / 8;
-                        (7 - y) * 8 + x
-                    };
-                    score += sign * (val + PST[p][idx]);
-                    if p != piece_index(PieceType::Pawn) && p != piece_index(PieceType::King) {
-                        if let Some(pos) = Board::index_to_algebraic(sq % 8, sq / 8) {
-                            let mob = board.pseudo_legal_moves(&pos).len() as i32;
-                            score += sign * Self::MOBILITY_WEIGHT * mob;
-                        }
-                    }
-                    bb &= bb - 1;
-                }
-            }
-
-            // Pawn structure evaluation
-            let pawns = board.bitboards[cidx][piece_index(PieceType::Pawn)];
-            let opp_pawns = board.bitboards[color_idx(opposite(c))][piece_index(PieceType::Pawn)];
-            for file in 0usize..8 {
-                let mut count = 0;
-                for rank in 0usize..8 {
-                    let sq = rank * 8 + file;
-                    if (pawns >> sq) & 1 != 0 {
-                        count += 1;
-                    }
-                }
-                if count > 1 {
-                    score -= sign * Self::DOUBLED_PAWN_PENALTY * (count as i32 - 1);
-                }
-            }
-            for rank in 0usize..8 {
-                for file in 0usize..8 {
-                    let sq = rank * 8 + file;
-                    if (pawns >> sq) & 1 == 0 {
-                        continue;
-                    }
-                    let mut isolated = true;
-                    if file > 0 {
-                        for r in 0usize..8 {
-                            let idx = r * 8 + (file - 1);
-                            if (pawns >> idx) & 1 != 0 {
-                                isolated = false;
-                                break;
-                            }
-                        }
-                    }
-                    if file < 7 {
-                        for r in 0usize..8 {
-                            let idx = r * 8 + (file + 1);
-                            if (pawns >> idx) & 1 != 0 {
-                                isolated = false;
-                                break;
-                            }
-                        }
-                    }
-                    if isolated {
-                        score -= sign * Self::ISOLATED_PAWN_PENALTY;
-                    }
-                    let mut blocked = false;
-                    if c == Color::White {
-                        for r in (rank + 1)..8 {
-                            for f in file.saturating_sub(1usize)..=usize::min(file + 1, 7) {
-                                let idx = r * 8 + f;
-                                if (opp_pawns >> idx) & 1 != 0 {
-                                    blocked = true;
-                                    break;
-                                }
-                            }
-                            if blocked {
-                                break;
-                            }
-                        }
-                    } else {
-                        for r in (0..rank).rev() {
-                            for f in file.saturating_sub(1usize)..=usize::min(file + 1, 7) {
-                                let idx = r * 8 + f;
-                                if (opp_pawns >> idx) & 1 != 0 {
-                                    blocked = true;
-                                    break;
-                                }
-                            }
-                            if blocked {
-                                break;
-                            }
-                        }
-                    }
-                    if !blocked {
-                        score += sign * Self::PASSED_PAWN_BONUS;
-                    }
-                }
-            }
-
-            // King safety
-            if let Some((kx, ky)) = board.find_king(c) {
-                let dir: isize = if c == Color::White { 1 } else { -1 };
-                let ny = ky as isize + dir;
-                if ny >= 0 && ny < 8 {
-                    for dx in -1..=1 {
-                        let nx = kx as isize + dx;
-                        if nx >= 0 && nx < 8 {
-                            let px = nx as usize;
-                            let py = ny as usize;
-                            if board
-                                .get_index(px, py)
-                                .filter(|p| p.piece_type == PieceType::Pawn && p.color == c)
-                                .is_none()
-                            {
-                                score -= sign * Self::KING_SAFETY_PENALTY;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if board.piece_count_color(PieceType::Bishop, Color::White) >= 2 {
-            score += if color == Color::White {
-                BISHOP_PAIR
-            } else {
-                -BISHOP_PAIR
-            };
-        }
-        if board.piece_count_color(PieceType::Bishop, Color::Black) >= 2 {
-            score += if color == Color::Black {
-                BISHOP_PAIR
-            } else {
-                -BISHOP_PAIR
-            };
-        }
-        score
+        crate::eval::evaluate(board, color)
     }
 
     fn cheapest_attacker(
@@ -342,8 +427,10 @@ impl Engine {
             let from = Board::index_to_algebraic(sx, sy).unwrap();
             let to = Board::index_to_algebraic(tx, ty).unwrap();
             if let Some(state) = board.make_move_state(&from, &to) {
-                let gain = Self::piece_value(state.captured.unwrap().piece_type)
-                    - self.see_rec(board, opposite(color), tx, ty);
+                let captured_val = state
+                    .captured
+                    .map_or(0, |p| Self::piece_value(p.piece_type));
+                let gain = captured_val - self.see_rec(board, opposite(color), tx, ty);
                 board.unmake_move(state);
                 return gain.max(0);
             }
@@ -352,29 +439,31 @@ impl Engine {
     }
 
     #[inline(always)]
-    fn static_exchange_eval(&self, board: &Board, s: &String, e: &String) -> i32 {
-        if let (Some((sx, sy)), Some((ex, ey))) =
-            (Board::algebraic_to_index(s), Board::algebraic_to_index(e))
-        {
-            if board.get_index(sx, sy).is_none() || board.get_index(ex, ey).is_none() {
-                return 0;
-            }
-            let mut b = board.clone();
-            let from = Board::index_to_algebraic(sx, sy).unwrap();
-            let to = Board::index_to_algebraic(ex, ey).unwrap();
-            if let Some(state) = b.make_move_state(&from, &to) {
-                let gain = Self::piece_value(state.captured.unwrap().piece_type)
-                    - self.see_rec(
-                        &mut b,
-                        opposite(board.get_index(sx, sy).unwrap().color),
-                        ex,
-                        ey,
-                    );
-                b.unmake_move(state);
-                return gain;
-            }
+    fn static_exchange_eval(&self, board: &Board, mv: Move) -> i32 {
+        let sx = (mv.from_sq() % 8) as usize;
+        let sy = (mv.from_sq() / 8) as usize;
+        let ex = (mv.to_sq() % 8) as usize;
+        let ey = (mv.to_sq() / 8) as usize;
+
+        if board.get_index(sx, sy).is_none() {
+            return 0; // Should not happen for legal moves
         }
-        0
+
+        let mut b = board.clone(); // Clone is expensive! Use with caution.
+
+        let color = board.get_index(sx, sy).unwrap().color;
+
+        let undo = b.make_move_fast(mv, color);
+
+        let captured_val = if undo.has_capture() {
+            crate::types::PieceValues::value_by_idx(undo.captured as usize)
+        } else {
+            0
+        };
+
+        let gain = captured_val - self.see_rec(&mut b, opposite(color), ex, ey);
+        b.unmake_move_fast(undo, color);
+        return gain;
     }
 
     #[inline(always)]
@@ -407,88 +496,148 @@ impl Engine {
             .ok()?;
         let wdl = tb.probe_wdl(&pos).ok()?.after_zeroing();
         Some(match wdl {
-            Wdl::Win | Wdl::CursedWin => 10000 - ply as i32,
-            Wdl::Loss | Wdl::BlessedLoss => -10000 + ply as i32,
+            Wdl::Win | Wdl::CursedWin => MATE_VALUE - ply as i32,
+            Wdl::Loss | Wdl::BlessedLoss => -MATE_VALUE + ply as i32,
             Wdl::Draw => 0,
         })
     }
 
-    fn move_score(
-        &self,
-        board: &Board,
-        s: &String,
-        e: &String,
-        ply: usize,
-        prev: Option<&(String, String)>,
-    ) -> i32 {
+    fn move_score(&self, board: &Board, mv: Move, ply: usize, prev: Option<&Move>) -> i32 {
         let mut score = 0;
-        let capture = if let Some((ex, ey)) = Board::algebraic_to_index(e) {
-            board.get_index(ex, ey).is_some()
-        } else {
-            false
-        };
+        let capture = mv.is_capture();
+        let from = mv.from_sq() as usize;
+        let to = mv.to_sq() as usize;
+
         if capture {
-            score += *self
-                .capture_history
-                .get(&(s.clone(), e.clone()))
-                .unwrap_or(&0);
-            if let Some((ex, ey)) = Board::algebraic_to_index(e) {
-                if let Some(p) = board.get_index(ex, ey) {
-                    score += Self::piece_value(p.piece_type) * 10;
-                }
+            score += self.capture_history[from][to];
+
+            let victim_idx = if mv.is_ep() {
+                0 // Pawn
+            } else {
+                let tx = to % 8;
+                let ty = to / 8;
+                board.piece_type_idx_at((ty * 8 + tx) as u8)
+            };
+
+            let attacker_idx = board.piece_type_idx_at(from as u8);
+
+            if victim_idx < 6 && attacker_idx < 6 {
+                score += mvv_lva_score(victim_idx, attacker_idx) * 100;
             }
-            if self.static_exchange_eval(board, s, e) < 0 {
+
+            if self.static_exchange_eval(board, mv) < 0 {
                 score -= 1000;
             }
         } else {
-            score += *self
-                .quiet_history
-                .get(&(s.clone(), e.clone()))
-                .unwrap_or(&0);
+            score += self.quiet_history[from][to];
             if let Some(k) = self.killers.get(ply) {
                 if let Some(m) = &k[0] {
-                    if m.0 == *s && m.1 == *e {
+                    if m.0 == mv.0 {
                         score += 10_000;
                     }
                 }
                 if let Some(m) = &k[1] {
-                    if m.0 == *s && m.1 == *e {
+                    if m.0 == mv.0 {
                         score += 9_000;
                     }
                 }
             }
         }
+
         if let Some(pmv) = prev {
-            score += *self
-                .cont_history
-                .get(&(pmv.clone(), (s.clone(), e.clone())))
-                .unwrap_or(&0);
+            score += *self.cont_history.get(&(pmv.0, mv.0)).unwrap_or(&0);
         }
         score
     }
 
     #[inline(always)]
-    fn quiescence(&mut self, board: &mut Board, color: Color, mut alpha: i32, beta: i32) -> i32 {
-        let stand_pat = Self::evaluate(board, color);
-        if stand_pat >= beta {
-            return beta;
+    fn should_stop(&self) -> bool {
+        if self.stop_flag.load(Ordering::Relaxed) {
+            return true;
         }
-        if stand_pat > alpha {
-            alpha = stand_pat;
-        }
-        let moves = board.capture_moves_fast(color);
-        for (s, e) in moves {
-            if let Some(state) = board.make_move_state(&s, &e) {
-                let score = -self.quiescence(board, opposite(color), -beta, -alpha);
-                board.unmake_move(state);
-                if score >= beta {
-                    return beta;
-                }
-                if score > alpha {
-                    alpha = score;
+        if let Some(tm) = &self.time_manager {
+            let count = tm.node_count.fetch_add(1, Ordering::Relaxed);
+            if count & 2047 == 0 {
+                if tm.should_stop() {
+                    self.stop_flag.store(true, Ordering::Release);
+                    return true;
                 }
             }
         }
+        false
+    }
+
+    #[inline(always)]
+    fn quiescence(
+        &mut self,
+        board: &mut Board,
+        color: Color,
+        mut alpha: i32,
+        beta: i32,
+        ply: usize,
+    ) -> i32 {
+        if self.should_stop() {
+            return 0;
+        }
+
+        let stand_pat = Self::evaluate(board, color);
+
+        if stand_pat >= beta {
+            return beta;
+        }
+
+        if stand_pat > alpha {
+            alpha = stand_pat;
+        }
+
+        const DELTA: i32 = 1000;
+        if stand_pat + DELTA < alpha {
+            return alpha;
+        }
+
+        let list = self.generate_legal_moves(board, color);
+        let mut capt_list = crate::types::MoveList::new();
+        for m in list.iter() {
+            if m.is_capture() {
+                capt_list.push(*m);
+            }
+        }
+        let mut moves = capt_list;
+
+        let len = moves.len();
+        if len > 1 {
+            let slice = moves.as_mut_slice();
+            slice.sort_by(|a, b| {
+                let score_a = self.move_score(board, *a, ply, None);
+                let score_b = self.move_score(board, *b, ply, None);
+                score_b.cmp(&score_a)
+            });
+        }
+
+        for m in moves.iter() {
+            let see_value = self.static_exchange_eval(board, *m);
+            if see_value < 0 {
+                continue;
+            }
+
+            let undo = board.make_move_fast(*m, color);
+
+            let score = -self.quiescence(board, opposite(color), -beta, -alpha, ply + 1);
+
+            board.unmake_move_fast(undo, color);
+
+            if self.stop_flag.load(Ordering::Relaxed) {
+                return 0;
+            }
+
+            if score >= beta {
+                return beta;
+            }
+            if score > alpha {
+                alpha = score;
+            }
+        }
+
         alpha
     }
 
@@ -500,12 +649,22 @@ impl Engine {
         mut alpha: i32,
         mut beta: i32,
         ply: usize,
-        prev_move: Option<(String, String)>,
-        use_iir: bool,
+        prev_move: Option<Move>,
+        _use_iir: bool,
     ) -> i32 {
-        const MATE_VALUE: i32 = 10000;
+        if self.should_stop() {
+            return 0;
+        }
 
-        // Mate Distance Pruning
+        if ply > 0 {
+            let current_hash = board.hash(color);
+            for &h in &self.search_history {
+                if h == current_hash {
+                    return 0; // Draw by repetition
+                }
+            }
+        }
+
         let mate_max = MATE_VALUE - ply as i32;
         if beta > mate_max {
             beta = mate_max;
@@ -517,18 +676,11 @@ impl Engine {
         if alpha >= beta {
             return alpha;
         }
-        if use_iir && depth >= 5 && !board.in_check(color) {
-            let mut d = depth - 2;
-            let mut score = self.pvs(board, color, d, alpha, beta, ply, prev_move.clone(), false);
-            while d < depth && score > alpha && score < beta {
-                d += 1;
-                score = self.pvs(board, color, d, alpha, beta, ply, prev_move.clone(), false);
-            }
-            return score;
-        }
+
         let alpha_orig = alpha;
-        let hash = board.hash(color);
-        let mut tt_best: Option<(String, String)> = None;
+        let hash = board.hash(color); // board.hash is u64 (Zobrist)
+        let mut tt_best: Option<Move> = None;
+
         if let Some(entry) = self.tt.get(hash) {
             if entry.depth >= depth {
                 match entry.bound {
@@ -541,11 +693,11 @@ impl Engine {
                 }
             }
             if let Some((fs, ts)) = entry.best {
-                let f = Board::index_to_algebraic((fs % 8) as usize, (fs / 8) as usize);
-                let t = Board::index_to_algebraic((ts % 8) as usize, (ts / 8) as usize);
-                if let (Some(ff), Some(tt)) = (f, t) {
-                    tt_best = Some((ff, tt));
-                }
+                let f_str =
+                    Board::index_to_algebraic((fs % 8) as usize, (fs / 8) as usize).unwrap();
+                let t_str =
+                    Board::index_to_algebraic((ts % 8) as usize, (ts / 8) as usize).unwrap();
+                tt_best = Some(self.string_to_move(board, &f_str, &t_str));
             }
         }
 
@@ -554,20 +706,24 @@ impl Engine {
         }
 
         if depth == 0 {
-            return self.quiescence(board, color, alpha, beta);
+            return self.quiescence(board, color, alpha, beta, ply);
         }
 
-        // Reverse Futility Pruning
-        if depth <= 3 && !board.in_check(color) {
+        let in_check = board.in_check(color);
+
+        if depth <= 3 && !in_check {
             let eval = Self::evaluate(board, color);
             if eval - RFP_MARGIN[depth as usize] >= beta {
                 return eval;
             }
         }
 
-        if depth >= 3 && !board.in_check(color) && board.piece_count_total(color) > 3 {
+        let can_null = !in_check && board.piece_count_total(color) > 3 && depth >= 3;
+        if can_null {
             let r = if depth > 6 { 3 } else { 2 };
-            let ep = board.en_passant;
+            let ep = board.en_passant; // Backup EP
+
+            board.en_passant = None;
             let score = -self.pvs(
                 board,
                 opposite(color),
@@ -575,77 +731,123 @@ impl Engine {
                 -beta,
                 -beta + 1,
                 ply + 1,
-                prev_move.clone(),
-                true,
+                None, // Prev move is null
+                false,
             );
-            board.en_passant = ep;
-            if score >= beta {
-                return beta;
-            }
-        }
+            board.en_passant = ep; // Restore EP
 
-        let all_moves = board.all_legal_moves_fast(color);
-        if all_moves.is_empty() {
-            if board.in_check(color) {
-                return -10000 + ply as i32;
+            if self.stop_flag.load(Ordering::Relaxed) {
+                return 0;
             }
-            return 0;
-        }
-        let mut captures = Vec::new();
-        let mut quiets = Vec::new();
-        for m in all_moves {
-            if let Some((ex, ey)) = Board::algebraic_to_index(&m.1) {
-                if board.get_index(ex, ey).is_some() {
-                    captures.push(m);
+
+            if score >= beta {
+                if depth > 8 {
+                    let verify = self.pvs(
+                        board,
+                        color,
+                        depth - r - 1,
+                        beta - 1,
+                        beta,
+                        ply,
+                        prev_move,
+                        false,
+                    );
+                    if verify >= beta {
+                        return beta;
+                    }
                 } else {
-                    quiets.push(m);
+                    return beta;
                 }
             }
         }
-        captures.sort_by_key(|(s, e)| -self.move_score(board, s, e, ply, prev_move.as_ref()));
-        quiets.sort_by_key(|(s, e)| -self.move_score(board, s, e, ply, prev_move.as_ref()));
-        let mut moves = captures;
-        moves.extend(quiets);
-        if let Some((bs, be)) = tt_best {
-            if let Some(pos) = moves.iter().position(|(s, e)| *s == bs && *e == be) {
-                moves.swap(0, pos);
+
+        let mut moves_list = self.generate_legal_moves(board, color);
+        if moves_list.len() == 0 {
+            if in_check {
+                return -MATE_VALUE + ply as i32;
+            }
+            return 0;
+        }
+
+        let moves_slice = moves_list.as_mut_slice();
+
+        let mut scores = [0i32; 256];
+        for (i, m) in moves_slice.iter().enumerate() {
+            scores[i] = self.move_score(board, *m, ply, prev_move.as_ref());
+            if let Some(ttm) = tt_best {
+                if m.0 == ttm.0 {
+                    scores[i] = 1_000_000;
+                }
             }
         }
 
-        let mut best_move = None;
-        let in_check_now = board.in_check(color);
+        let len = moves_slice.len();
+        for i in 0..len {
+            for j in 0..len - 1 - i {
+                if scores[j] < scores[j + 1] {
+                    scores.swap(j, j + 1);
+                    moves_slice.swap(j, j + 1);
+                }
+            }
+        }
+
+        let mut best_move: Option<Move> = None;
         let mut skip_quiets = false;
-        for (idx, (s, e)) in moves.iter().enumerate() {
-            let capture_flag = if let Some((ex, ey)) = Board::algebraic_to_index(e) {
-                board.get_index(ex, ey).is_some()
-            } else {
-                false
-            };
-            if !in_check_now && !capture_flag && depth <= 4 && idx >= LMP_LIMITS[depth as usize] {
+
+        for (idx, m) in moves_slice.iter().enumerate() {
+            let capture = m.is_capture();
+
+            if !in_check && !capture && depth <= 4 && idx >= LMP_LIMITS[depth as usize] {
                 continue;
             }
-            if skip_quiets && !capture_flag {
+            if skip_quiets && !capture {
                 continue;
             }
-            if !in_check_now && !capture_flag && depth <= HLP_THRESHOLD && idx > 0 {
-                let mv_score = self.move_score(board, s, e, ply, prev_move.as_ref());
-                if mv_score < HLP_BASE {
+            if !in_check && !capture && depth <= HLP_THRESHOLD && idx > 0 {
+                let s = self.move_score(board, *m, ply, prev_move.as_ref());
+                if s < HLP_BASE {
                     skip_quiets = true;
                     continue;
                 }
             }
-            if let Some(state) = board.make_move_state(s, e) {
-                let mut new_depth = depth - 1;
-                let capture = state.captured.is_some();
-                if depth > 2 && !capture && !in_check_now {
-                    let mut r = Self::lmr_value(depth, idx + 1);
-                    if board.in_check(opposite(color)) {
-                        r = r.saturating_sub(1);
-                    }
-                    new_depth = new_depth.saturating_sub(r);
-                }
-                let mut score;
-                if idx == 0 {
+
+            let undo = board.make_move_fast(*m, color);
+            let gives_check = board.in_check_fast(opposite(color)); // Fast check
+
+            let mut new_depth = depth - 1;
+            if gives_check && depth < MAX_DEPTH - 1 {
+                new_depth = new_depth.saturating_add(1);
+            }
+
+            if depth > 2 && !capture && !in_check && !gives_check && idx >= 3 {
+                let r = Self::lmr_value(depth, idx + 1);
+                new_depth = new_depth.saturating_sub(r);
+            }
+
+            let mut score;
+            if idx == 0 {
+                score = -self.pvs(
+                    board,
+                    opposite(color),
+                    new_depth,
+                    -beta,
+                    -alpha,
+                    ply + 1,
+                    Some(*m),
+                    true,
+                );
+            } else {
+                score = -self.pvs(
+                    board,
+                    opposite(color),
+                    new_depth,
+                    -alpha - 1,
+                    -alpha,
+                    ply + 1,
+                    Some(*m),
+                    true,
+                );
+                if score > alpha && score < beta {
                     score = -self.pvs(
                         board,
                         opposite(color),
@@ -653,115 +855,69 @@ impl Engine {
                         -beta,
                         -alpha,
                         ply + 1,
-                        Some((s.clone(), e.clone())),
+                        Some(*m),
                         true,
                     );
+                }
+            }
+
+            board.unmake_move_fast(undo, color);
+
+            if self.stop_flag.load(Ordering::Relaxed) {
+                return 0;
+            }
+
+            if score >= beta {
+                if !capture {
+                    if self.killers.len() <= ply {
+                        self.killers.resize(ply + 1, [None, None]);
+                    }
+                    let k = &mut self.killers[ply];
+                    if k[0] != Some(*m) {
+                        k[1] = k[0];
+                        k[0] = Some(*m);
+                    }
+                }
+
+                let from = m.from_sq() as usize;
+                let to = m.to_sq() as usize;
+                let bonus = (depth * depth) as i32;
+
+                if capture {
+                    self.capture_history[from][to] += bonus;
                 } else {
-                    score = -self.pvs(
-                        board,
-                        opposite(color),
-                        new_depth,
-                        -alpha - 1,
-                        -alpha,
-                        ply + 1,
-                        Some((s.clone(), e.clone())),
-                        true,
-                    );
-                    if score > alpha && score < beta {
-                        score = -self.pvs(
-                            board,
-                            opposite(color),
-                            new_depth,
-                            -beta,
-                            -alpha,
-                            ply + 1,
-                            Some((s.clone(), e.clone())),
-                            true,
-                        );
-                    }
+                    self.quiet_history[from][to] += bonus;
                 }
-                if depth > 1 && score >= beta - SINGULAR_MARGIN {
-                    let ext_depth = std::cmp::min(new_depth.saturating_add(1), depth - 1);
-                    if ext_depth > 0 {
-                        let ext_score = -self.pvs(
-                            board,
-                            opposite(color),
-                            ext_depth,
-                            -beta,
-                            -alpha,
-                            ply + 1,
-                            Some((s.clone(), e.clone())),
-                            true,
-                        );
-                        score = ext_score;
-                    }
+
+                if let Some(pmv) = prev_move {
+                    *self.cont_history.entry((pmv.0, m.0)).or_insert(0) += bonus;
                 }
-                board.unmake_move(state);
-                if score >= beta {
-                    if !capture {
-                        if self.killers.len() <= ply {
-                            self.killers.resize(ply + 1, [None, None]);
-                        }
-                        let k = &mut self.killers[ply];
-                        if k[0].as_ref() != Some(&(s.clone(), e.clone())) {
-                            k[1] = k[0].clone();
-                            k[0] = Some((s.clone(), e.clone()));
-                        }
-                    }
-                    if capture {
-                        *self
-                            .capture_history
-                            .entry((s.clone(), e.clone()))
-                            .or_insert(0) += (depth * depth) as i32;
-                    } else {
-                        *self
-                            .quiet_history
-                            .entry((s.clone(), e.clone()))
-                            .or_insert(0) += (depth * depth) as i32;
-                    }
-                    if let Some(pmv) = &prev_move {
-                        *self
-                            .cont_history
-                            .entry((pmv.clone(), (s.clone(), e.clone())))
-                            .or_insert(0) += (depth * depth) as i32;
-                    }
-                    let best_idx = Board::algebraic_to_index(s).and_then(|(sx, sy)| {
-                        Board::algebraic_to_index(e)
-                            .map(|(ex, ey)| ((sy * 8 + sx) as u8, (ey * 8 + ex) as u8))
-                    });
-                    self.tt.store(
-                        hash,
-                        TTEntry {
-                            depth,
-                            value: beta,
-                            bound: Bound::Lower,
-                            best: best_idx,
-                        },
-                    );
-                    return beta;
+
+                self.tt.store(
+                    hash,
+                    TTEntry {
+                        depth,
+                        value: beta,
+                        bound: Bound::Lower,
+                        best: Some((from as u8, to as u8)),
+                    },
+                );
+
+                return beta;
+            } else {
+                let from = m.from_sq() as usize;
+                let to = m.to_sq() as usize;
+                let penalty = (depth * depth) as i32;
+                if capture {
+                    self.capture_history[from][to] -= penalty;
                 } else {
-                    if capture {
-                        *self
-                            .capture_history
-                            .entry((s.clone(), e.clone()))
-                            .or_insert(0) -= (depth * depth) as i32;
-                    } else {
-                        *self
-                            .quiet_history
-                            .entry((s.clone(), e.clone()))
-                            .or_insert(0) -= (depth * depth) as i32;
-                    }
-                    if let Some(pmv) = &prev_move {
-                        *self
-                            .cont_history
-                            .entry((pmv.clone(), (s.clone(), e.clone())))
-                            .or_insert(0) -= (depth * depth) as i32;
-                    }
+                    self.quiet_history[from][to] -= penalty;
                 }
-                if score > alpha {
-                    alpha = score;
-                    best_move = Some((s.clone(), e.clone()));
-                }
+            }
+
+            if score > alpha {
+                alpha = score;
+                best_move = Some(*m);
             }
         }
 
@@ -770,11 +926,9 @@ impl Engine {
         } else {
             Bound::Exact
         };
-        let best_idx = best_move.as_ref().and_then(|(s, e)| {
-            let fs = Board::algebraic_to_index(s)?;
-            let ts = Board::algebraic_to_index(e)?;
-            Some(((fs.1 * 8 + fs.0) as u8, (ts.1 * 8 + ts.0) as u8))
-        });
+
+        let best_idx = best_move.map(|m| (m.from_sq(), m.to_sq()));
+
         self.tt.store(
             hash,
             TTEntry {
@@ -784,31 +938,58 @@ impl Engine {
                 best: best_idx,
             },
         );
+
         alpha
     }
 
-    #[allow(dead_code)]
-    fn negamax(
+    pub fn best_move_timed(
         &mut self,
-        board: &mut Board,
-        color: Color,
-        depth: u32,
-        alpha: i32,
-        beta: i32,
-        ply: usize,
-        prev_move: Option<(String, String)>,
-    ) -> i32 {
-        self.pvs(board, color, depth, alpha, beta, ply, prev_move, true)
+        game: &mut Game,
+        config: &TimeConfig,
+    ) -> Option<((String, String), u32)> {
+        self.reset_stop();
+        self.tt.next_age();
+
+        if let Some(book_mv) = book_move(&game.history, &game.board, game.current_turn) {
+            return Some((book_mv, 0));
+        }
+
+        let max_depth = config.depth.unwrap_or(MAX_DEPTH).min(MAX_DEPTH);
+        let time_manager = TimeManager::new(config, game.current_turn, self.stop_flag.clone());
+        self.time_manager = Some(Arc::new(time_manager));
+
+        let result = self.best_move_single(game, max_depth);
+
+        self.time_manager = None;
+        result
     }
 
-    fn best_move_single(&mut self, game: &mut Game) -> Option<(String, String)> {
+    pub fn best_move(&mut self, game: &mut Game) -> Option<(String, String)> {
+        let config = TimeConfig::fixed_depth(self.depth);
+        self.best_move_timed(game, &config).map(|(m, _)| m)
+    }
+
+    fn best_move_single(
+        &mut self,
+        game: &mut Game,
+        max_depth: u32,
+    ) -> Option<((String, String), u32)> {
         const ASPIRATION: i32 = 50;
         let color = game.current_turn;
         let root_hash = game.board.hash(color);
         let mut guess = 0;
-        let mut best_move = None;
+        let mut best_move: Option<Move> = None;
+        let mut reached_depth = 0;
 
-        for d in 1..=self.depth {
+        self.search_history = game.hash_history.clone();
+
+        for d in 1..=max_depth {
+            if let Some(ref tm) = self.time_manager {
+                if !tm.should_continue_iterating() && d > 1 {
+                    break;
+                }
+            }
+
             let mut alpha = -100000;
             let mut beta = 100000;
             if d > 1 {
@@ -817,86 +998,67 @@ impl Engine {
             }
 
             loop {
+                if self.stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+
                 let mut board = game.board.clone();
+
                 let score = self.pvs(&mut board, color, d, alpha, beta, 0, None, true);
 
+                if self.stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+
                 if score <= alpha {
-                    alpha -= ASPIRATION;
+                    alpha = (alpha - ASPIRATION * 2).max(-100000);
                     continue;
                 }
                 if score >= beta {
-                    beta += ASPIRATION;
+                    beta = (beta + ASPIRATION * 2).min(100000);
                     continue;
                 }
 
                 guess = score;
+
                 if let Some(entry) = self.tt.get(root_hash) {
                     if let Some((fs, ts)) = entry.best {
-                        if let (Some(f), Some(t)) = (
-                            Board::index_to_algebraic((fs % 8) as usize, (fs / 8) as usize),
-                            Board::index_to_algebraic((ts % 8) as usize, (ts / 8) as usize),
-                        ) {
-                            best_move = Some((f, t));
-                        }
+                        let f_str = Board::index_to_algebraic((fs % 8) as usize, (fs / 8) as usize)
+                            .unwrap();
+                        let t_str = Board::index_to_algebraic((ts % 8) as usize, (ts / 8) as usize)
+                            .unwrap();
+                        best_move = Some(self.string_to_move(&game.board, &f_str, &t_str));
                     }
                 }
                 break;
             }
+            reached_depth = d;
+            if self.stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
         }
 
-        best_move
-    }
-
-    fn best_move_parallel(&self, game: &mut Game) -> Option<(String, String)> {
-        use rayon::prelude::*;
-        let color = game.current_turn;
-        let moves = game.board.all_legal_moves_fast(color);
-        if moves.is_empty() {
-            return None;
-        }
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(self.threads)
-            .build()
-            .expect("thread pool");
-        let depth = self.depth;
-        let res = pool.install(|| {
-            moves
-                .par_iter()
-                .map(|(s, e)| {
-                    let mut engine = self.clone();
-                    let mut board = game.board.clone();
-                    if let Some(state) = board.make_move_state(s, e) {
-                        let score = -engine.pvs(
-                            &mut board,
-                            opposite(color),
-                            depth - 1,
-                            -100000,
-                            100000,
-                            0,
-                            None,
-                            true,
-                        );
-                        board.unmake_move(state);
-                        (score, s.clone(), e.clone())
-                    } else {
-                        (i32::MIN, s.clone(), e.clone())
-                    }
-                })
-                .max_by_key(|(sc, _, _)| *sc)
-        });
-        res.map(|(_, s, e)| (s, e))
-    }
-
-    pub fn best_move(&mut self, game: &mut Game) -> Option<(String, String)> {
-        self.tt.next_age();
-        if let Some(book_mv) = book_move(&game.history, &game.board, game.current_turn) {
-            return Some(book_mv);
-        }
-        if self.threads <= 1 {
-            self.best_move_single(game)
-        } else {
-            self.best_move_parallel(game)
-        }
+        best_move.map(|m| {
+            let f =
+                Board::index_to_algebraic((m.from_sq() % 8) as usize, (m.from_sq() / 8) as usize)
+                    .unwrap();
+            let t = Board::index_to_algebraic((m.to_sq() % 8) as usize, (m.to_sq() / 8) as usize)
+                .unwrap();
+            let mut t_string = t;
+            if m.is_promotion() {
+                if let Some(pt) = m.promotion_piece() {
+                    let c = match pt {
+                        PieceType::Queen => 'q',
+                        PieceType::Rook => 'r',
+                        PieceType::Bishop => 'b',
+                        PieceType::Knight => 'n',
+                        _ => 'q',
+                    };
+                    t_string.push(c);
+                }
+            }
+            ((f, t_string), reached_depth)
+        })
     }
 }
 
@@ -905,5 +1067,285 @@ fn opposite(c: Color) -> Color {
     match c {
         Color::White => Color::Black,
         Color::Black => Color::White,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup_game() -> Game {
+        Game::new()
+    }
+
+    #[test]
+    fn test_engine_returns_valid_move() {
+        let mut game = setup_game();
+        let mut engine = Engine::new(4);
+
+        let result = engine.best_move(&mut game);
+        assert!(
+            result.is_some(),
+            "Engine should return a move from starting position"
+        );
+
+        let (from, to) = result.unwrap();
+        assert!(
+            game.board.is_legal(&from, &to, Color::White),
+            "Engine returned illegal move: {} -> {}",
+            from,
+            to
+        );
+    }
+
+    #[test]
+    fn test_engine_finds_obvious_capture() {
+        let mut game = Game::new();
+        game.board = Board::new();
+
+        game.board.set(
+            "e1",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::White,
+            }),
+        );
+        game.board.set(
+            "d1",
+            Some(Piece {
+                piece_type: PieceType::Queen,
+                color: Color::White,
+            }),
+        );
+
+        game.board.set(
+            "h8",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::Black,
+            }),
+        );
+        game.board.set(
+            "d8",
+            Some(Piece {
+                piece_type: PieceType::Rook,
+                color: Color::Black,
+            }),
+        );
+
+        let mut engine = Engine::new(3);
+        let config = TimeConfig::fixed_depth(3);
+        let result = engine.best_move_timed(&mut game, &config);
+
+        assert!(result.is_some());
+        let ((from, to), _depth) = result.unwrap();
+
+        assert_eq!(from, "d1", "Queen should move from d1");
+        assert_eq!(to, "d8", "Queen should capture rook on d8");
+    }
+
+    #[test]
+    fn test_mate_in_one() {
+        let mut game = Game::new();
+        game.board = Board::new();
+
+        game.board.set(
+            "g1",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::White,
+            }),
+        );
+        game.board.set(
+            "a1",
+            Some(Piece {
+                piece_type: PieceType::Rook,
+                color: Color::White,
+            }),
+        );
+        game.board.set(
+            "h8",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::Black,
+            }),
+        );
+        game.board.set(
+            "g7",
+            Some(Piece {
+                piece_type: PieceType::Pawn,
+                color: Color::Black,
+            }),
+        );
+        game.board.set(
+            "h7",
+            Some(Piece {
+                piece_type: PieceType::Pawn,
+                color: Color::Black,
+            }),
+        );
+
+        let mut engine = Engine::new(2);
+        let config = TimeConfig::fixed_depth(2);
+        let result = engine.best_move_timed(&mut game, &config);
+
+        assert!(result.is_some());
+        let ((from, to), _depth) = result.unwrap();
+
+        assert_eq!(from, "a1", "Rook should move from a1");
+        assert_eq!(to, "a8", "Rook should deliver mate on a8");
+    }
+
+    #[test]
+    fn test_fixed_depth_search() {
+        let mut game = setup_game();
+        let mut engine = Engine::new(3);
+
+        let config = TimeConfig::fixed_depth(3);
+        let result = engine.best_move_timed(&mut game, &config);
+
+        assert!(result.is_some(), "Should return a move");
+    }
+
+    #[test]
+    fn test_engine_evaluates_material() {
+        let mut game = Game::new();
+        game.board = Board::new();
+
+        game.board.set(
+            "e1",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::White,
+            }),
+        );
+        game.board.set(
+            "d1",
+            Some(Piece {
+                piece_type: PieceType::Queen,
+                color: Color::White,
+            }),
+        );
+        game.board.set(
+            "e8",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::Black,
+            }),
+        );
+
+        let eval = Engine::evaluate(&game.board, Color::White);
+        assert!(
+            eval > 800,
+            "White up a queen should have high eval, got {}",
+            eval
+        );
+    }
+
+    #[test]
+    fn test_time_config_creation() {
+        let fixed = TimeConfig::fixed_depth(5);
+        assert_eq!(fixed.depth, Some(5));
+
+        let timed = TimeConfig::fixed_time(1000);
+        assert_eq!(timed.movetime, Some(1000));
+
+        let infinite = TimeConfig::infinite();
+        assert!(infinite.infinite);
+    }
+
+    #[test]
+    fn test_engine_cloning() {
+        let engine = Engine::new(5);
+        let cloned = engine.clone();
+
+        assert_eq!(engine.depth, cloned.depth);
+        assert_eq!(engine.threads, cloned.threads);
+    }
+
+    #[test]
+    fn test_generate_legal_moves_count() {
+        let mut board = Board::new();
+        board.setup_standard();
+
+        let engine = Engine::new(1);
+        let moves = engine.generate_legal_moves(&mut board, Color::White);
+
+        assert_eq!(
+            moves.len(),
+            20,
+            "Starting position should have 20 legal moves"
+        );
+    }
+
+    #[test]
+    fn test_search_doesnt_hang() {
+        let mut game = setup_game();
+        let mut engine = Engine::new(4);
+
+        let config = TimeConfig::fixed_depth(4);
+        let start = std::time::Instant::now();
+        let _result = engine.best_move_timed(&mut game, &config);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed.as_secs() < 10,
+            "Search took too long: {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_transposition_table_usage() {
+        let mut game = setup_game();
+        let mut engine = Engine::new(3);
+
+        let config = TimeConfig::fixed_depth(3);
+        let result1 = engine.best_move_timed(&mut game, &config);
+
+        let result2 = engine.best_move_timed(&mut game, &config);
+
+        assert_eq!(result1, result2, "Same position should return same move");
+    }
+
+    #[test]
+    fn test_quiescence_prevents_horizon_effect() {
+        let mut game = Game::new();
+        game.board = Board::new();
+
+        game.board.set(
+            "e1",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::White,
+            }),
+        );
+        game.board.set(
+            "e4",
+            Some(Piece {
+                piece_type: PieceType::Pawn,
+                color: Color::White,
+            }),
+        );
+        game.board.set(
+            "e8",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::Black,
+            }),
+        );
+        game.board.set(
+            "d6",
+            Some(Piece {
+                piece_type: PieceType::Knight,
+                color: Color::Black,
+            }),
+        );
+
+        let mut engine = Engine::new(4);
+        let config = TimeConfig::fixed_depth(4);
+        let result = engine.best_move_timed(&mut game, &config);
+
+        assert!(result.is_some());
     }
 }

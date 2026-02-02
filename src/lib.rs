@@ -1,11 +1,13 @@
 pub mod board;
 pub mod engine;
+pub mod eval;
 pub mod game;
 pub mod movegen;
 pub mod opening;
 pub mod pieces;
 pub mod san;
 pub mod transposition;
+pub mod types;
 
 #[cfg(test)]
 mod tests {

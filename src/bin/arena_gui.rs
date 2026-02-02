@@ -60,18 +60,15 @@ impl ArenaApp {
     }
 
     fn step(&mut self) {
-        // Check end of game
         let legal = self.game.legal_moves();
         if legal.is_empty() {
             if self.game.board.in_check(self.game.current_turn) {
-                // checkmate
                 if let Some(winner) = self.game.result {
                     if winner == Color::White {
                         self.wins += 1;
                     }
                 }
             } else {
-                // stalemate
                 self.draws += 1;
             }
             self.games_played += 1;
