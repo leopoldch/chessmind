@@ -26,8 +26,7 @@
     return '';
   }
 
-  if (!/^\/game\/[^\/]+$/.test(window.location.pathname)) return;
-
+  // Le listener reste actif en permanence pour la SPA
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg.action === 'start_game') {
       startGame();
@@ -36,11 +35,62 @@
     }
   });
 
-  function startGame() {
+  // Utilitaire pour attendre qu'un élément apparaisse dans le DOM
+  function waitForElement(selector, timeout = 10000) {
+    return new Promise((resolve, reject) => {
+      const existing = document.querySelector(selector);
+      if (existing) {
+        resolve(existing);
+        return;
+      }
+
+      const timeoutId = setTimeout(() => {
+        obs.disconnect();
+        reject(new Error(`Timeout: element "${selector}" not found after ${timeout}ms`));
+      }, timeout);
+
+      const obs = new MutationObserver(() => {
+        const el = document.querySelector(selector);
+        if (el) {
+          clearTimeout(timeoutId);
+          obs.disconnect();
+          resolve(el);
+        }
+      });
+
+      obs.observe(document.body, { childList: true, subtree: true });
+    });
+  }
+
+  async function startGame() {
+    // Vérification de l'URL à chaque démarrage (SPA)
+    if (!/^\/game\/[^\/]+$/.test(window.location.pathname)) {
+      console.log('[ChessMind] Not on a game page, ignoring start_game');
+      return;
+    }
+
     if (gameStarted) return;
     gameStarted = true;
     shouldReconnect = true;
-    connect();
+
+    // Réinitialiser l'état pour permettre l'envoi de l'historique
+    lastMoves = [];
+    myColor = null;
+
+    try {
+      // Attendre que le plateau et la liste des coups soient chargés
+      await Promise.all([
+        waitForElement('svg.coordinates'),
+        waitForElement('.timestamps-with-base-time')
+      ]);
+      connect();
+    } catch (err) {
+      console.error('[ChessMind] Failed to find board elements:', err);
+      gameStarted = false;
+      shouldReconnect = false;
+      return;
+    }
+
     window.addEventListener('beforeunload', stopGame);
   }
 
