@@ -57,13 +57,21 @@ The engine can be configured without code changes via environment variables:
 | `CHESSMIND_TT_SIZE` | Transposition table size (number of entries). | `4_194_304`. |
 | `SYZYGY_PATH` | Path to Syzygy tablebases to enable endgame probing. | Disabled if not set. |
 
+## Online chess.com (please do not abuse)
+
+```bash
+cargo run --release --bin ws_server
+```
+Then load the browser extension.
+Important: please do not test against real players.
+
 ## Graphical interface
 
 If you prefer playing locally without the WebSocket server, a simple GUI is
 available. Launch it with:
 
 ```bash
-cargo run --bin gui
+cargo run --release --bin gui
 ```
 
 The board appears in a new window and you can move pieces by dragging them from
