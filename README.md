@@ -7,7 +7,7 @@ To avoid draws by repetition, game states are tracked and the AI skips moves tha
 ## Warning 
 
 This implementation is indeed not perfect and could be improved a lot; This programs was just a experiment.
-
+Apprx ELO when tested on chess.com: 2000
 
 ## Building
 
