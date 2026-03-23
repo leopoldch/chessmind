@@ -10,6 +10,7 @@ pub struct MoveState {
     pub end: (usize, usize),
     pub captured: Option<Piece>,
     pub captured_sq: Option<(usize, usize)>,
+    pub promotion: Option<PieceType>,
     pub prev_en_passant: Option<(usize, usize)>,
     pub prev_castling: [[bool; 2]; 2],
     pub rook_move: Option<((usize, usize), (usize, usize))>,
@@ -153,7 +154,7 @@ impl Board {
 
     pub fn make_move_state(&mut self, start: &str, end: &str) -> Option<MoveState> {
         let (sx, sy) = Self::algebraic_to_index(start)?;
-        let (ex, ey) = Self::algebraic_to_index(end)?;
+        let ((ex, ey), promotion) = Self::parse_move_destination(end)?;
         let piece = self.get_index(sx, sy)?;
         let captured = self.get_index(ex, ey);
         let mut captured_sq = if captured.is_some() {
@@ -220,6 +221,7 @@ impl Board {
                         end: (ex, ey),
                         captured: cap,
                         captured_sq,
+                        promotion: None,
                         prev_en_passant: prev_ep,
                         prev_castling,
                         rook_move,
@@ -228,7 +230,16 @@ impl Board {
             }
         }
 
-        self.set_index(ex, ey, Some(piece));
+        let moved_piece = if piece.piece_type == PieceType::Pawn && (ey == 0 || ey == 7) {
+            Piece {
+                piece_type: promotion.unwrap_or(PieceType::Queen),
+                color: piece.color,
+            }
+        } else {
+            piece
+        };
+
+        self.set_index(ex, ey, Some(moved_piece));
         self.set_index(sx, sy, None);
 
         Some(MoveState {
@@ -236,6 +247,11 @@ impl Board {
             end: (ex, ey),
             captured,
             captured_sq,
+            promotion: if moved_piece.piece_type != piece.piece_type {
+                Some(moved_piece.piece_type)
+            } else {
+                None
+            },
             prev_en_passant: prev_ep,
             prev_castling,
             rook_move,
@@ -243,7 +259,13 @@ impl Board {
     }
 
     pub fn unmake_move(&mut self, state: MoveState) {
-        let moving = self.get_index(state.end.0, state.end.1);
+        let mut moving = self.get_index(state.end.0, state.end.1);
+        if state.promotion.is_some() {
+            if let Some(mut piece) = moving {
+                piece.piece_type = PieceType::Pawn;
+                moving = Some(piece);
+            }
+        }
         self.set_index(state.start.0, state.start.1, moving);
         self.set_index(state.end.0, state.end.1, None);
         if let Some((cx, cy)) = state.captured_sq {
@@ -288,6 +310,64 @@ impl Board {
 
     fn inside(x: isize, y: isize) -> bool {
         x >= 0 && x < 8 && y >= 0 && y < 8
+    }
+
+    fn parse_move_destination(end: &str) -> Option<((usize, usize), Option<PieceType>)> {
+        let bytes = end.as_bytes();
+        let promotion = match bytes.len() {
+            2 => None,
+            3 => Some(match bytes[2].to_ascii_lowercase() {
+                b'n' => PieceType::Knight,
+                b'b' => PieceType::Bishop,
+                b'r' => PieceType::Rook,
+                b'q' => PieceType::Queen,
+                _ => return None,
+            }),
+            _ => return None,
+        };
+
+        let square = Self::algebraic_to_index(std::str::from_utf8(&bytes[..2]).ok()?)?;
+        Some((square, promotion))
+    }
+
+    pub fn encode_move(&self, start: &str, end: &str, color: Color) -> Option<Move> {
+        let (sx, sy) = Self::algebraic_to_index(start)?;
+        let ((ex, ey), promotion) = Self::parse_move_destination(end)?;
+        let piece = self.get_index(sx, sy)?;
+        if piece.color != color {
+            return None;
+        }
+        if matches!(self.get_index(ex, ey), Some(dest) if dest.color == color) {
+            return None;
+        }
+
+        let from = (sy * 8 + sx) as u8;
+        let to = (ey * 8 + ex) as u8;
+        let is_ep = piece.piece_type == PieceType::Pawn
+            && sx != ex
+            && self.get_index(ex, ey).is_none()
+            && self.en_passant == Some((ex, ey));
+        let is_capture = self.get_index(ex, ey).is_some() || is_ep;
+
+        Some(match piece.piece_type {
+            PieceType::Pawn if ey == 0 || ey == 7 => {
+                Move::promotion(from, to, promotion.unwrap_or(PieceType::Queen), is_capture)
+            }
+            PieceType::Pawn if sx == ex && sy.abs_diff(ey) == 2 => {
+                Move::new(from, to, Move::FLAG_DOUBLE_PUSH)
+            }
+            PieceType::Pawn if is_ep => Move::new(from, to, Move::FLAG_EP_CAPTURE),
+            PieceType::King if sy == ey && sx.abs_diff(ex) == 2 => {
+                let flag = if ex > sx {
+                    Move::FLAG_KING_CASTLE
+                } else {
+                    Move::FLAG_QUEEN_CASTLE
+                };
+                Move::new(from, to, flag)
+            }
+            _ if is_capture => Move::capture(from, to),
+            _ => Move::normal(from, to),
+        })
     }
 
     pub fn pseudo_legal_moves(&self, pos: &str) -> Vec<String> {
@@ -476,55 +556,11 @@ impl Board {
     }
 
     pub fn square_attacked(&mut self, x: usize, y: usize, by_color: Color) -> bool {
-        for yy in 0..8 {
-            for xx in 0..8 {
-                if let Some(p) = self.get_index(xx, yy) {
-                    if p.color == by_color {
-                        if let Some(pos) = Self::index_to_algebraic(xx, yy) {
-                            for m in self.pseudo_legal_moves(&pos) {
-                                if let Some((tx, ty)) = Self::algebraic_to_index(&m) {
-                                    if tx == x && ty == y {
-                                        return true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        false
+        self.is_square_attacked_by((y * 8 + x) as u8, by_color)
     }
 
     pub fn in_check(&mut self, color: Color) -> bool {
-        let king_sq = self.find_king(color);
-        if king_sq.is_none() {
-            return false;
-        }
-        let k = king_sq.unwrap();
-        let opp = if color == Color::White {
-            Color::Black
-        } else {
-            Color::White
-        };
-        for y in 0..8 {
-            for x in 0..8 {
-                if let Some(p) = self.get_index(x, y) {
-                    if p.color == opp {
-                        if let Some(pos) = Self::index_to_algebraic(x, y) {
-                            for m in self.pseudo_legal_moves(&pos) {
-                                if let Some((tx, ty)) = Self::algebraic_to_index(&m) {
-                                    if tx == k.0 && ty == k.1 {
-                                        return true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        false
+        self.in_check_fast(color)
     }
 
     pub fn find_king(&self, color: Color) -> Option<(usize, usize)> {
@@ -541,57 +577,10 @@ impl Board {
     }
 
     pub fn is_legal(&mut self, start: &str, end: &str, color: Color) -> bool {
-        let (sx, sy) = match Self::algebraic_to_index(start) {
-            Some(v) => v,
-            None => return false,
-        };
-        let (ex, ey) = match Self::algebraic_to_index(end) {
-            Some(v) => v,
-            None => return false,
-        };
-
-        let piece = match self.get_index(sx, sy) {
-            Some(p) => p,
-            None => return false,
-        };
-        if piece.color != color {
+        let Some(mv) = self.encode_move(start, end, color) else {
             return false;
-        }
-
-        if let Some(dest) = self.get_index(ex, ey) {
-            if dest.color == color {
-                return false;
-            }
-        }
-
-        let is_castle =
-            piece.piece_type == PieceType::King && (sx as isize - ex as isize).abs() == 2;
-        if is_castle {
-            if self.in_check(color) {
-                return false;
-            }
-            let step = if ex > sx { 1 } else { -1 };
-            let opp = if color == Color::White {
-                Color::Black
-            } else {
-                Color::White
-            };
-            let mut x = sx as isize + step;
-            while x != ex as isize {
-                if self.square_attacked(x as usize, sy, opp) {
-                    return false;
-                }
-                x += step;
-            }
-        }
-
-        if let Some(state) = self.make_move_state(start, end) {
-            let check = self.in_check(color);
-            self.unmake_move(state);
-            !check
-        } else {
-            false
-        }
+        };
+        self.is_move_legal_fast(mv, color)
     }
 
     pub fn all_legal_moves(&mut self, color: Color) -> Vec<(String, String)> {
@@ -616,6 +605,61 @@ impl Board {
 
     pub fn all_legal_moves_fast(&mut self, color: Color) -> Vec<(String, String)> {
         crate::movegen::generate_moves(self, color)
+    }
+
+    #[inline]
+    pub fn is_move_legal_fast(&mut self, mv: Move, color: Color) -> bool {
+        crate::movegen::is_move_pseudo_legal(self, mv, color)
+            && self.is_generated_move_legal(mv, color)
+    }
+
+    #[inline]
+    pub fn is_generated_move_legal(&mut self, mv: Move, color: Color) -> bool {
+        let from_sq = mv.from_sq();
+        let from_x = (from_sq % 8) as usize;
+        let from_y = (from_sq / 8) as usize;
+
+        if mv.is_castle() {
+            let cidx = color_idx(color);
+            let rank = if color == Color::White { 0 } else { 7 };
+            if from_x != 4 || from_y != rank {
+                return false;
+            }
+
+            let (rook_x, transit_sq, side) = if mv.flags() == Move::FLAG_KING_CASTLE {
+                (7, rank * 8 + 5, 0usize)
+            } else {
+                (0, rank * 8 + 3, 1usize)
+            };
+
+            if !self.castling[cidx][side] {
+                return false;
+            }
+
+            if !matches!(
+                self.get_index(rook_x, rank),
+                Some(Piece {
+                    piece_type: PieceType::Rook,
+                    color: rook_color
+                }) if rook_color == color
+            ) {
+                return false;
+            }
+
+            let opp = if color == Color::White {
+                Color::Black
+            } else {
+                Color::White
+            };
+            if self.in_check_fast(color) || self.is_square_attacked_by(transit_sq as u8, opp) {
+                return false;
+            }
+        }
+
+        let undo = self.make_move_fast(mv, color);
+        let legal = !self.in_check_fast(color);
+        self.unmake_move_fast(undo, color);
+        legal
     }
 
     pub fn capture_moves(&mut self, color: Color) -> Vec<(String, String)> {
@@ -1164,7 +1208,7 @@ mod tests {
         board.set("f1", None);
         board.set("g1", None);
 
-        let original_hash = board.hash;
+        let _original_hash = board.hash;
         let original_castling = board.castling;
 
         let state = board.make_move_state("e1", "g1").unwrap();
@@ -1217,7 +1261,7 @@ mod tests {
 
         board.make_move_state("d7", "d5");
 
-        let hash_before_ep = board.hash;
+        let _hash_before_ep = board.hash;
 
         let state = board.make_move_state("e5", "d6").unwrap();
 
@@ -1257,18 +1301,50 @@ mod tests {
             }),
         );
 
-        let original_hash = board.hash;
+        let _original_hash = board.hash;
 
-        let state = board.make_move_state("e7", "e8").unwrap();
+        let state = board.make_move_state("e7", "e8q").unwrap();
 
         let piece = board.get("e8").unwrap();
         assert_eq!(piece.color, Color::White);
+        assert_eq!(piece.piece_type, PieceType::Queen);
         assert!(board.get("e7").is_none());
 
         board.unmake_move(state);
         let pawn = board.get("e7").unwrap();
         assert_eq!(pawn.piece_type, PieceType::Pawn);
         assert!(board.get("e8").is_none());
+    }
+
+    #[test]
+    fn test_make_move_state_supports_underpromotion_suffix() {
+        let mut board = Board::new();
+        board.set(
+            "e7",
+            Some(Piece {
+                piece_type: PieceType::Pawn,
+                color: Color::White,
+            }),
+        );
+        board.set(
+            "h8",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::Black,
+            }),
+        );
+        board.set(
+            "e1",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::White,
+            }),
+        );
+
+        let state = board.make_move_state("e7", "e8n").unwrap();
+        assert_eq!(board.get("e8").unwrap().piece_type, PieceType::Knight);
+        board.unmake_move(state);
+        assert_eq!(board.get("e7").unwrap().piece_type, PieceType::Pawn);
     }
 
     #[test]
@@ -1364,6 +1440,42 @@ mod tests {
     }
 
     #[test]
+    fn test_is_legal_rejects_castle_through_check() {
+        let mut board = Board::new();
+
+        board.set(
+            "e1",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::White,
+            }),
+        );
+        board.set(
+            "h1",
+            Some(Piece {
+                piece_type: PieceType::Rook,
+                color: Color::White,
+            }),
+        );
+        board.set(
+            "a8",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::Black,
+            }),
+        );
+        board.set(
+            "f8",
+            Some(Piece {
+                piece_type: PieceType::Rook,
+                color: Color::Black,
+            }),
+        );
+
+        assert!(!board.is_legal("e1", "g1", Color::White));
+    }
+
+    #[test]
     fn test_to_fen_starting_position() {
         let mut board = Board::new();
         board.setup_standard();
@@ -1401,5 +1513,49 @@ mod tests {
         assert!(board.get("e2").is_some());
         assert!(board.get("e4").is_none());
         assert_eq!(board.hash, original_hash);
+    }
+
+    #[test]
+    fn test_is_move_legal_fast_rejects_en_passant_discovered_check() {
+        let mut board = Board::new();
+
+        board.set(
+            "e1",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::White,
+            }),
+        );
+        board.set(
+            "e5",
+            Some(Piece {
+                piece_type: PieceType::Pawn,
+                color: Color::White,
+            }),
+        );
+        board.set(
+            "a8",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::Black,
+            }),
+        );
+        board.set(
+            "e8",
+            Some(Piece {
+                piece_type: PieceType::Rook,
+                color: Color::Black,
+            }),
+        );
+        board.set(
+            "d5",
+            Some(Piece {
+                piece_type: PieceType::Pawn,
+                color: Color::Black,
+            }),
+        );
+        board.en_passant = Some((3, 5)); // d6
+
+        assert!(!board.is_move_legal_fast(Move::new(36, 43, Move::FLAG_EP_CAPTURE), Color::White));
     }
 }

@@ -1,5 +1,6 @@
 use crate::board::{Board, color_idx, piece_index};
 use crate::pieces::{Color, PieceType};
+use crate::types::{Move, MoveList};
 use once_cell::sync::Lazy;
 
 const DIRS_KNIGHT: &[(isize, isize)] = &[
@@ -93,7 +94,8 @@ pub static BLACK_PAWN_ATTACKS: Lazy<[u64; 64]> = Lazy::new(|| {
     arr
 });
 
-fn rook_attacks(sq: usize, occ: u64) -> u64 {
+#[inline(always)]
+pub(crate) fn rook_attacks(sq: usize, occ: u64) -> u64 {
     let x = (sq % 8) as isize;
     let y = (sq / 8) as isize;
     let mut attacks = 0u64;
@@ -142,7 +144,8 @@ fn rook_attacks(sq: usize, occ: u64) -> u64 {
     attacks
 }
 
-fn bishop_attacks(sq: usize, occ: u64) -> u64 {
+#[inline(always)]
+pub(crate) fn bishop_attacks(sq: usize, occ: u64) -> u64 {
     let x = (sq % 8) as isize;
     let y = (sq / 8) as isize;
     let mut attacks = 0u64;
@@ -205,7 +208,8 @@ fn bishop_attacks(sq: usize, occ: u64) -> u64 {
     attacks
 }
 
-fn pawn_moves(
+#[inline(always)]
+pub(crate) fn pawn_moves(
     sq: usize,
     color: Color,
     occ: u64,
@@ -258,11 +262,139 @@ fn pawn_moves(
     moves
 }
 
+#[inline(always)]
+fn has_castle_rook(board: &Board, color: Color, rook_x: usize, rank: usize) -> bool {
+    matches!(
+        board.get_index(rook_x, rank),
+        Some(piece) if piece.color == color && piece.piece_type == PieceType::Rook
+    )
+}
+
+#[inline(always)]
+pub(crate) fn pseudo_targets_for_piece(
+    board: &Board,
+    sq: usize,
+    piece_type: PieceType,
+    color: Color,
+) -> u64 {
+    let cidx = color_idx(color);
+    let occ_self = board.all_pieces(color);
+    let occ_opp = board.all_pieces(if color == Color::White {
+        Color::Black
+    } else {
+        Color::White
+    });
+    let occ_all = occ_self | occ_opp;
+
+    let mut targets = match piece_type {
+        PieceType::Pawn => pawn_moves(sq, color, occ_all, occ_opp, board.en_passant),
+        PieceType::Knight => KNIGHT_TABLE[sq],
+        PieceType::Bishop => bishop_attacks(sq, occ_all),
+        PieceType::Rook => rook_attacks(sq, occ_all),
+        PieceType::Queen => bishop_attacks(sq, occ_all) | rook_attacks(sq, occ_all),
+        PieceType::King => {
+            let mut king_targets = KING_TABLE[sq];
+            let rank = if color == Color::White { 0 } else { 7 };
+            if sq == rank * 8 + 4 {
+                if board.castling[cidx][0]
+                    && has_castle_rook(board, color, 7, rank)
+                    && board.get_index(5, rank).is_none()
+                    && board.get_index(6, rank).is_none()
+                {
+                    king_targets |= 1u64 << (rank * 8 + 6);
+                }
+                if board.castling[cidx][1]
+                    && has_castle_rook(board, color, 0, rank)
+                    && board.get_index(1, rank).is_none()
+                    && board.get_index(2, rank).is_none()
+                    && board.get_index(3, rank).is_none()
+                {
+                    king_targets |= 1u64 << (rank * 8 + 2);
+                }
+            }
+            king_targets
+        }
+    };
+
+    targets &= !occ_self;
+    targets
+}
+
+#[inline(always)]
+pub(crate) fn is_move_pseudo_legal(board: &Board, mv: Move, color: Color) -> bool {
+    let from_sq = mv.from_sq() as usize;
+    let to_sq = mv.to_sq() as usize;
+    let from_x = from_sq % 8;
+    let from_y = from_sq / 8;
+    let to_x = to_sq % 8;
+    let to_y = to_sq / 8;
+
+    let piece = match board.get_index(from_x, from_y) {
+        Some(piece) if piece.color == color => piece,
+        _ => return false,
+    };
+
+    if matches!(board.get_index(to_x, to_y), Some(piece) if piece.color == color) {
+        return false;
+    }
+
+    let targets = pseudo_targets_for_piece(board, from_sq, piece.piece_type, color);
+    if (targets & (1u64 << to_sq)) == 0 {
+        return false;
+    }
+
+    let is_ep_target = piece.piece_type == PieceType::Pawn
+        && board.en_passant == Some((to_x, to_y))
+        && from_x != to_x
+        && board.get_index(to_x, to_y).is_none();
+    let is_capture = board.get_index(to_x, to_y).is_some() || is_ep_target;
+
+    match piece.piece_type {
+        PieceType::Pawn => {
+            let promotion_rank = if color == Color::White { 7 } else { 0 };
+            if (to_y == promotion_rank) != mv.is_promotion() {
+                return false;
+            }
+            if mv.is_ep() != is_ep_target {
+                return false;
+            }
+            if mv.is_double_push() != (from_x == to_x && from_y.abs_diff(to_y) == 2) {
+                return false;
+            }
+            if mv.is_capture() != is_capture {
+                return false;
+            }
+        }
+        PieceType::King => {
+            let is_castle = from_y == to_y && from_x.abs_diff(to_x) == 2;
+            if mv.is_castle() != is_castle {
+                return false;
+            }
+            if mv.is_double_push() || mv.is_ep() || mv.is_promotion() {
+                return false;
+            }
+            if !mv.is_castle() && mv.is_capture() != is_capture {
+                return false;
+            }
+        }
+        _ => {
+            if mv.is_double_push() || mv.is_ep() || mv.is_promotion() || mv.is_castle() {
+                return false;
+            }
+            if mv.is_capture() != is_capture {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
 pub fn generate_moves(board: &mut Board, color: Color) -> Vec<(String, String)> {
-    let mut list = crate::types::MoveList::new();
+    let mut list = MoveList::new();
     generate_moves_fast(board, color, &mut list);
 
-    let mut res = Vec::new();
+    let mut res = Vec::with_capacity(list.len());
     for i in 0..list.len() {
         let m = list.get(i).unwrap();
         let f_str =
@@ -288,16 +420,18 @@ pub fn generate_moves(board: &mut Board, color: Color) -> Vec<(String, String)> 
     res
 }
 
-pub fn generate_moves_fast(board: &mut Board, color: Color, list: &mut crate::types::MoveList) {
+#[inline(always)]
+fn push_promotion_moves(list: &mut MoveList, from: u8, to: u8, is_capture: bool) {
+    list.push(Move::promotion(from, to, PieceType::Queen, is_capture));
+    list.push(Move::promotion(from, to, PieceType::Rook, is_capture));
+    list.push(Move::promotion(from, to, PieceType::Bishop, is_capture));
+    list.push(Move::promotion(from, to, PieceType::Knight, is_capture));
+}
+
+fn generate_pseudo_legal_moves(board: &Board, color: Color, list: &mut MoveList) {
+    list.clear();
     let cidx = color_idx(color);
-    let opp_color = if color == Color::White {
-        Color::Black
-    } else {
-        Color::White
-    };
-    let occ_self: u64 = board.bitboards[cidx].iter().fold(0u64, |a, &b| a | b);
     let occ_opp: u64 = board.bitboards[1 - cidx].iter().fold(0u64, |a, &b| a | b);
-    let occ_all = occ_self | occ_opp;
 
     for pt in [
         PieceType::Pawn,
@@ -311,124 +445,64 @@ pub fn generate_moves_fast(board: &mut Board, color: Color, list: &mut crate::ty
         while bb != 0 {
             let sq = bb.trailing_zeros() as usize;
             let from = sq as u8;
-            let mut targets;
-
-            match pt {
-                PieceType::Pawn => {
-                    targets = pawn_moves(sq, color, occ_all, occ_opp, board.en_passant)
-                }
-                PieceType::Knight => targets = KNIGHT_TABLE[sq],
-                PieceType::Bishop => targets = bishop_attacks(sq, occ_all),
-                PieceType::Rook => targets = rook_attacks(sq, occ_all),
-                PieceType::Queen => {
-                    targets = bishop_attacks(sq, occ_all) | rook_attacks(sq, occ_all)
-                }
-                PieceType::King => {
-                    targets = KING_TABLE[sq];
-                    let rank = if color == Color::White { 0 } else { 7 };
-                    if sq == rank * 8 + 4 {
-                        if board.castling[cidx][0]
-                            && board.get_index(5, rank).is_none()
-                            && board.get_index(6, rank).is_none()
-                            && !board.is_square_attacked_by(sq as u8, opp_color) // King not in check
-                            && !board.is_square_attacked_by((rank*8+5) as u8, opp_color)
-                        {
-                            targets |= 1u64 << (rank * 8 + 6);
-                        }
-                        if board.castling[cidx][1]
-                            && board.get_index(1, rank).is_none()
-                            && board.get_index(2, rank).is_none()
-                            && board.get_index(3, rank).is_none()
-                            && !board.is_square_attacked_by(sq as u8, opp_color)
-                            && !board.is_square_attacked_by((rank * 8 + 3) as u8, opp_color)
-                        {
-                            targets |= 1u64 << (rank * 8 + 2);
-                        }
-                    }
-                }
-            }
-            targets &= !occ_self;
+            let mut targets = pseudo_targets_for_piece(board, sq, pt, color);
 
             while targets != 0 {
                 let to_sq = targets.trailing_zeros() as usize;
                 let to = to_sq as u8;
 
-                let is_capture = (occ_opp & (1u64 << to_sq)) != 0
-                    || (pt == PieceType::Pawn && (to_sq as isize - sq as isize).abs() % 8 != 0); // Diag pawn move
-
-                let mut flags = crate::types::Move::FLAG_NORMAL;
-                if is_capture {
-                    flags = crate::types::Move::FLAG_CAPTURE;
-                }
-
                 if pt == PieceType::Pawn {
-                    let dy = (to_sq as isize - sq as isize).abs();
-                    if dy == 16 {
-                        flags = crate::types::Move::FLAG_DOUBLE_PUSH;
-                    }
-                    if dy % 8 != 0 && (occ_opp & (1u64 << to_sq)) == 0 {
-                        flags = crate::types::Move::FLAG_EP_CAPTURE;
-                    }
-
+                    let is_ep = board.en_passant == Some((to_sq % 8, to_sq / 8))
+                        && (occ_opp & (1u64 << to_sq)) == 0
+                        && (to_sq as isize - sq as isize).abs() % 8 != 0;
+                    let is_capture = (occ_opp & (1u64 << to_sq)) != 0 || is_ep;
                     let rank_to = to_sq / 8;
                     if rank_to == 0 || rank_to == 7 {
-                        let next_is_capture = (occ_opp & (1u64 << to_sq)) != 0;
-
-                        let f_s = Board::index_to_algebraic(sq % 8, sq / 8).unwrap();
-                        let t_s = Board::index_to_algebraic(to_sq % 8, to_sq / 8).unwrap();
-
-                        if board.is_legal(&f_s, &t_s, color) {
-                            list.push(crate::types::Move::promotion(
-                                from,
-                                to,
-                                PieceType::Queen,
-                                next_is_capture,
-                            ));
-                            list.push(crate::types::Move::promotion(
-                                from,
-                                to,
-                                PieceType::Rook,
-                                next_is_capture,
-                            ));
-                            list.push(crate::types::Move::promotion(
-                                from,
-                                to,
-                                PieceType::Bishop,
-                                next_is_capture,
-                            ));
-                            list.push(crate::types::Move::promotion(
-                                from,
-                                to,
-                                PieceType::Knight,
-                                next_is_capture,
-                            ));
-                        }
-
+                        push_promotion_moves(list, from, to, is_capture);
                         targets &= targets - 1;
-                        continue; // Skip normal push (already handled all 4 promos)
+                        continue;
                     }
+                    if is_ep {
+                        list.push(Move::new(from, to, Move::FLAG_EP_CAPTURE));
+                    } else if (to_sq as isize - sq as isize).abs() == 16 {
+                        list.push(Move::new(from, to, Move::FLAG_DOUBLE_PUSH));
+                    } else if is_capture {
+                        list.push(Move::capture(from, to));
+                    } else {
+                        list.push(Move::normal(from, to));
+                    }
+                    targets &= targets - 1;
+                    continue;
                 }
 
                 if pt == PieceType::King && (to_sq as isize - sq as isize).abs() == 2 {
-                    if to_sq > sq {
-                        flags = crate::types::Move::FLAG_KING_CASTLE;
+                    let flag = if to_sq > sq {
+                        Move::FLAG_KING_CASTLE
                     } else {
-                        flags = crate::types::Move::FLAG_QUEEN_CASTLE;
-                    }
-                }
-
-                let mv = crate::types::Move::new(from, to, flags);
-
-                let f_s = Board::index_to_algebraic(sq % 8, sq / 8).unwrap();
-                let t_s = Board::index_to_algebraic(to_sq % 8, to_sq / 8).unwrap();
-
-                if board.is_legal(&f_s, &t_s, color) {
-                    list.push(mv);
+                        Move::FLAG_QUEEN_CASTLE
+                    };
+                    list.push(Move::new(from, to, flag));
+                } else if (occ_opp & (1u64 << to_sq)) != 0 {
+                    list.push(Move::capture(from, to));
+                } else {
+                    list.push(Move::normal(from, to));
                 }
 
                 targets &= targets - 1;
             }
             bb &= bb - 1;
+        }
+    }
+}
+
+pub fn generate_moves_fast(board: &mut Board, color: Color, list: &mut MoveList) {
+    let mut pseudo = MoveList::new();
+    generate_pseudo_legal_moves(board, color, &mut pseudo);
+
+    list.clear();
+    for mv in pseudo.iter().copied() {
+        if board.is_generated_move_legal(mv, color) {
+            list.push(mv);
         }
     }
 }
@@ -881,6 +955,100 @@ mod tests {
             .count();
 
         assert!(ep_count >= 1, "Should have at least 1 en passant move");
+    }
+
+    #[test]
+    fn test_castling_through_check_not_generated() {
+        let mut board = Board::new();
+
+        board.set(
+            "e1",
+            Some(crate::pieces::Piece {
+                piece_type: PieceType::King,
+                color: Color::White,
+            }),
+        );
+        board.set(
+            "h1",
+            Some(crate::pieces::Piece {
+                piece_type: PieceType::Rook,
+                color: Color::White,
+            }),
+        );
+        board.set(
+            "a8",
+            Some(crate::pieces::Piece {
+                piece_type: PieceType::King,
+                color: Color::Black,
+            }),
+        );
+        board.set(
+            "f8",
+            Some(crate::pieces::Piece {
+                piece_type: PieceType::Rook,
+                color: Color::Black,
+            }),
+        );
+
+        let mut list = MoveList::new();
+        generate_moves_fast(&mut board, Color::White, &mut list);
+
+        assert!(
+            !(0..list.len())
+                .any(|i| list.get(i).unwrap() == Move::new(4, 6, Move::FLAG_KING_CASTLE)),
+            "Kingside castling must not be generated when f1 is attacked"
+        );
+    }
+
+    #[test]
+    fn test_en_passant_discovered_check_not_generated() {
+        let mut board = Board::new();
+
+        board.set(
+            "e1",
+            Some(crate::pieces::Piece {
+                piece_type: PieceType::King,
+                color: Color::White,
+            }),
+        );
+        board.set(
+            "e5",
+            Some(crate::pieces::Piece {
+                piece_type: PieceType::Pawn,
+                color: Color::White,
+            }),
+        );
+        board.set(
+            "a8",
+            Some(crate::pieces::Piece {
+                piece_type: PieceType::King,
+                color: Color::Black,
+            }),
+        );
+        board.set(
+            "e8",
+            Some(crate::pieces::Piece {
+                piece_type: PieceType::Rook,
+                color: Color::Black,
+            }),
+        );
+        board.set(
+            "d5",
+            Some(crate::pieces::Piece {
+                piece_type: PieceType::Pawn,
+                color: Color::Black,
+            }),
+        );
+        board.en_passant = Some((3, 5)); // d6
+
+        let mut list = MoveList::new();
+        generate_moves_fast(&mut board, Color::White, &mut list);
+
+        assert!(
+            !(0..list.len())
+                .any(|i| list.get(i).unwrap() == Move::new(36, 43, Move::FLAG_EP_CAPTURE)),
+            "En passant must be filtered out when it opens the e-file onto the king"
+        );
     }
 
     #[test]
