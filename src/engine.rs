@@ -6,7 +6,6 @@ use crate::transposition::{Bound, TABLE_SIZE, TTEntry, Table};
 use crate::types::{Move, mvv_lva_score}; // Import Move, mvv_lva_score
 use shakmaty::{CastlingMode, Chess, fen::Fen};
 use shakmaty_syzygy::{Tablebase, Wdl};
-use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -314,6 +313,22 @@ struct RootSearchResult {
     score: i32,
 }
 
+struct PonderState {
+    root_hash: u64,
+    predicted_move: Move,
+    stop_flag: Arc<AtomicBool>,
+    handle: thread::JoinHandle<()>,
+}
+
+const CONT_HISTORY_PIECE_TYPES: usize = 6;
+const CONT_HISTORY_SQUARES: usize = 64;
+const CONT_HISTORY_SIZE: usize = CONT_HISTORY_PIECE_TYPES
+    * CONT_HISTORY_SQUARES
+    * CONT_HISTORY_PIECE_TYPES
+    * CONT_HISTORY_SQUARES;
+
+type ContinuationHistory = Vec<i32>;
+
 pub struct Engine {
     pub depth: u32,
     pub threads: usize,
@@ -321,11 +336,12 @@ pub struct Engine {
     killers: Vec<[Option<Move>; 2]>,
     quiet_history: [[i32; 64]; 64],
     capture_history: [[i32; 64]; 64],
-    cont_history: HashMap<(u16, u16), i32>,
+    cont_history: ContinuationHistory,
     tb: Option<Arc<Tablebase<Chess>>>,
     stop_flag: Arc<AtomicBool>,
     time_manager: Option<Arc<TimeManager>>,
     search_history: Vec<u64>,
+    ponder: Option<PonderState>,
 }
 
 impl Clone for Engine {
@@ -342,7 +358,14 @@ impl Clone for Engine {
             stop_flag: self.stop_flag.clone(),
             time_manager: self.time_manager.clone(),
             search_history: self.search_history.clone(),
+            ponder: None,
         }
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.stop_ponder();
     }
 }
 
@@ -363,11 +386,12 @@ impl Engine {
             killers: vec![[None, None]; MAX_PLY],
             quiet_history: [[0; 64]; 64],
             capture_history: [[0; 64]; 64],
-            cont_history: HashMap::new(),
+            cont_history: vec![0; CONT_HISTORY_SIZE],
             tb: None,
             stop_flag: Arc::new(AtomicBool::new(false)),
             time_manager: None,
             search_history: Vec::new(),
+            ponder: None,
         }
     }
 
@@ -412,6 +436,137 @@ impl Engine {
 
     fn reset_stop(&mut self) {
         self.stop_flag = Arc::new(AtomicBool::new(false));
+    }
+
+    fn clone_game(game: &Game) -> Game {
+        Game {
+            board: game.board.clone(),
+            current_turn: game.current_turn,
+            history: game.history.clone(),
+            hash_history: game.hash_history.clone(),
+            hash_counts: game.hash_counts.clone(),
+            result: game.result,
+        }
+    }
+
+    fn current_ponder_move_internal(&self) -> Option<Move> {
+        self.ponder.as_ref().map(|state| state.predicted_move)
+    }
+
+    fn predict_ponder_move(&self, game: &Game) -> Option<Move> {
+        let root_hash = game.board.hash(game.current_turn);
+        if let Some(entry) = self.tt.get(root_hash) {
+            if let Some(mv) = self.find_tt_move(&game.board, game.current_turn, entry.best) {
+                return Some(mv);
+            }
+        }
+
+        self.ordered_root_moves(&game.board, game.current_turn)
+            .into_iter()
+            .next()
+    }
+
+    fn search_with_current_stop_flag(
+        &mut self,
+        game: &mut Game,
+        config: &TimeConfig,
+        allow_book: bool,
+    ) -> Option<((String, String), u32)> {
+        self.tt.next_age();
+
+        if allow_book {
+            if let Some(book_mv) = book_move(&game.history, &game.board, game.current_turn) {
+                return Some((book_mv, 0));
+            }
+        }
+
+        let max_depth = config.depth.unwrap_or(MAX_DEPTH).min(MAX_DEPTH);
+        let time_manager = TimeManager::new(config, game.current_turn, self.stop_flag.clone());
+        self.time_manager = Some(Arc::new(time_manager));
+
+        let result = if self.threads <= 1 || !Self::should_use_parallel_search(config, max_depth) {
+            self.best_move_single(game, max_depth)
+        } else {
+            self.best_move_parallel(game, max_depth)
+        };
+
+        self.time_manager = None;
+        result
+    }
+
+    fn ponder_matches(&self, game: &Game, actual_move: Move) -> bool {
+        let Some(state) = &self.ponder else {
+            return false;
+        };
+
+        state.root_hash == game.board.hash(game.current_turn) && state.predicted_move == actual_move
+    }
+
+    /// Returns the currently predicted opponent move, if a ponder search is active.
+    pub fn current_ponder_move(&self) -> Option<(String, String)> {
+        self.current_ponder_move_internal()
+            .map(Self::move_to_strings)
+    }
+
+    /// Reports whether a background ponder search is currently running.
+    pub fn is_pondering(&self) -> bool {
+        self.ponder.is_some()
+    }
+
+    /// Starts a background ponder on a single predicted reply from the current position.
+    pub fn start_ponder(&mut self, game: &Game) -> Option<(String, String)> {
+        self.stop_ponder();
+
+        let predicted_move = self.predict_ponder_move(game)?;
+        let root_hash = game.board.hash(game.current_turn);
+        let ponder_stop = Arc::new(AtomicBool::new(false));
+        let mut ponder_engine = self.clone();
+        let (start, end) = Self::move_to_strings(predicted_move);
+        let mut ponder_game = Self::clone_game(game);
+
+        if !ponder_game.make_move(&start, &end) {
+            return None;
+        }
+
+        ponder_engine.stop_flag = ponder_stop.clone();
+        ponder_engine.time_manager = None;
+
+        let handle = thread::spawn(move || {
+            let _ = ponder_engine.search_with_current_stop_flag(
+                &mut ponder_game,
+                &TimeConfig::infinite(),
+                false,
+            );
+        });
+
+        self.ponder = Some(PonderState {
+            root_hash,
+            predicted_move,
+            stop_flag: ponder_stop,
+            handle,
+        });
+
+        Some((start, end))
+    }
+
+    /// Stops the background ponder search, if any, and waits for its thread to exit.
+    pub fn stop_ponder(&mut self) {
+        let Some(state) = self.ponder.take() else {
+            return;
+        };
+
+        state.stop_flag.store(true, Ordering::Release);
+        let _ = state.handle.join();
+    }
+
+    /// Validates the played move against the current ponder prediction, then stops ponder cleanly.
+    pub fn ponder_hit(&mut self, game: &Game, start: &str, end: &str) -> bool {
+        let hit = game
+            .board
+            .encode_move(start, end, game.current_turn)
+            .is_some_and(|mv| self.ponder_matches(game, mv));
+        self.stop_ponder();
+        hit
     }
 
     fn string_to_move(&self, board: &Board, s: &str, e: &str) -> Move {
@@ -470,6 +625,27 @@ impl Engine {
     fn generate_legal_moves(&self, board: &mut Board, color: Color) -> crate::types::MoveList {
         let mut list = crate::types::MoveList::new();
         crate::movegen::generate_moves_fast(board, color, &mut list);
+        list
+    }
+
+    fn generate_in_check_moves(&self, board: &mut Board, color: Color) -> crate::types::MoveList {
+        let mut list = crate::types::MoveList::new();
+        crate::movegen::generate_evasions_fast(board, color, &mut list);
+        list
+    }
+
+    fn generate_quiescence_moves(
+        &self,
+        board: &mut Board,
+        color: Color,
+        in_check: bool,
+    ) -> crate::types::MoveList {
+        let mut list = crate::types::MoveList::new();
+        if in_check {
+            crate::movegen::generate_evasions_fast(board, color, &mut list);
+        } else {
+            crate::movegen::generate_captures_fast(board, color, &mut list);
+        }
         list
     }
 
@@ -562,9 +738,77 @@ impl Engine {
         }
 
         if let Some(pmv) = prev {
-            score += *self.cont_history.get(&(pmv.0, mv.0)).unwrap_or(&0);
+            score +=
+                Self::continuation_history_score(self.cont_history.as_slice(), board, *pmv, mv);
         }
         score
+    }
+
+    #[inline(always)]
+    fn continuation_history_score(
+        cont_history: &[i32],
+        board: &Board,
+        prev: Move,
+        mv: Move,
+    ) -> i32 {
+        let prev_to = prev.to_sq() as usize;
+        let curr_from = mv.from_sq() as usize;
+        let curr_to = mv.to_sq() as usize;
+
+        let prev_piece = board.piece_type_idx_at(prev_to as u8);
+        if prev_piece >= 6 {
+            return 0;
+        }
+
+        let curr_piece = board.piece_type_idx_at(curr_from as u8);
+        if curr_piece >= 6 {
+            return 0;
+        }
+
+        cont_history[Self::cont_history_index(prev_piece, prev_to, curr_piece, curr_to)]
+    }
+
+    #[inline(always)]
+    fn update_continuation_history(
+        cont_history: &mut [i32],
+        board: &Board,
+        prev: Move,
+        mv: Move,
+        delta: i32,
+    ) {
+        let prev_to = prev.to_sq() as usize;
+        let curr_from = mv.from_sq() as usize;
+        let curr_to = mv.to_sq() as usize;
+
+        let prev_piece = board.piece_type_idx_at(prev_to as u8);
+        if prev_piece >= 6 {
+            return;
+        }
+
+        let curr_piece = board.piece_type_idx_at(curr_from as u8);
+        if curr_piece >= 6 {
+            return;
+        }
+
+        let idx = Self::cont_history_index(prev_piece, prev_to, curr_piece, curr_to);
+        cont_history[idx] += delta;
+    }
+
+    #[inline(always)]
+    fn cont_history_index(
+        prev_piece: usize,
+        prev_to: usize,
+        curr_piece: usize,
+        curr_to: usize,
+    ) -> usize {
+        debug_assert!(prev_piece < CONT_HISTORY_PIECE_TYPES);
+        debug_assert!(prev_to < CONT_HISTORY_SQUARES);
+        debug_assert!(curr_piece < CONT_HISTORY_PIECE_TYPES);
+        debug_assert!(curr_to < CONT_HISTORY_SQUARES);
+
+        (((prev_piece * CONT_HISTORY_SQUARES + prev_to) * CONT_HISTORY_PIECE_TYPES + curr_piece)
+            * CONT_HISTORY_SQUARES)
+            + curr_to
     }
 
     #[inline(always)]
@@ -763,21 +1007,14 @@ impl Engine {
                 }
             }
 
-            let list = self.generate_legal_moves(board, color);
-            if list.is_empty() {
+            let mut moves = self.generate_quiescence_moves(board, color, in_check);
+            if moves.is_empty() {
                 if in_check {
                     -MATE_VALUE + ply as i32
                 } else {
                     alpha
                 }
             } else {
-                let mut moves = crate::types::MoveList::new();
-                for m in list.iter() {
-                    if in_check || m.is_capture() || m.is_promotion() {
-                        moves.push(*m);
-                    }
-                }
-
                 let mut stages = [ORDER_QUIET; 256];
                 let mut scores = [0i32; 256];
                 let mut sees = [0i32; 256];
@@ -941,7 +1178,11 @@ impl Engine {
                     }
                 }
 
-                let mut moves_list = self.generate_legal_moves(board, color);
+                let mut moves_list = if in_check {
+                    self.generate_in_check_moves(board, color)
+                } else {
+                    self.generate_legal_moves(board, color)
+                };
                 if moves_list.is_empty() {
                     if in_check {
                         break 'search -MATE_VALUE + ply as i32;
@@ -1087,7 +1328,13 @@ impl Engine {
                         }
 
                         if let Some(pmv) = prev_move {
-                            *self.cont_history.entry((pmv.0, m.0)).or_insert(0) += bonus;
+                            Self::update_continuation_history(
+                                self.cont_history.as_mut(),
+                                board,
+                                pmv,
+                                m,
+                                bonus,
+                            );
                         }
 
                         self.tt.store(
@@ -1156,7 +1403,11 @@ impl Engine {
         let root_hash = board.hash(color);
         let tt_best = self.tt.get(root_hash).and_then(|entry| entry.best);
         let mut board_clone = board.clone();
-        let mut moves = self.generate_legal_moves(&mut board_clone, color);
+        let mut moves = if board_clone.in_check_fast(color) {
+            self.generate_in_check_moves(&mut board_clone, color)
+        } else {
+            self.generate_legal_moves(&mut board_clone, color)
+        };
 
         if moves.is_empty() {
             return Vec::new();
@@ -1321,25 +1572,9 @@ impl Engine {
         game: &mut Game,
         config: &TimeConfig,
     ) -> Option<((String, String), u32)> {
+        self.stop_ponder();
         self.reset_stop();
-        self.tt.next_age();
-
-        if let Some(book_mv) = book_move(&game.history, &game.board, game.current_turn) {
-            return Some((book_mv, 0));
-        }
-
-        let max_depth = config.depth.unwrap_or(MAX_DEPTH).min(MAX_DEPTH);
-        let time_manager = TimeManager::new(config, game.current_turn, self.stop_flag.clone());
-        self.time_manager = Some(Arc::new(time_manager));
-
-        let result = if self.threads <= 1 || !Self::should_use_parallel_search(config, max_depth) {
-            self.best_move_single(game, max_depth)
-        } else {
-            self.best_move_parallel(game, max_depth)
-        };
-
-        self.time_manager = None;
-        result
+        self.search_with_current_stop_flag(game, config, true)
     }
 
     fn should_use_parallel_search(config: &TimeConfig, max_depth: u32) -> bool {
@@ -1593,6 +1828,55 @@ mod tests {
 
     fn setup_game() -> Game {
         Game::new()
+    }
+
+    fn setup_ponder_position() -> Game {
+        let mut game = Game::new();
+        game.board = Board::new();
+        game.current_turn = Color::White;
+        game.history.clear();
+        game.result = None;
+
+        game.board.set(
+            "e1",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::White,
+            }),
+        );
+        game.board.set(
+            "d1",
+            Some(Piece {
+                piece_type: PieceType::Queen,
+                color: Color::White,
+            }),
+        );
+        game.board.set(
+            "h8",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::Black,
+            }),
+        );
+        game.board.set(
+            "d8",
+            Some(Piece {
+                piece_type: PieceType::Rook,
+                color: Color::Black,
+            }),
+        );
+        game.board.set(
+            "g7",
+            Some(Piece {
+                piece_type: PieceType::Pawn,
+                color: Color::Black,
+            }),
+        );
+
+        let hash = game.board.hash(game.current_turn);
+        game.hash_history = vec![hash];
+        game.hash_counts = std::collections::HashMap::from([(hash, 1usize)]);
+        game
     }
 
     #[test]
@@ -1872,6 +2156,26 @@ mod tests {
     }
 
     #[test]
+    fn test_continuation_history_table_uses_piece_and_target_indices() {
+        let mut board = Board::new();
+        board.setup_standard();
+
+        let prev = Move::new(12, 28, Move::FLAG_DOUBLE_PUSH); // e2 -> e4
+        let _undo = board.make_move_fast(prev, Color::White);
+        let curr = Move::new(62, 45, Move::FLAG_NORMAL); // g8 -> f6
+
+        let engine = Engine::new(1);
+        let mut boosted = engine.clone();
+        let idx = Engine::cont_history_index(0, 28, 1, 45);
+        boosted.cont_history[idx] = 777;
+
+        let base = engine.move_score(&board, curr, 0, Some(&prev));
+        let boosted_score = boosted.move_score(&board, curr, 0, Some(&prev));
+
+        assert_eq!(boosted_score - base, 777);
+    }
+
+    #[test]
     fn test_search_doesnt_hang() {
         let mut game = setup_game();
         let mut engine = Engine::new(4);
@@ -1914,6 +2218,57 @@ mod tests {
             result1, result2,
             "Forced-collision TT should still produce stable repeated search results"
         );
+    }
+
+    #[test]
+    fn test_start_ponder_predicts_legal_reply_and_stops_cleanly() {
+        let mut game = setup_ponder_position();
+        let mut engine = Engine::new(3);
+        let config = TimeConfig::fixed_depth(3);
+        let ((from, to), _) = engine.best_move_timed(&mut game, &config).unwrap();
+
+        assert!(game.make_move(&from, &to));
+
+        let predicted = engine
+            .start_ponder(&game)
+            .expect("ponder should predict one reply");
+
+        assert!(engine.is_pondering());
+        assert!(
+            game.board
+                .is_legal(&predicted.0, &predicted.1, game.current_turn),
+            "predicted ponder move should be legal"
+        );
+
+        engine.stop_ponder();
+        assert!(!engine.is_pondering());
+        assert_eq!(engine.current_ponder_move(), None);
+    }
+
+    #[test]
+    fn test_ponder_hit_and_miss_stop_background_search() {
+        let mut game = Game::new();
+        assert!(game.make_move("e2", "e4"));
+
+        let mut engine = Engine::new(3);
+
+        let predicted = engine
+            .start_ponder(&game)
+            .expect("ponder should predict one legal black reply");
+        assert!(engine.ponder_hit(&game, &predicted.0, &predicted.1));
+        assert!(!engine.is_pondering());
+
+        let predicted = engine
+            .start_ponder(&game)
+            .expect("ponder should restart after a clean stop");
+        let alternative = game
+            .legal_moves()
+            .into_iter()
+            .find(|mv| mv != &predicted)
+            .expect("test position should have a second legal reply");
+
+        assert!(!engine.ponder_hit(&game, &alternative.0, &alternative.1));
+        assert!(!engine.is_pondering());
     }
 
     #[test]

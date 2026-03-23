@@ -2,8 +2,8 @@ use once_cell::sync::Lazy;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-use crate::board::Board;
-use crate::pieces::Color;
+use crate::board::{Board, color_idx, piece_index};
+use crate::pieces::{Color, PieceType};
 
 #[derive(Clone, Copy)]
 pub enum Bound {
@@ -267,32 +267,113 @@ impl Table {
     }
 }
 
+const FILE_A: u64 = 0x0101_0101_0101_0101;
+const FILE_H: u64 = 0x8080_8080_8080_8080;
+
+fn splitmix64(seed: &mut u64) -> u64 {
+    *seed = seed.wrapping_add(0x9e3779b97f4a7c15);
+    let mut z = *seed;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+    z ^ (z >> 31)
+}
+
 pub static ZOBRIST: Lazy<[[[u64; 64]; 6]; 2]> = Lazy::new(|| {
     let mut arr = [[[0u64; 64]; 6]; 2];
     let mut seed: u64 = 0xcbf29ce484222325;
     for c in 0..2 {
         for p in 0..6 {
             for s in 0..64 {
-                seed ^= seed >> 12;
-                seed ^= seed << 25;
-                seed ^= seed >> 27;
-                seed = seed.wrapping_mul(0x2545F4914F6CDD1D);
-                arr[c][p][s] = seed;
+                arr[c][p][s] = splitmix64(&mut seed);
             }
         }
     }
     arr
 });
 
+pub static ZOBRIST_CASTLING: Lazy<[u64; 4]> = Lazy::new(|| {
+    let mut seed: u64 = 0x3243f6a8885a308d;
+    std::array::from_fn(|_| splitmix64(&mut seed))
+});
+
+pub static ZOBRIST_EP_FILE: Lazy<[u64; 8]> = Lazy::new(|| {
+    let mut seed: u64 = 0x13198a2e03707344;
+    std::array::from_fn(|_| splitmix64(&mut seed))
+});
+
 pub static ZOBRIST_SIDE: Lazy<u64> = Lazy::new(|| 0x9d39247e33776d41);
 
 impl Board {
-    pub fn hash(&self, side: Color) -> u64 {
-        if side == Color::White {
-            self.hash ^ *ZOBRIST_SIDE
-        } else {
-            self.hash
+    #[inline(always)]
+    fn castling_hash(&self) -> u64 {
+        let mut h = 0;
+        if self.castling[0][0] {
+            h ^= ZOBRIST_CASTLING[0];
         }
+        if self.castling[0][1] {
+            h ^= ZOBRIST_CASTLING[1];
+        }
+        if self.castling[1][0] {
+            h ^= ZOBRIST_CASTLING[2];
+        }
+        if self.castling[1][1] {
+            h ^= ZOBRIST_CASTLING[3];
+        }
+        h
+    }
+
+    #[inline(always)]
+    fn en_passant_hash(&self, side: Color) -> u64 {
+        let Some((file, rank)) = self.en_passant else {
+            return 0;
+        };
+
+        if file >= 8 || rank >= 8 || !self.has_en_passant_capture(side, file, rank) {
+            return 0;
+        }
+
+        ZOBRIST_EP_FILE[file]
+    }
+
+    #[inline(always)]
+    fn has_en_passant_capture(&self, side: Color, file: usize, rank: usize) -> bool {
+        let ep_sq = rank * 8 + file;
+        let ep_mask = 1u64 << ep_sq;
+
+        let pawns = self.bitboards[color_idx(side)][piece_index(PieceType::Pawn)];
+        let attacks = if side == Color::White {
+            ((pawns & !FILE_A) << 7) | ((pawns & !FILE_H) << 9)
+        } else {
+            ((pawns & !FILE_H) >> 7) | ((pawns & !FILE_A) >> 9)
+        };
+        if (attacks & ep_mask) == 0 {
+            return false;
+        }
+
+        let captured_sq = if side == Color::White {
+            ep_sq.checked_sub(8)
+        } else {
+            ep_sq.checked_add(8).filter(|sq| *sq < 64)
+        };
+        let Some(captured_sq) = captured_sq else {
+            return false;
+        };
+
+        let opp = if side == Color::White {
+            Color::Black
+        } else {
+            Color::White
+        };
+        let opp_pawns = self.bitboards[color_idx(opp)][piece_index(PieceType::Pawn)];
+        (opp_pawns & (1u64 << captured_sq)) != 0
+    }
+
+    pub fn hash(&self, side: Color) -> u64 {
+        let mut h = self.hash ^ self.castling_hash() ^ self.en_passant_hash(side);
+        if side == Color::White {
+            h ^= *ZOBRIST_SIDE;
+        }
+        h
     }
 
     pub fn recompute_hash(&mut self) {

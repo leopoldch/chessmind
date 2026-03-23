@@ -1,5 +1,6 @@
 use core::option::Option::None;
 
+use crate::attacks::{bishop_attacks, rook_attacks};
 use crate::pieces::{Color, Piece, PieceType};
 use crate::transposition::ZOBRIST;
 use crate::types::{Move, UndoState};
@@ -20,7 +21,12 @@ pub struct MoveState {
 pub struct Board {
     pub squares: [[Option<Piece>; 8]; 8],
     pub bitboards: [[u64; 6]; 2],
+    pub white_occ: u64,
+    pub black_occ: u64,
     pub hash: u64,
+    pub eval_mg: i32,
+    pub eval_eg: i32,
+    pub eval_phase: i32,
     pub en_passant: Option<(usize, usize)>,
     pub castling: [[bool; 2]; 2],
 }
@@ -52,14 +58,24 @@ impl Board {
         Self {
             squares: [[None; 8]; 8],
             bitboards: [[0u64; 6]; 2],
+            white_occ: 0,
+            black_occ: 0,
             hash: 0,
+            eval_mg: 0,
+            eval_eg: 0,
+            eval_phase: 0,
             en_passant: None,
             castling: [[true, true], [true, true]],
         }
     }
 
     pub fn setup_standard(&mut self) {
+        self.white_occ = 0;
+        self.black_occ = 0;
         self.hash = 0;
+        self.eval_mg = 0;
+        self.eval_eg = 0;
+        self.eval_phase = 0;
         for y in 0..8 {
             for x in 0..8 {
                 self.squares[y][x] = None;
@@ -119,14 +135,32 @@ impl Board {
         if let Some(old) = self.squares[y][x] {
             let c = color_idx(old.color);
             let p = piece_index(old.piece_type);
+            let (mg, eg, phase) = crate::eval::piece_eval_delta(old, y * 8 + x);
+            self.eval_mg -= mg;
+            self.eval_eg -= eg;
+            self.eval_phase -= phase;
             self.bitboards[c][p] &= !mask;
+            if old.color == Color::White {
+                self.white_occ &= !mask;
+            } else {
+                self.black_occ &= !mask;
+            }
             self.hash ^= ZOBRIST[c][p][y * 8 + x];
         }
         self.squares[y][x] = piece;
         if let Some(pce) = piece {
             let c = color_idx(pce.color);
             let p = piece_index(pce.piece_type);
+            let (mg, eg, phase) = crate::eval::piece_eval_delta(pce, y * 8 + x);
+            self.eval_mg += mg;
+            self.eval_eg += eg;
+            self.eval_phase += phase;
             self.bitboards[c][p] |= mask;
+            if pce.color == Color::White {
+                self.white_occ |= mask;
+            } else {
+                self.black_occ |= mask;
+            }
             self.hash ^= ZOBRIST[c][p][y * 8 + x];
         }
     }
@@ -725,19 +759,15 @@ impl Board {
     }
 
     pub fn piece_count_total(&self, color: Color) -> usize {
-        let cidx = color_idx(color);
-        self.bitboards[cidx]
-            .iter()
-            .map(|bb| bb.count_ones() as usize)
-            .sum()
+        if color == Color::White {
+            self.white_occ.count_ones() as usize
+        } else {
+            self.black_occ.count_ones() as usize
+        }
     }
 
     pub fn piece_count_all(&self) -> usize {
-        self.bitboards
-            .iter()
-            .flat_map(|b| b.iter())
-            .map(|bb| bb.count_ones() as usize)
-            .sum()
+        (self.white_occ | self.black_occ).count_ones() as usize
     }
 
     pub fn to_fen(&self, turn: Color) -> String {
@@ -984,6 +1014,31 @@ impl Board {
         self.hash = state.prev_hash;
     }
 
+    pub fn recompute_eval_state(&mut self) {
+        self.white_occ = 0;
+        self.black_occ = 0;
+        self.eval_mg = 0;
+        self.eval_eg = 0;
+        self.eval_phase = 0;
+
+        for y in 0..8 {
+            for x in 0..8 {
+                if let Some(piece) = self.squares[y][x] {
+                    let mask = sq_mask(x, y);
+                    let (mg, eg, phase) = crate::eval::piece_eval_delta(piece, y * 8 + x);
+                    self.eval_mg += mg;
+                    self.eval_eg += eg;
+                    self.eval_phase += phase;
+                    if piece.color == Color::White {
+                        self.white_occ |= mask;
+                    } else {
+                        self.black_occ |= mask;
+                    }
+                }
+            }
+        }
+    }
+
     #[inline(always)]
     fn pack_castling(&self) -> u8 {
         let mut c = 0u8;
@@ -1024,13 +1079,16 @@ impl Board {
 
     #[inline(always)]
     pub fn all_pieces(&self, color: Color) -> u64 {
-        let cidx = color_idx(color);
-        self.bitboards[cidx].iter().fold(0, |a, &b| a | b)
+        if color == Color::White {
+            self.white_occ
+        } else {
+            self.black_occ
+        }
     }
 
     #[inline(always)]
     pub fn occupied(&self) -> u64 {
-        self.all_pieces(Color::White) | self.all_pieces(Color::Black)
+        self.white_occ | self.black_occ
     }
 
     #[inline]
@@ -1063,59 +1121,15 @@ impl Board {
         let bishops_queens = self.bitboards[cidx][2] | self.bitboards[cidx][4];
         let rooks_queens = self.bitboards[cidx][3] | self.bitboards[cidx][4];
 
-        if self.diagonal_attacks(sq, occ) & bishops_queens != 0 {
+        if bishop_attacks(sq as usize, occ) & bishops_queens != 0 {
             return true;
         }
 
-        if self.straight_attacks(sq, occ) & rooks_queens != 0 {
+        if rook_attacks(sq as usize, occ) & rooks_queens != 0 {
             return true;
         }
 
         false
-    }
-
-    #[inline]
-    fn diagonal_attacks(&self, sq: u8, occ: u64) -> u64 {
-        let x = (sq % 8) as isize;
-        let y = (sq / 8) as isize;
-        let mut attacks = 0u64;
-
-        for (dx, dy) in [(1, 1), (1, -1), (-1, 1), (-1, -1)] {
-            let mut nx = x + dx;
-            let mut ny = y + dy;
-            while nx >= 0 && nx < 8 && ny >= 0 && ny < 8 {
-                let idx = (ny * 8 + nx) as usize;
-                attacks |= 1u64 << idx;
-                if (occ & (1u64 << idx)) != 0 {
-                    break;
-                }
-                nx += dx;
-                ny += dy;
-            }
-        }
-        attacks
-    }
-
-    #[inline]
-    fn straight_attacks(&self, sq: u8, occ: u64) -> u64 {
-        let x = (sq % 8) as isize;
-        let y = (sq / 8) as isize;
-        let mut attacks = 0u64;
-
-        for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-            let mut nx = x + dx;
-            let mut ny = y + dy;
-            while nx >= 0 && nx < 8 && ny >= 0 && ny < 8 {
-                let idx = (ny * 8 + nx) as usize;
-                attacks |= 1u64 << idx;
-                if (occ & (1u64 << idx)) != 0 {
-                    break;
-                }
-                nx += dx;
-                ny += dy;
-            }
-        }
-        attacks
     }
 
     #[inline]
@@ -1372,6 +1386,157 @@ mod tests {
     }
 
     #[test]
+    fn test_full_hash_distinguishes_castling_rights() {
+        let mut board = Board::new();
+        board.set(
+            "e1",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::White,
+            }),
+        );
+        board.set(
+            "h1",
+            Some(Piece {
+                piece_type: PieceType::Rook,
+                color: Color::White,
+            }),
+        );
+        board.set(
+            "e8",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::Black,
+            }),
+        );
+        board.castling = [[true, false], [false, false]];
+
+        let mut without_rights = board.clone();
+        without_rights.castling = [[false, false], [false, false]];
+
+        assert_ne!(board.hash(Color::White), without_rights.hash(Color::White));
+    }
+
+    #[test]
+    fn test_full_hash_ignores_non_capturable_en_passant() {
+        let mut board = Board::new();
+        board.set(
+            "e1",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::White,
+            }),
+        );
+        board.set(
+            "a8",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::Black,
+            }),
+        );
+        board.set(
+            "e4",
+            Some(Piece {
+                piece_type: PieceType::Pawn,
+                color: Color::White,
+            }),
+        );
+        board.castling = [[false, false], [false, false]];
+
+        let without_ep = board.hash(Color::Black);
+        board.en_passant = Some((4, 2)); // e3, but Black has no adjacent pawn to capture it
+
+        assert_eq!(board.hash(Color::Black), without_ep);
+    }
+
+    #[test]
+    fn test_full_hash_distinguishes_capturable_en_passant() {
+        let mut board = Board::new();
+        board.set(
+            "e1",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::White,
+            }),
+        );
+        board.set(
+            "a8",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::Black,
+            }),
+        );
+        board.set(
+            "e4",
+            Some(Piece {
+                piece_type: PieceType::Pawn,
+                color: Color::White,
+            }),
+        );
+        board.set(
+            "d4",
+            Some(Piece {
+                piece_type: PieceType::Pawn,
+                color: Color::Black,
+            }),
+        );
+        board.castling = [[false, false], [false, false]];
+
+        let without_ep = board.hash(Color::Black);
+        board.en_passant = Some((4, 2)); // e3, capturable by the black pawn on d4
+
+        assert_ne!(board.hash(Color::Black), without_ep);
+    }
+
+    #[test]
+    fn test_recompute_hash_preserves_full_position_hash() {
+        let mut board = Board::new();
+        board.set(
+            "e1",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::White,
+            }),
+        );
+        board.set(
+            "e8",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::Black,
+            }),
+        );
+        board.set(
+            "e4",
+            Some(Piece {
+                piece_type: PieceType::Pawn,
+                color: Color::White,
+            }),
+        );
+        board.set(
+            "d4",
+            Some(Piece {
+                piece_type: PieceType::Pawn,
+                color: Color::Black,
+            }),
+        );
+        board.set(
+            "h1",
+            Some(Piece {
+                piece_type: PieceType::Rook,
+                color: Color::White,
+            }),
+        );
+        board.castling = [[true, false], [false, false]];
+        board.en_passant = Some((4, 2)); // e3
+
+        let full_hash = board.hash(Color::Black);
+        board.hash = 0;
+        board.recompute_hash();
+
+        assert_eq!(board.hash(Color::Black), full_hash);
+    }
+
+    #[test]
     fn test_in_check_detection() {
         let mut board = Board::new();
 
@@ -1513,6 +1678,122 @@ mod tests {
         assert!(board.get("e2").is_some());
         assert!(board.get("e4").is_none());
         assert_eq!(board.hash, original_hash);
+    }
+
+    #[test]
+    fn test_full_hash_restored_after_fast_unmake() {
+        let mut board = setup_board();
+        let original_full_hash = board.hash(Color::White);
+
+        let mv = Move::new(12, 28, Move::FLAG_DOUBLE_PUSH); // e2=12, e4=28
+        let undo = board.make_move_fast(mv, Color::White);
+
+        board.unmake_move_fast(undo, Color::White);
+
+        assert_eq!(board.hash(Color::White), original_full_hash);
+    }
+
+    #[test]
+    fn test_eval_state_restored_after_fast_unmake() {
+        let mut board = Board::new();
+        board.set(
+            "e1",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::White,
+            }),
+        );
+        board.set(
+            "a1",
+            Some(Piece {
+                piece_type: PieceType::Rook,
+                color: Color::White,
+            }),
+        );
+        board.set(
+            "e8",
+            Some(Piece {
+                piece_type: PieceType::King,
+                color: Color::Black,
+            }),
+        );
+        board.set(
+            "a8",
+            Some(Piece {
+                piece_type: PieceType::Rook,
+                color: Color::Black,
+            }),
+        );
+
+        let original = (
+            board.white_occ,
+            board.black_occ,
+            board.eval_mg,
+            board.eval_eg,
+            board.eval_phase,
+        );
+        let mv = Move::capture(0, 56); // a1xa8
+        let undo = board.make_move_fast(mv, Color::White);
+
+        let mut recomputed = board.clone();
+        recomputed.recompute_eval_state();
+        assert_eq!(
+            (
+                board.white_occ,
+                board.black_occ,
+                board.eval_mg,
+                board.eval_eg,
+                board.eval_phase,
+            ),
+            (
+                recomputed.white_occ,
+                recomputed.black_occ,
+                recomputed.eval_mg,
+                recomputed.eval_eg,
+                recomputed.eval_phase
+            )
+        );
+        assert_ne!(
+            (
+                board.white_occ,
+                board.black_occ,
+                board.eval_mg,
+                board.eval_eg,
+                board.eval_phase,
+            ),
+            original
+        );
+
+        board.unmake_move_fast(undo, Color::White);
+        assert_eq!(
+            (
+                board.white_occ,
+                board.black_occ,
+                board.eval_mg,
+                board.eval_eg,
+                board.eval_phase,
+            ),
+            original
+        );
+
+        let mut restored = board.clone();
+        restored.recompute_eval_state();
+        assert_eq!(
+            (
+                board.white_occ,
+                board.black_occ,
+                board.eval_mg,
+                board.eval_eg,
+                board.eval_phase,
+            ),
+            (
+                restored.white_occ,
+                restored.black_occ,
+                restored.eval_mg,
+                restored.eval_eg,
+                restored.eval_phase,
+            )
+        );
     }
 
     #[test]

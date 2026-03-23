@@ -1,3 +1,4 @@
+use crate::attacks::{bishop_attacks, rook_attacks};
 use crate::board::{Board, color_idx, piece_index};
 use crate::pieces::{Color, PieceType};
 use crate::types::{Move, PieceValues};
@@ -13,82 +14,6 @@ fn opposite(color: Color) -> Color {
 #[inline(always)]
 fn sq_bb(sq: u8) -> u64 {
     1u64 << sq
-}
-
-fn rook_attacks(sq: u8, occ: u64) -> u64 {
-    let x = (sq % 8) as isize;
-    let y = (sq / 8) as isize;
-    let mut attacks = 0u64;
-
-    let mut ny = y + 1;
-    while ny < 8 {
-        let idx = (ny * 8 + x) as u8;
-        attacks |= sq_bb(idx);
-        if occ & sq_bb(idx) != 0 {
-            break;
-        }
-        ny += 1;
-    }
-
-    ny = y - 1;
-    while ny >= 0 {
-        let idx = (ny * 8 + x) as u8;
-        attacks |= sq_bb(idx);
-        if occ & sq_bb(idx) != 0 {
-            break;
-        }
-        if ny == 0 {
-            break;
-        }
-        ny -= 1;
-    }
-
-    let mut nx = x + 1;
-    while nx < 8 {
-        let idx = (y * 8 + nx) as u8;
-        attacks |= sq_bb(idx);
-        if occ & sq_bb(idx) != 0 {
-            break;
-        }
-        nx += 1;
-    }
-
-    nx = x - 1;
-    while nx >= 0 {
-        let idx = (y * 8 + nx) as u8;
-        attacks |= sq_bb(idx);
-        if occ & sq_bb(idx) != 0 {
-            break;
-        }
-        if nx == 0 {
-            break;
-        }
-        nx -= 1;
-    }
-
-    attacks
-}
-
-fn bishop_attacks(sq: u8, occ: u64) -> u64 {
-    let x = (sq % 8) as isize;
-    let y = (sq / 8) as isize;
-    let mut attacks = 0u64;
-
-    for (dx, dy) in [(1isize, 1isize), (1, -1), (-1, 1), (-1, -1)] {
-        let mut nx = x + dx;
-        let mut ny = y + dy;
-        while nx >= 0 && nx < 8 && ny >= 0 && ny < 8 {
-            let idx = (ny * 8 + nx) as u8;
-            attacks |= sq_bb(idx);
-            if occ & sq_bb(idx) != 0 {
-                break;
-            }
-            nx += dx;
-            ny += dy;
-        }
-    }
-
-    attacks
 }
 
 #[inline(always)]
@@ -142,8 +67,8 @@ fn attackers_to_square(pieces: &[[u64; 6]; 2], occ: u64, sq: u8, by_color: Color
     (pawn_attackers_to_square(sq, by_color) & pawns)
         | (crate::movegen::KNIGHT_TABLE[sq as usize] & knights)
         | (crate::movegen::KING_TABLE[sq as usize] & kings)
-        | (bishop_attacks(sq, occ) & (bishops | queens))
-        | (rook_attacks(sq, occ) & (rooks | queens))
+        | (bishop_attacks(sq as usize, occ) & (bishops | queens))
+        | (rook_attacks(sq as usize, occ) & (rooks | queens))
 }
 
 fn least_valuable_attacker(

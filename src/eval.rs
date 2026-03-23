@@ -1,10 +1,11 @@
-use crate::board::{Board, color_idx};
-use crate::eval_cache::EVAL_CACHE;
+use crate::attacks::{bishop_attacks, rook_attacks};
+use crate::board::{Board, color_idx, piece_index};
+use crate::eval_cache::{EVAL_CACHE, PAWN_CACHE, pawn_hash};
 use crate::movegen::{KING_TABLE, KNIGHT_TABLE};
-use crate::pieces::Color;
+use crate::pieces::{Color, Piece, PieceType};
 use crate::types::{Phase, Square};
 
-#[derive(Copy, Clone, Default, Eq, PartialEq)]
+#[derive(Copy, Clone, Default, Debug, Eq, PartialEq)]
 pub struct Score(i32);
 
 impl Score {
@@ -247,6 +248,30 @@ const OPPOSITE_BISHOPS_SCALE_DEN: i32 = 4;
 
 const TEMPO_BONUS: i32 = 15;
 
+#[inline(always)]
+pub(crate) fn piece_eval_delta(piece: Piece, sq: usize) -> (i32, i32, i32) {
+    let idx = piece_index(piece.piece_type);
+    let eval_sq = if piece.color == Color::White {
+        sq
+    } else {
+        Square::flip(sq as u8) as usize
+    };
+    let sign = if piece.color == Color::White { 1 } else { -1 };
+    let phase = match piece.piece_type {
+        PieceType::Knight => Phase::KNIGHT_PHASE,
+        PieceType::Bishop => Phase::BISHOP_PHASE,
+        PieceType::Rook => Phase::ROOK_PHASE,
+        PieceType::Queen => Phase::QUEEN_PHASE,
+        _ => 0,
+    };
+
+    (
+        sign * (MATERIAL_MG[idx] as i32 + PST_MG[idx][eval_sq] as i32),
+        sign * (MATERIAL_EG[idx] as i32 + PST_EG[idx][eval_sq] as i32),
+        phase,
+    )
+}
+
 #[allow(dead_code)]
 pub struct Evaluator<'a> {
     board: &'a Board,
@@ -258,10 +283,10 @@ pub struct Evaluator<'a> {
 
 impl<'a> Evaluator<'a> {
     pub fn new(board: &'a Board) -> Self {
-        let white_pieces: u64 = board.bitboards[0].iter().fold(0, |a, b| a | b);
-        let black_pieces: u64 = board.bitboards[1].iter().fold(0, |a, b| a | b);
+        let white_pieces = board.white_occ;
+        let black_pieces = board.black_occ;
 
-        let phase = Self::calculate_phase(board);
+        let phase = board.eval_phase.clamp(0, Phase::TOTAL_PHASE);
 
         Self {
             board,
@@ -301,48 +326,59 @@ impl<'a> Evaluator<'a> {
         self.scale_sparse_endgame(score.taper(self.phase))
     }
 
-    fn eval_material_and_pst(&self) -> Score {
-        let mut score = Score::ZERO;
-
-        for pt in 0..6 {
-            let mut bb = self.board.bitboards[0][pt];
-            while bb != 0 {
-                let sq = bb.trailing_zeros() as usize;
-                score += Score::new(
-                    MATERIAL_MG[pt] + PST_MG[pt][sq],
-                    MATERIAL_EG[pt] + PST_EG[pt][sq],
-                );
-                bb &= bb - 1;
-            }
-
-            let mut bb = self.board.bitboards[1][pt];
-            while bb != 0 {
-                let sq = bb.trailing_zeros() as usize;
-                let flipped = Square::flip(sq as u8) as usize;
-                score -= Score::new(
-                    MATERIAL_MG[pt] + PST_MG[pt][flipped],
-                    MATERIAL_EG[pt] + PST_EG[pt][flipped],
-                );
-                bb &= bb - 1;
-            }
+    pub fn evaluate_uncached(&self) -> i32 {
+        if is_drawn_endgame(self.board) {
+            return 0;
         }
 
-        score
+        let mut score = Score::ZERO;
+
+        score += self.eval_material_and_pst();
+        score += self.eval_pawn_structure_uncached();
+        score += self.eval_pieces();
+        score += self.eval_king_safety();
+
+        self.scale_sparse_endgame(score.taper(self.phase))
+    }
+
+    fn eval_material_and_pst(&self) -> Score {
+        Score::new(self.board.eval_mg as i16, self.board.eval_eg as i16)
     }
 
     fn eval_pawn_structure(&self) -> Score {
+        let key = pawn_hash(self.board);
+        let static_score =
+            Score(PAWN_CACHE.get_or_insert_with(key, || self.eval_pawn_structure_static().0));
+        static_score + self.eval_pawn_structure_dynamic()
+    }
+
+    fn eval_pawn_structure_uncached(&self) -> Score {
+        self.eval_pawn_structure_static() + self.eval_pawn_structure_dynamic()
+    }
+
+    fn eval_pawn_structure_static(&self) -> Score {
         let mut score = Score::ZERO;
         let white_pawns = self.board.bitboards[0][0];
         let black_pawns = self.board.bitboards[1][0];
 
-        score += self.eval_pawns_for_color(Color::White, white_pawns, black_pawns);
-
-        score -= self.eval_pawns_for_color(Color::Black, black_pawns, white_pawns);
+        score += self.eval_pawns_for_color_static(Color::White, white_pawns, black_pawns);
+        score -= self.eval_pawns_for_color_static(Color::Black, black_pawns, white_pawns);
 
         score
     }
 
-    fn eval_pawns_for_color(&self, color: Color, own_pawns: u64, enemy_pawns: u64) -> Score {
+    fn eval_pawn_structure_dynamic(&self) -> Score {
+        let mut score = Score::ZERO;
+        let white_pawns = self.board.bitboards[0][0];
+        let black_pawns = self.board.bitboards[1][0];
+
+        score += self.eval_pawns_for_color_dynamic(Color::White, white_pawns, black_pawns);
+        score -= self.eval_pawns_for_color_dynamic(Color::Black, black_pawns, white_pawns);
+
+        score
+    }
+
+    fn eval_pawns_for_color_static(&self, color: Color, own_pawns: u64, enemy_pawns: u64) -> Score {
         let mut score = Score::ZERO;
         let mut pawns = own_pawns;
         let own_pawn_attacks = Self::pawn_attack_map(color, own_pawns);
@@ -386,6 +422,38 @@ impl<'a> Evaluator<'a> {
                     );
                 }
 
+                // Occupancy-dependent passed-pawn bonuses are evaluated separately.
+            }
+
+            if self.is_backward_pawn(sq, color, own_pawns, enemy_pawns) {
+                score -= BACKWARD_PAWN_PENALTY;
+            }
+
+            pawns &= pawns - 1;
+        }
+
+        score
+    }
+
+    fn eval_pawns_for_color_dynamic(
+        &self,
+        color: Color,
+        own_pawns: u64,
+        enemy_pawns: u64,
+    ) -> Score {
+        let mut score = Score::ZERO;
+        let mut pawns = own_pawns;
+
+        while pawns != 0 {
+            let sq = pawns.trailing_zeros() as u8;
+
+            if self.is_passed_pawn(sq, color, enemy_pawns) {
+                let rank = if color == Color::White {
+                    Square::rank(sq) as usize
+                } else {
+                    7 - Square::rank(sq) as usize
+                };
+
                 if let Some(stop_sq) = Self::advance_square(sq, color) {
                     if (self.occupied & (1u64 << stop_sq)) != 0 {
                         score -= Score::new(
@@ -396,10 +464,6 @@ impl<'a> Evaluator<'a> {
                 }
 
                 score += self.eval_passed_pawn_rook_support(color, sq);
-            }
-
-            if self.is_backward_pawn(sq, color, own_pawns, enemy_pawns) {
-                score -= BACKWARD_PAWN_PENALTY;
             }
 
             pawns &= pawns - 1;
@@ -722,41 +786,14 @@ impl<'a> Evaluator<'a> {
     fn attacks_for_piece(&self, pt: usize, sq: u8) -> u64 {
         match pt {
             1 => KNIGHT_TABLE[sq as usize],
-            2 => self.bishop_attacks(sq),
-            3 => self.rook_attacks(sq),
-            4 => self.bishop_attacks(sq) | self.rook_attacks(sq),
+            2 => bishop_attacks(sq as usize, self.occupied),
+            3 => rook_attacks(sq as usize, self.occupied),
+            4 => {
+                bishop_attacks(sq as usize, self.occupied)
+                    | rook_attacks(sq as usize, self.occupied)
+            }
             _ => 0,
         }
-    }
-
-    fn bishop_attacks(&self, sq: u8) -> u64 {
-        self.ray_attacks(sq, &[(1, 1), (1, -1), (-1, 1), (-1, -1)])
-    }
-
-    fn rook_attacks(&self, sq: u8) -> u64 {
-        self.ray_attacks(sq, &[(1, 0), (-1, 0), (0, 1), (0, -1)])
-    }
-
-    fn ray_attacks(&self, sq: u8, directions: &[(i8, i8)]) -> u64 {
-        let x = (sq % 8) as i8;
-        let y = (sq / 8) as i8;
-        let mut attacks = 0u64;
-
-        for &(dx, dy) in directions {
-            let mut nx = x + dx;
-            let mut ny = y + dy;
-            while (0..8).contains(&nx) && (0..8).contains(&ny) {
-                let idx = (ny as u8 * 8 + nx as u8) as usize;
-                attacks |= 1u64 << idx;
-                if (self.occupied & (1u64 << idx)) != 0 {
-                    break;
-                }
-                nx += dx;
-                ny += dy;
-            }
-        }
-
-        attacks
     }
 
     fn eval_passed_pawn_rook_support(&self, color: Color, pawn_sq: u8) -> Score {
@@ -929,7 +966,7 @@ impl<'a> Evaluator<'a> {
 #[inline]
 pub(crate) fn evaluate_uncached(board: &Board) -> i32 {
     let evaluator = Evaluator::new(board);
-    evaluator.evaluate()
+    evaluator.evaluate_uncached()
 }
 
 #[inline]
@@ -953,8 +990,8 @@ pub fn game_phase(board: &Board) -> i32 {
 }
 
 pub fn is_drawn_endgame(board: &Board) -> bool {
-    let white_pieces: u64 = board.bitboards[0].iter().fold(0, |a, b| a | b);
-    let black_pieces: u64 = board.bitboards[1].iter().fold(0, |a, b| a | b);
+    let white_pieces = board.white_occ;
+    let black_pieces = board.black_occ;
     let total = (white_pieces | black_pieces).count_ones();
 
     if total <= 2 {
@@ -1256,12 +1293,12 @@ mod tests {
             }),
         );
 
-        let protected_eval = Evaluator::new(&protected).eval_pawns_for_color(
+        let protected_eval = Evaluator::new(&protected).eval_pawns_for_color_static(
             Color::White,
             protected.bitboards[0][0],
             protected.bitboards[1][0],
         );
-        let unprotected_eval = Evaluator::new(&unprotected).eval_pawns_for_color(
+        let unprotected_eval = Evaluator::new(&unprotected).eval_pawns_for_color_static(
             Color::White,
             unprotected.bitboards[0][0],
             unprotected.bitboards[1][0],
@@ -1393,12 +1430,12 @@ mod tests {
             }),
         );
 
-        let behind_eval = Evaluator::new(&rook_behind).eval_pawns_for_color(
+        let behind_eval = Evaluator::new(&rook_behind).eval_pawns_for_color_dynamic(
             Color::White,
             rook_behind.bitboards[0][0],
             rook_behind.bitboards[1][0],
         );
-        let sideways_eval = Evaluator::new(&rook_sideways).eval_pawns_for_color(
+        let sideways_eval = Evaluator::new(&rook_sideways).eval_pawns_for_color_dynamic(
             Color::White,
             rook_sideways.bitboards[0][0],
             rook_sideways.bitboards[1][0],
@@ -1483,5 +1520,36 @@ mod tests {
         let uncached_restored = evaluate_uncached(&game.board) + TEMPO_BONUS;
         assert_eq!(cached_restored, uncached_restored);
         assert_eq!(cached_restored, cached_start);
+    }
+
+    #[test]
+    fn test_pawn_cache_matches_uncached_and_survives_unmake() {
+        let mut game = Game::new();
+        let start_hash = pawn_hash(&game.board);
+
+        let cached_start = Evaluator::new(&game.board).eval_pawn_structure();
+        let uncached_start = Evaluator::new(&game.board).eval_pawn_structure_uncached();
+        assert_eq!(cached_start, uncached_start);
+
+        let first = game.board.make_move_state("e2", "e4").unwrap();
+        let second = game.board.make_move_state("e7", "e5").unwrap();
+        let third = game.board.make_move_state("g1", "f3").unwrap();
+
+        let mid_hash = pawn_hash(&game.board);
+        let cached_mid = Evaluator::new(&game.board).eval_pawn_structure();
+        let uncached_mid = Evaluator::new(&game.board).eval_pawn_structure_uncached();
+        assert_eq!(cached_mid, uncached_mid);
+
+        game.board.unmake_move(third);
+        game.board.unmake_move(second);
+        game.board.unmake_move(first);
+
+        assert_eq!(pawn_hash(&game.board), start_hash);
+
+        let cached_restored = Evaluator::new(&game.board).eval_pawn_structure();
+        let uncached_restored = Evaluator::new(&game.board).eval_pawn_structure_uncached();
+        assert_eq!(cached_restored, uncached_restored);
+        assert_eq!(cached_restored, cached_start);
+        assert_ne!(mid_hash, start_hash);
     }
 }

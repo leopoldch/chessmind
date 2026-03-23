@@ -332,6 +332,7 @@ fn repetition_tracking_counts_repeat_positions() {
     let mut board = Board::new();
     put(&mut board, "e1", PieceType::King, Color::White);
     put(&mut board, "e8", PieceType::King, Color::Black);
+    board.castling = [[false, false], [false, false]];
     let mut game = game_from_board(board, Color::White);
     let initial = game.hash_history[0];
 

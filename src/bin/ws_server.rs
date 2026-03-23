@@ -21,11 +21,21 @@ fn is_coordinate(mv: &str) -> bool {
         && mv.as_bytes()[3].is_ascii_digit()
 }
 
+fn normalize_move(game: &mut Game, raw: &str) -> Option<(String, String)> {
+    let mv = raw.replace('+', "").replace('#', "");
+    if is_coordinate(&mv) {
+        Some((mv[0..2].to_string(), mv[2..].to_string()))
+    } else {
+        parse_san(game, &mv, game.current_turn)
+    }
+}
+
 #[derive(Deserialize)]
 struct MoveEntry {
     #[serde(rename = "move")]
     mov: String,
-    color: String,
+    #[serde(rename = "color")]
+    _color: String,
 }
 
 #[derive(Deserialize, Default, Clone, Debug)]
@@ -156,6 +166,7 @@ async fn handle_conn(stream: tokio::net::TcpStream, addr: std::net::SocketAddr) 
             if let Ok(data) = serde_json::from_str::<ClientMsg>(txt) {
                 match data {
                     ClientMsg::Color { color } => {
+                        engine.stop_ponder();
                         my_color = match color.as_str() {
                             "white" => Some(Color::White),
                             _ => Some(Color::Black),
@@ -173,7 +184,6 @@ async fn handle_conn(stream: tokio::net::TcpStream, addr: std::net::SocketAddr) 
 
                         if my_color == Some(Color::White) && game.current_turn == Color::White {
                             let time_config = current_time_control.to_time_config();
-                            let time_config = current_time_control.to_time_config();
                             if let Some(((s, e), depth)) =
                                 engine.best_move_timed(&mut game, &time_config)
                             {
@@ -181,6 +191,9 @@ async fn handle_conn(stream: tokio::net::TcpStream, addr: std::net::SocketAddr) 
                                 game.make_move(&s, &e);
                                 last_len = 1;
                                 let _ = write.send(Message::Text(format!("{}{}", s, e))).await;
+                                if let Some((ps, pe)) = engine.start_ponder(&game) {
+                                    println!("Started ponder on {}{}", ps, pe);
+                                }
                             }
                         }
                         continue;
@@ -191,16 +204,13 @@ async fn handle_conn(stream: tokio::net::TcpStream, addr: std::net::SocketAddr) 
                             current_time_control = tc;
                         }
 
-                        let mov = mov.replace('+', "").replace('#', "");
-                        if is_coordinate(&mov) {
-                            game.make_move(&mov[0..2], &mov[2..4]);
-                            last_len += 1;
-                        } else {
-                            let color = game.current_turn;
-                            if let Some((s, e)) = parse_san(&mut game, &mov, color) {
-                                game.make_move(&s, &e);
-                                last_len += 1;
+                        if let Some((s, e)) = normalize_move(&mut game, &mov) {
+                            let ponder_hit = engine.ponder_hit(&game, &s, &e);
+                            if ponder_hit {
+                                println!("Ponder hit on {}{}", s, e);
                             }
+                            game.make_move(&s, &e);
+                            last_len += 1;
                         }
                     }
 
@@ -213,17 +223,10 @@ async fn handle_conn(stream: tokio::net::TcpStream, addr: std::net::SocketAddr) 
                             continue;
                         }
 
+                        engine.stop_ponder();
                         game = Game::new();
                         for entry in &moves {
-                            let mv = entry.mov.replace('+', "").replace('#', "");
-                            let color = if entry.color.to_lowercase().starts_with('w') {
-                                Color::White
-                            } else {
-                                Color::Black
-                            };
-                            if is_coordinate(&mv) {
-                                game.make_move(&mv[0..2], &mv[2..4]);
-                            } else if let Some((s, e)) = parse_san(&mut game, &mv, color) {
+                            if let Some((s, e)) = normalize_move(&mut game, &entry.mov) {
                                 game.make_move(&s, &e);
                             }
                         }
@@ -253,6 +256,9 @@ async fn handle_conn(stream: tokio::net::TcpStream, addr: std::net::SocketAddr) 
                             })
                             .to_string();
                             let _ = write.send(Message::Text(msg)).await;
+                            if let Some((ps, pe)) = engine.start_ponder(&game) {
+                                println!("Started ponder on {}{}", ps, pe);
+                            }
                         }
                         continue;
                     }
@@ -265,11 +271,13 @@ async fn handle_conn(stream: tokio::net::TcpStream, addr: std::net::SocketAddr) 
 
                     ClientMsg::Stop => {
                         engine.stop();
+                        engine.stop_ponder();
                         println!("Search stopped");
                         continue;
                     }
 
                     ClientMsg::NewGame => {
+                        engine.stop_ponder();
                         game = Game::new();
                         last_len = 0;
                         current_time_control = TimeControl::default();
@@ -278,14 +286,21 @@ async fn handle_conn(stream: tokio::net::TcpStream, addr: std::net::SocketAddr) 
                     }
                 }
             } else if is_coordinate(txt) {
-                game.make_move(&txt[0..2], &txt[2..4]);
-                last_len += 1;
-            } else {
-                let color = game.current_turn;
-                if let Some((s, e)) = parse_san(&mut game, txt, color) {
+                if let Some((s, e)) = normalize_move(&mut game, txt) {
+                    let ponder_hit = engine.ponder_hit(&game, &s, &e);
+                    if ponder_hit {
+                        println!("Ponder hit on {}{}", s, e);
+                    }
                     game.make_move(&s, &e);
                     last_len += 1;
                 }
+            } else if let Some((s, e)) = normalize_move(&mut game, txt) {
+                let ponder_hit = engine.ponder_hit(&game, &s, &e);
+                if ponder_hit {
+                    println!("Ponder hit on {}{}", s, e);
+                }
+                game.make_move(&s, &e);
+                last_len += 1;
             }
 
             if let Some(color) = my_color {
@@ -331,6 +346,9 @@ async fn handle_conn(stream: tokio::net::TcpStream, addr: std::net::SocketAddr) 
                     })
                     .to_string();
                     let _ = write.send(Message::Text(msg)).await;
+                    if let Some((ps, pe)) = engine.start_ponder(&game) {
+                        println!("Started ponder on {}{}", ps, pe);
+                    }
                 }
             }
         }
