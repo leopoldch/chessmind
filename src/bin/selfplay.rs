@@ -8,9 +8,9 @@
 //! (legality, mate, stalemate, threefold repetition, 50-move rule,
 //! insufficient material, ply cap) and its own clocks.
 //!
-//! Statistics: pentanomial score, logistic Elo +/- 95%, normalized Elo and a
-//! pentanomial GSPRT log-likelihood ratio (see `Penta::llr`), plus the old
-//! trinomial W/D/L summary for reference.
+//! Statistics: pentanomial score, logistic Elo +/- 95%, normalized Elo and the
+//! exact fishtest pentanomial GSPRT log-likelihood ratio (see `gsprt_llr`),
+//! plus the old trinomial W/D/L summary for reference.
 //!
 //! Usage:
 //!   selfplay --engine1 PATH --engine2 PATH [--games N | --pairs N]
@@ -18,6 +18,7 @@
 //!            [--openings FILE] [--openings-order random|sequential] [--seed N]
 //!            [--concurrency K] [--threads T] [--hash MB] [--no-book] [--pgn FILE]
 //!            [--sprt] [--elo0 0] [--elo1 5] [--alpha 0.05] [--beta 0.05] [--sprt-min-pairs 20]
+//!            [--sprt-model normalized|logistic]
 //!            [--quiet] [--status-interval SECS]
 //!            [--max-plies 400] [--timemargin MS] [--name1 NAME] [--name2 NAME]
 //!
@@ -115,6 +116,7 @@ struct Config {
     alpha: f64,
     beta: f64,
     sprt_min_pairs: u32,
+    sprt_model: SprtModel,
     max_plies: usize,
     time_margin_ms: u64,
     openings: Option<String>,
@@ -131,6 +133,7 @@ fn usage() -> ! {
          [--openings FILE] [--openings-order random|sequential] [--seed N]
          [--concurrency K] [--threads T] [--hash MB] [--no-book] [--pgn FILE]
          [--sprt] [--elo0 E] [--elo1 E] [--alpha A] [--beta B] [--sprt-min-pairs N]
+         [--sprt-model normalized|logistic]
          [--quiet] [--status-interval SECS]
          [--max-plies N] [--timemargin MS] [--name1 NAME] [--name2 NAME]
   SPEC = BASE_MS+INC_MS | movetime=MS | depth=N  (--tc1/--tc2 give time odds)"
@@ -168,6 +171,7 @@ fn parse_args() -> Config {
         alpha: 0.05,
         beta: 0.05,
         sprt_min_pairs: 20,
+        sprt_model: SprtModel::Normalized,
         max_plies: 400,
         time_margin_ms: 100,
         openings: None,
@@ -226,6 +230,16 @@ fn parse_args() -> Config {
             "--alpha" => cfg.alpha = num(&value(i)),
             "--beta" => cfg.beta = num(&value(i)),
             "--sprt-min-pairs" => cfg.sprt_min_pairs = num(&value(i)),
+            "--sprt-model" => {
+                cfg.sprt_model = match value(i).as_str() {
+                    "logistic" => SprtModel::Logistic,
+                    "normalized" => SprtModel::Normalized,
+                    other => {
+                        eprintln!("invalid --sprt-model '{other}'");
+                        usage()
+                    }
+                }
+            }
             "--max-plies" => cfg.max_plies = num(&value(i)),
             "--timemargin" => cfg.time_margin_ms = num(&value(i)),
             "--openings" => cfg.openings = Some(value(i)),
@@ -846,9 +860,12 @@ fn play_game(
                 } else {
                     (&mut btime, binc)
                 };
+                // Charge the full elapsed time and never refill an overdraft:
+                // `margin` is one fixed allowance for process/IPC latency over
+                // the whole game, not a per-move tolerance.
                 *clock -= elapsed;
                 let flagged = *clock < -margin;
-                *clock = (*clock).max(0) + inc;
+                *clock += inc;
                 flagged
             }
             TimeControl::MoveTime(ms) => elapsed > ms as i64 + margin,
@@ -929,19 +946,151 @@ fn mean_var(dist: &[(f64, f64)]) -> (f64, f64, f64) {
     (n, mean, var)
 }
 
-/// Generalized SPRT (normal approximation) for logistic Elo bounds:
-///   LLR = N * (s1 - s0) * (2*mean - s0 - s1) / (2 * var)
-/// where N is the number of samples (pairs or games), mean/var the sample
-/// mean/variance of the per-sample score, s0/s1 the expected scores at
-/// elo0/elo1. This is the log of the ratio of two normal likelihoods with
-/// the sample variance, i.e. N*((mean-s0)^2 - (mean-s1)^2) / (2*var).
-fn gsprt_llr(n: f64, mean: f64, var: f64, elo0: f64, elo1: f64) -> f64 {
-    if n <= 0.0 || var <= 0.0 {
+/// Elo model of the SPRT bounds `--elo0/--elo1`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SprtModel {
+    /// Logistic Elo: the hypotheses fix the expected score.
+    Logistic,
+    /// Normalized Elo (modern fishtest default): the hypotheses fix the
+    /// t-value (score - 0.5) / sigma, so bounds are independent of the draw
+    /// rate and of the opening book.
+    Normalized,
+}
+
+impl SprtModel {
+    fn name(self) -> &'static str {
+        match self {
+            SprtModel::Logistic => "logistic",
+            SprtModel::Normalized => "normalized",
+        }
+    }
+}
+
+/// fishtest regularization: empty cells get a tiny count so the MLE exists.
+const REG_EPS: f64 = 1e-3;
+
+/// Solves the secular equation `sum_i p_i a_i / (1 + x a_i) = 0` for x in
+/// `(-1/max a, -1/min a)` (fishtest `LLRcalc.secular`). The left-hand side is
+/// strictly decreasing there, from +inf to -inf, so bisection is exact to
+/// machine precision. `None` if the support does not straddle zero.
+fn secular(pdf: &[(f64, f64)]) -> Option<f64> {
+    let v = pdf.iter().map(|&(a, _)| a).fold(f64::INFINITY, f64::min);
+    let w = pdf
+        .iter()
+        .map(|&(a, _)| a)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if v * w >= 0.0 || !v.is_finite() || !w.is_finite() {
+        return None;
+    }
+    let f = |x: f64| pdf.iter().map(|&(a, p)| p * a / (1.0 + x * a)).sum::<f64>();
+    let (mut lo, mut hi) = (-1.0 / w + 1e-9, -1.0 / v - 1e-9);
+    for _ in 0..200 {
+        let mid = 0.5 * (lo + hi);
+        if mid <= lo || mid >= hi {
+            break;
+        }
+        if f(mid) > 0.0 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Some(0.5 * (lo + hi))
+}
+
+/// Maximum-likelihood distribution on the support of `pdf` (value, prob)
+/// whose expectation is `s` (fishtest `MLE_expected`). Returns probabilities.
+fn mle_expected(pdf: &[(f64, f64)], s: f64) -> Option<Vec<f64>> {
+    let shifted: Vec<(f64, f64)> = pdf.iter().map(|&(a, p)| (a - s, p)).collect();
+    let x = secular(&shifted)?;
+    Some(shifted.iter().map(|&(b, p)| p / (1.0 + x * b)).collect())
+}
+
+/// Maximum-likelihood distribution on the support of `pdf` whose t-value
+/// `(mu - reference) / sigma` equals `t` (fishtest `MLE_t_value`, fixed-point
+/// iteration on the linearized constraint).
+fn mle_t_value(pdf: &[(f64, f64)], reference: f64, t: f64) -> Option<Vec<f64>> {
+    let n = pdf.len();
+    let mut probs = vec![1.0 / n as f64; n];
+    for _ in 0..100 {
+        // `mean_var` takes (weight, value) pairs.
+        let current: Vec<(f64, f64)> = pdf.iter().zip(&probs).map(|(&(a, _), &p)| (p, a)).collect();
+        let (_, mu, var) = mean_var(&current);
+        let sigma = var.sqrt();
+        let constraint: Vec<(f64, f64)> = pdf
+            .iter()
+            .map(|&(a, p)| {
+                let z = (mu - a) / sigma;
+                (a - reference - t * sigma * (1.0 + z * z) / 2.0, p)
+            })
+            .collect();
+        let x = secular(&constraint)?;
+        let next: Vec<f64> = constraint.iter().map(|&(b, p)| p / (1.0 + x * b)).collect();
+        let delta = next
+            .iter()
+            .zip(&probs)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
+        probs = next;
+        if delta < 1e-12 {
+            break;
+        }
+    }
+    Some(probs)
+}
+
+/// Exact generalized SPRT log-likelihood ratio, as fishtest computes it
+/// (`LLRcalc.LLR_logistic` / `LLR_normalized`):
+///
+///   LLR = sum_k n_k * ln(p1_k / p0_k)
+///
+/// where `counts` is a trinomial [L, D, W] or pentanomial [LL, LD, DD+WL,
+/// WD, WW] tally (cell k has score k / (len - 1)), empty cells are
+/// regularized to 1e-3, and p0 / p1 are the maximum-likelihood distributions
+/// constrained to hypothesis H0 / H1:
+/// * logistic: expected score `s_i = 1 / (1 + 10^(-elo_i / 400))`;
+/// * normalized: t-value `(mu - 0.5) / sigma = nelo_i / (800 / ln 10)` per
+///   game, times sqrt(2) per pair.
+///
+/// Unlike the Gaussian approximation `N (s1-s0)(2 mean-s0-s1) / (2 var)` this
+/// does not blow up when the sample variance is tiny (e.g. all draws) or when
+/// the score is far from the hypotheses. NaN if the MLE does not exist.
+fn gsprt_llr(counts: &[u32], elo0: f64, elo1: f64, model: SprtModel) -> f64 {
+    let total: u32 = counts.iter().sum();
+    if total == 0 {
         return 0.0;
     }
-    let s0 = score_from_elo(elo0);
-    let s1 = score_from_elo(elo1);
-    (s1 - s0) * (2.0 * mean - s0 - s1) * n / (2.0 * var)
+    let len = counts.len();
+    let reg: Vec<f64> = counts
+        .iter()
+        .map(|&c| if c == 0 { REG_EPS } else { c as f64 })
+        .collect();
+    let n: f64 = reg.iter().sum();
+    let pdf: Vec<(f64, f64)> = reg
+        .iter()
+        .enumerate()
+        .map(|(k, &c)| (k as f64 / (len - 1) as f64, c / n))
+        .collect();
+    let mle = |e: f64| match model {
+        SprtModel::Logistic => mle_expected(&pdf, score_from_elo(e)),
+        SprtModel::Normalized => {
+            let per_game_t = e / NELO_SCALE;
+            let t = if len == 5 {
+                per_game_t * std::f64::consts::SQRT_2
+            } else {
+                per_game_t
+            };
+            mle_t_value(&pdf, 0.5, t)
+        }
+    };
+    match (mle(elo0), mle(elo1)) {
+        (Some(p0), Some(p1)) => reg
+            .iter()
+            .zip(p0.iter().zip(&p1))
+            .map(|(&c, (&q0, &q1))| c * (q1 / q0).ln())
+            .sum(),
+        _ => f64::NAN,
+    }
 }
 
 /// Trinomial W/D/L tally for engine1 (games treated as independent).
@@ -986,9 +1135,9 @@ impl Tally {
         let hi = elo_from_score(s + Z95 * se);
         (elo_from_score(s), (hi - lo) / 2.0)
     }
-    fn llr(&self, elo0: f64, elo1: f64) -> f64 {
-        let (n, s, var) = mean_var(&self.dist());
-        gsprt_llr(n, s, var, elo0, elo1)
+    /// Exact GSPRT LLR on the [L, D, W] counts (see `gsprt_llr`).
+    fn llr(&self, elo0: f64, elo1: f64, model: SprtModel) -> f64 {
+        gsprt_llr(&[self.losses, self.draws, self.wins], elo0, elo1, model)
     }
     /// Likelihood of superiority (draws ignored).
     fn los(&self) -> f64 {
@@ -1032,22 +1181,16 @@ impl Penta {
     fn n(&self) -> u32 {
         self.counts.iter().sum()
     }
-    fn dist(&self, regularize: bool) -> [(f64, f64); 5] {
+    fn dist(&self) -> [(f64, f64); 5] {
         let mut d = [(0.0, 0.0); 5];
         for k in 0..5 {
-            let c = self.counts[k] as f64;
-            // fishtest-style regularization: empty cells get a tiny count so
-            // the variance is never degenerate early in a test.
-            d[k] = (
-                if regularize && c == 0.0 { 1e-3 } else { c },
-                PAIR_SCORES[k],
-            );
+            d[k] = (self.counts[k] as f64, PAIR_SCORES[k]);
         }
         d
     }
     /// (pairs, mean pair score, per-pair variance)
     fn stats(&self) -> (f64, f64, f64) {
-        mean_var(&self.dist(false))
+        mean_var(&self.dist())
     }
     fn score(&self) -> f64 {
         self.stats().1
@@ -1081,14 +1224,10 @@ impl Penta {
         }
         normal_cdf((s - 0.5) / (var / n).sqrt())
     }
-    /// Pentanomial GSPRT LLR for logistic Elo bounds (see `gsprt_llr`), with
-    /// N = number of pairs and the (regularized) per-pair variance.
-    fn llr(&self, elo0: f64, elo1: f64) -> f64 {
-        if self.n() == 0 {
-            return 0.0;
-        }
-        let (_, mean, var) = mean_var(&self.dist(true));
-        gsprt_llr(self.n() as f64, mean, var, elo0, elo1)
+    /// Exact pentanomial GSPRT LLR (fishtest; see `gsprt_llr`), one sample
+    /// per game pair.
+    fn llr(&self, elo0: f64, elo1: f64, model: SprtModel) -> f64 {
+        gsprt_llr(&self.counts, elo0, elo1, model)
     }
     fn compact(&self) -> String {
         let c = self.counts;
@@ -1282,7 +1421,8 @@ impl Report<'_> {
             elo,
             err,
             self.penta.nelo().0,
-            self.penta.llr(self.cfg.elo0, self.cfg.elo1),
+            self.penta
+                .llr(self.cfg.elo0, self.cfg.elo1, self.cfg.sprt_model),
             self.bounds.0,
             self.bounds.1,
             games * 60.0 / elapsed.max(1e-3),
@@ -1344,8 +1484,13 @@ fn main() {
     );
     if cfg.sprt {
         println!(
-            "SPRT: pentanomial GSPRT, logistic Elo, elo0={} elo1={} alpha={} beta={} (no verdict before {} pairs)",
-            cfg.elo0, cfg.elo1, cfg.alpha, cfg.beta, cfg.sprt_min_pairs
+            "SPRT: exact pentanomial GSPRT, {} Elo, elo0={} elo1={} alpha={} beta={} (no verdict before {} pairs)",
+            cfg.sprt_model.name(),
+            cfg.elo0,
+            cfg.elo1,
+            cfg.alpha,
+            cfg.beta,
+            cfg.sprt_min_pairs
         );
     }
 
@@ -1397,6 +1542,8 @@ fn main() {
     let mut white_score = 0.0f64;
     let mut reasons: Vec<(String, u32)> = Vec::new();
     let mut illegal = 0u32;
+    // Time forfeits suffered by (engine1, engine2).
+    let mut time_losses = (0u32, 0u32);
     let mut done = 0usize;
     let mut sprt_verdict: Option<&str> = None;
     let mut half_pairs: HashMap<usize, f64> = HashMap::new();
@@ -1413,6 +1560,13 @@ fn main() {
         };
         if rec.reason.contains("illegal move") {
             illegal += 1;
+        }
+        if rec.reason.contains("loses on time") {
+            if points == 0.0 {
+                time_losses.0 += 1;
+            } else {
+                time_losses.1 += 1;
+            }
         }
         // Group reasons without the per-move detail (e.g. times in ms).
         let key = rec
@@ -1461,7 +1615,7 @@ fn main() {
                 report.penta.compact(),
                 elo,
                 err,
-                report.penta.llr(cfg.elo0, cfg.elo1),
+                report.penta.llr(cfg.elo0, cfg.elo1, cfg.sprt_model),
             );
         } else if pair_done && last_status.elapsed().as_secs_f64() >= cfg.status_interval {
             last_status = Instant::now();
@@ -1471,12 +1625,12 @@ fn main() {
             let _ = f.write_all(pgn_text(&rec, &cfg, &openings).as_bytes());
             let _ = f.flush();
         }
-        // The variance estimate is meaningless with a handful of pairs (one WW
-        // pair has ~zero variance and a huge LLR), so no verdict before
-        // --sprt-min-pairs complete pairs.
+        // With a handful of pairs the 1e-3 regularization prior still weighs on
+        // the MLE, so as a safety net no verdict before --sprt-min-pairs
+        // complete pairs.
         if cfg.sprt && pair_done && sprt_verdict.is_none() && report.penta.n() >= cfg.sprt_min_pairs
         {
-            let llr = report.penta.llr(cfg.elo0, cfg.elo1);
+            let llr = report.penta.llr(cfg.elo0, cfg.elo1, cfg.sprt_model);
             if llr >= upper {
                 sprt_verdict = Some("H1 accepted");
             } else if llr <= lower {
@@ -1521,12 +1675,13 @@ fn main() {
         100.0 * penta.los()
     );
     println!(
-        "SPRT (pentanomial GSPRT, logistic) elo0={} elo1={} alpha={} beta={}: LLR {:.2} [{:.2}, {:.2}]{}",
+        "SPRT (exact pentanomial GSPRT, {} Elo) elo0={} elo1={} alpha={} beta={}: LLR {:.2} [{:.2}, {:.2}]{}",
+        cfg.sprt_model.name(),
         cfg.elo0,
         cfg.elo1,
         cfg.alpha,
         cfg.beta,
-        penta.llr(cfg.elo0, cfg.elo1),
+        penta.llr(cfg.elo0, cfg.elo1, cfg.sprt_model),
         lower,
         upper,
         match sprt_verdict {
@@ -1543,12 +1698,16 @@ fn main() {
         tally.losses,
         100.0 * tally.score(),
         100.0 * tally.los(),
-        tally.llr(cfg.elo0, cfg.elo1),
+        tally.llr(cfg.elo0, cfg.elo1, cfg.sprt_model),
     );
     println!(
-        "Draw ratio: {:.1}%   White score: {:.1}%   Illegal moves: {illegal}",
+        "Draw ratio: {:.1}%   White score: {:.1}%   Illegal moves: {illegal}   Time forfeits: {} {} / {} {}",
         100.0 * tally.draws as f64 / n.max(1.0),
-        100.0 * white_score / n.max(1.0)
+        100.0 * white_score / n.max(1.0),
+        cfg.name1,
+        time_losses.0,
+        cfg.name2,
+        time_losses.1,
     );
     println!("Terminations:");
     for (reason, count) in &reasons {
@@ -1606,37 +1765,177 @@ mod tests {
         // score 0.5 +/- 1.96*sqrt(var/9) = 0.5 +/- 0.18861 -> +/- 137.9 Elo.
         assert!(close(err, 137.9, 0.2), "err {err}");
         // Symmetric hypotheses around 0: LLR is exactly 0.
-        assert!(close(p.llr(-5.0, 5.0), 0.0, 1e-12));
+        for model in [SprtModel::Logistic, SprtModel::Normalized] {
+            assert!(close(p.llr(-5.0, 5.0, model), 0.0, 1e-9));
+        }
         assert!(close(p.los(), 0.5, 1e-9));
     }
 
-    #[test]
-    fn llr_matches_reference_values() {
-        // mean 0.7, var 0.0475 over 100 pairs.
-        let p = penta([0, 10, 20, 50, 20]);
-        let (_, mean, var) = p.stats();
-        assert!(close(mean, 0.7, 1e-12));
-        assert!(close(var, 0.0475, 1e-12));
-        let s1 = score_from_elo(5.0);
-        let expected = (s1 - 0.5) * (1.4 - 0.5 - s1) * 100.0 / (2.0 * 0.0475);
-        // Regularization (1e-3 in the empty LL cell) barely moves it.
-        assert!(close(p.llr(0.0, 5.0), expected, 0.01 * expected.abs()));
-        assert!(p.llr(0.0, 5.0) > 2.94, "clear gain crosses the H1 bound");
-        // Elo of a 70% pair score.
-        assert!(close(p.elo().0, 147.2, 0.1));
-        // Mirror image: strongly negative.
-        let q = penta([20, 50, 20, 10, 0]);
-        assert!(q.llr(0.0, 5.0) < -2.94);
-        assert!(close(q.elo().0, -147.2, 0.1));
+    use SprtModel::{Logistic, Normalized};
+
+    /// The old Gaussian approximation (fishtest `LLR_alt2`, times N), kept
+    /// here only to compare against the exact GSPRT.
+    fn approx_llr(p: &Penta, elo0: f64, elo1: f64) -> f64 {
+        let mut d = p.dist();
+        for c in d.iter_mut() {
+            if c.0 == 0.0 {
+                c.0 = REG_EPS;
+            }
+        }
+        let (n, mean, var) = mean_var(&d);
+        let (s0, s1) = (score_from_elo(elo0), score_from_elo(elo1));
+        n * (s1 - s0) * (2.0 * mean - s0 - s1) / (2.0 * var)
     }
 
     #[test]
-    fn llr_equals_normal_likelihood_ratio() {
-        let p = penta([3, 20, 45, 25, 7]);
-        let (n, mean, var) = mean_var(&p.dist(true));
-        let (s0, s1) = (score_from_elo(0.0), score_from_elo(10.0));
-        let direct = n * ((mean - s0).powi(2) - (mean - s1).powi(2)) / (2.0 * var);
-        assert!(close(p.llr(0.0, 10.0), direct, 1e-9));
+    fn llr_matches_fishtest_reference_values() {
+        // Produced by fishtest server/fishtest/stats/LLRcalc.py (LLR_logistic,
+        // LLR_normalized); the first two are its own self-test samples.
+        let cases: [([u32; 5], f64, f64, SprtModel, f64); 13] = [
+            (
+                [10789, 19328, 33806, 19402, 10543],
+                -3.0,
+                1.0,
+                Logistic,
+                2.1310678117855075,
+            ),
+            (
+                [10789, 19328, 33806, 19402, 10543],
+                -3.0,
+                1.0,
+                Normalized,
+                0.3008697855029647,
+            ),
+            (
+                [39, 2226, 31451, 2412, 40],
+                0.2,
+                0.9,
+                Logistic,
+                2.162542580049078,
+            ),
+            (
+                [39, 2226, 31451, 2412, 40],
+                0.764,
+                3.439,
+                Normalized,
+                2.1629408695841943,
+            ),
+            ([0, 10, 20, 50, 20], 0.0, 5.0, Logistic, 1.4286861064744187),
+            ([0, 10, 20, 50, 20], 0.0, 5.0, Normalized, 1.268896403977093),
+            ([3, 20, 45, 25, 7], 0.0, 10.0, Logistic, 0.6959726064980855),
+            (
+                [3, 20, 45, 25, 7],
+                0.0,
+                10.0,
+                Normalized,
+                0.4949702786678729,
+            ),
+            ([0, 0, 50, 0, 0], 0.0, 5.0, Logistic, -0.7176058361124835),
+            ([0, 0, 50, 0, 0], 0.0, 5.0, Normalized, -0.01756124857176134),
+            ([2, 5, 80, 8, 5], 0.0, 5.0, Logistic, 0.5384862572588683),
+            ([2, 5, 80, 8, 5], 0.0, 5.0, Normalized, 0.26570559377961006),
+            ([0, 0, 40, 10, 0], 0.0, 5.0, Normalized, 0.31255435949946725),
+        ];
+        for (counts, e0, e1, model, want) in cases {
+            let got = penta(counts).llr(e0, e1, model);
+            assert!(
+                close(got, want, 1e-6 * want.abs().max(1.0)),
+                "{counts:?} {e0}/{e1} {model:?}: got {got}, fishtest {want}"
+            );
+        }
+        // Trinomial [L, D, W].
+        let t = Tally {
+            losses: 65804,
+            draws: 56553,
+            wins: 65388,
+        };
+        assert!(close(t.llr(-3.0, 1.0, Logistic), 2.049042617996086, 1e-6));
+        assert!(close(
+            t.llr(-3.0, 1.0, Normalized),
+            0.49171177626817564,
+            1e-6
+        ));
+    }
+
+    #[test]
+    fn llr_sign_follows_the_result() {
+        let good = penta([0, 10, 20, 50, 20]);
+        let bad = penta([20, 50, 20, 10, 0]);
+        for model in [Logistic, Normalized] {
+            assert!(good.llr(0.0, 5.0, model) > 0.0);
+            assert!(bad.llr(0.0, 5.0, model) < 0.0);
+            // Mirror image of the counts <=> mirror image of the hypotheses.
+            assert!(close(
+                good.llr(0.0, 5.0, model),
+                -bad.llr(-5.0, 0.0, model),
+                1e-9
+            ));
+        }
+    }
+
+    #[test]
+    fn exact_matches_approximation_for_large_samples() {
+        // Realistic fishtest-like run: tens of thousands of pairs, score near
+        // the hypotheses, moderate variance.
+        let p = penta([1187, 7410, 13475, 7378, 1164]);
+        let exact = p.llr(-3.0, 1.0, Logistic);
+        let approx = approx_llr(&p, -3.0, 1.0);
+        assert!(
+            close(exact, approx, 0.02 * approx.abs()),
+            "exact {exact} approx {approx}"
+        );
+        let q = penta([10789, 19328, 33806, 19402, 10543]);
+        let (exact, approx) = (q.llr(-3.0, 1.0, Logistic), approx_llr(&q, -3.0, 1.0));
+        assert!(
+            close(exact, approx, 0.02 * approx.abs()),
+            "exact {exact} approx {approx}"
+        );
+    }
+
+    #[test]
+    fn exact_is_conservative_for_tiny_variance() {
+        // All draws: the regularized variance is ~1e-5 and the Gaussian
+        // approximation screams "H0" after 50 pairs; the exact LLR does not.
+        let dd = penta([0, 0, 50, 0, 0]);
+        let approx = approx_llr(&dd, 0.0, 5.0);
+        assert!(approx < -100.0, "approx {approx}");
+        for model in [Logistic, Normalized] {
+            let exact = dd.llr(0.0, 5.0, model);
+            assert!(
+                exact.is_finite() && (-2.94..0.0).contains(&exact),
+                "{model:?} {exact}"
+            );
+        }
+        // 20% WD pairs among the draws: the approximation accepts H1 at
+        // once, the exact test is still inconclusive.
+        let wd = penta([0, 0, 80, 20, 0]);
+        assert!(approx_llr(&wd, 0.0, 5.0) > 2.94);
+        for model in [Logistic, Normalized] {
+            let exact = wd.llr(0.0, 5.0, model);
+            assert!(exact > 0.0 && exact < 2.94, "{model:?} {exact}");
+        }
+        // Score far from the hypotheses: the approximation overstates the
+        // evidence (it assumes a normal likelihood with the sample variance).
+        let p = penta([0, 10, 20, 50, 20]);
+        assert!(p.llr(0.0, 5.0, Logistic) < approx_llr(&p, 0.0, 5.0));
+    }
+
+    #[test]
+    fn mle_satisfies_its_constraint() {
+        let pdf: Vec<(f64, f64)> = [3.0, 20.0, 45.0, 25.0, 7.0]
+            .iter()
+            .enumerate()
+            .map(|(k, &c)| (k as f64 / 4.0, c / 100.0))
+            .collect();
+        let with_probs = |probs: &[f64]| -> Vec<(f64, f64)> {
+            pdf.iter().zip(probs).map(|(&(a, _), &p)| (p, a)).collect()
+        };
+        let p = mle_expected(&pdf, 0.52).unwrap();
+        let (n, mean, _) = mean_var(&with_probs(&p));
+        assert!(close(n, 1.0, 1e-9) && close(mean, 0.52, 1e-9));
+        let p = mle_t_value(&pdf, 0.5, 0.1).unwrap();
+        let (n, mean, var) = mean_var(&with_probs(&p));
+        assert!(close(n, 1.0, 1e-9) && close((mean - 0.5) / var.sqrt(), 0.1, 1e-9));
     }
 
     #[test]
@@ -1666,13 +1965,23 @@ mod tests {
     fn empty_and_degenerate() {
         let p = Penta::default();
         assert_eq!(p.elo(), (0.0, 0.0));
-        assert_eq!(p.llr(0.0, 5.0), 0.0);
+        assert_eq!(p.llr(0.0, 5.0, Logistic), 0.0);
         // All draws: zero variance; regularized LLR is finite and negative
         // (a 50% score is evidence for elo0 = 0 against elo1 = 5).
         let d = penta([0, 0, 50, 0, 0]);
         assert_eq!(d.elo(), (0.0, 0.0));
-        let llr = d.llr(0.0, 5.0);
-        assert!(llr.is_finite() && llr < 0.0);
+        for model in [Logistic, Normalized] {
+            let llr = d.llr(0.0, 5.0, model);
+            assert!(llr.is_finite() && llr < 0.0);
+        }
+        // A single pair of any kind: finite.
+        for k in 0..5 {
+            let mut c = [0; 5];
+            c[k] = 1;
+            for model in [Logistic, Normalized] {
+                assert!(penta(c).llr(0.0, 5.0, model).is_finite(), "{c:?} {model:?}");
+            }
+        }
     }
 
     #[test]
