@@ -3,6 +3,7 @@ pub mod board;
 pub mod engine;
 pub mod eval;
 pub mod eval_cache;
+pub mod fen;
 pub mod game;
 pub mod movegen;
 pub mod opening;

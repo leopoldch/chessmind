@@ -301,7 +301,7 @@ fn transposition_table_round_trip_is_consistent() {
         depth: 6,
         value: 1234,
         bound: Bound::Exact,
-        best: Some((12, 28)),
+        best: Some(Move::new(12, 28, Move::FLAG_DOUBLE_PUSH)),
     };
     table.store(0xdead_beef, entry);
 
@@ -315,7 +315,7 @@ fn transposition_table_round_trip_is_consistent() {
         depth: 8,
         value: -55,
         bound: Bound::Lower,
-        best: Some((4, 6)),
+        best: Some(Move::new(4, 6, Move::FLAG_KING_CASTLE)),
     };
     table.store(0xdead_beef, replacement);
     let got = table
@@ -405,4 +405,67 @@ fn tactical_capture_and_mate_regressions_remain_stable() {
     .collect();
 
     assert_eq!(mate_two_moves, expected);
+}
+
+#[test]
+fn transposition_table_keeps_promotion_piece() {
+    let table = Table::new(64);
+    for (key, piece_type) in [
+        (1u64, PieceType::Knight),
+        (2, PieceType::Bishop),
+        (3, PieceType::Rook),
+        (4, PieceType::Queen),
+    ] {
+        for capture in [false, true] {
+            let mv = Move::promotion(50, if capture { 57 } else { 58 }, piece_type, capture);
+            let key = key * 1000 + capture as u64;
+            table.store(
+                key,
+                TTEntry {
+                    depth: 5,
+                    value: -321,
+                    bound: Bound::Exact,
+                    best: Some(mv),
+                },
+            );
+            let got = table.get(key).expect("missing TT entry");
+            assert_eq!(got.best, Some(mv));
+            assert_eq!(got.value, -321);
+        }
+    }
+}
+
+/// White: Kc6, Pc7. Black: Ka7. c8=Q is stalemate, c8=R wins. The TT used to
+/// store only (from, to), so the search returned c8=Q.
+fn underpromotion_game() -> Game {
+    let mut board = Board::new();
+    put(&mut board, "c6", PieceType::King, Color::White);
+    put(&mut board, "c7", PieceType::Pawn, Color::White);
+    put(&mut board, "a7", PieceType::King, Color::Black);
+    board.castling = [[false, false], [false, false]];
+    game_from_board(board, Color::White)
+}
+
+#[test]
+fn search_underpromotes_to_avoid_stalemate() {
+    for depth in 2..=10 {
+        let mut game = underpromotion_game();
+        let mut engine = Engine::new(depth);
+        let result = engine
+            .best_move_timed(&mut game, &TimeConfig::fixed_depth(depth))
+            .expect("missing move");
+        assert_eq!(
+            result.0,
+            ("c7".to_string(), "c8r".to_string()),
+            "depth {depth}"
+        );
+    }
+
+    // Parallel root search (used from depth 9 with several threads).
+    let mut game = underpromotion_game();
+    let mut engine = Engine::with_threads(10, 3);
+    let result = engine
+        .best_move_timed(&mut game, &TimeConfig::fixed_depth(10))
+        .expect("missing move");
+    assert_eq!(result.0, ("c7".to_string(), "c8r".to_string()));
 }

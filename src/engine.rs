@@ -221,16 +221,6 @@ impl TimeManager {
         self.stop_flag.store(true, Ordering::Release);
     }
 
-    #[inline(always)]
-    fn check_time(&self) -> bool {
-        let count = self.node_count.fetch_add(1, Ordering::Relaxed);
-        if count & 2047 == 0 {
-            !self.should_stop()
-        } else {
-            !self.stop_flag.load(Ordering::Relaxed)
-        }
-    }
-
     fn nodes(&self) -> u64 {
         self.node_count.load(Ordering::Relaxed)
     }
@@ -293,11 +283,34 @@ impl TimeManager {
 const RFP_MARGIN: [i32; 4] = [0, 150, 250, 350];
 const FUTILITY_MARGIN: [i32; 5] = [0, 120, 220, 320, 440];
 const HLP_THRESHOLD: u32 = 3;
-const HLP_BASE: i32 = -50;
+/// History-leaf pruning drops the remaining quiets once a quiet's combined
+/// (butterfly + continuation) history falls below `HLP_BASE * depth`.
+const HLP_BASE: i32 = -2_000;
+/// Saturation bound of the gravity-style history tables.
+const HISTORY_MAX: i32 = 16_384;
+const MAX_TRIED_QUIETS: usize = 64;
+const MAX_TRIED_CAPTURES: usize = 32;
 const LMP_LIMITS: [usize; 5] = [0, 5, 7, 10, 14];
 const MATE_VALUE: i32 = 10000;
 const MAX_PLY: usize = 128;
 const MAX_DEPTH: u32 = 64;
+const NODE_FLUSH_INTERVAL: u64 = 2048;
+/// Optimistic victim values (max of middlegame/endgame material) for qsearch delta pruning.
+const QS_DELTA_VALUES: [i32; 6] = [120, 320, 330, 550, 1000, 0];
+const QS_DELTA_MARGIN: i32 = 200;
+
+/// Late-move reduction by `[depth][move index]`: `ln(depth) * ln(idx + 1) / 1.5`,
+/// clamped to `1..=depth - 1`, and zero for `depth < 3` or `idx < 3`.
+static LMR_TABLE: std::sync::LazyLock<[[u8; 64]; 64]> = std::sync::LazyLock::new(|| {
+    let mut table = [[0u8; 64]; 64];
+    for depth in 3..64usize {
+        for idx in 3..64usize {
+            let r = ((depth as f64).ln() * ((idx + 1) as f64).ln() / 1.5) as usize;
+            table[depth][idx] = r.clamp(1, depth - 1) as u8;
+        }
+    }
+    table
+});
 const ORDER_TT: u8 = 0;
 const ORDER_PROMOTION: u8 = 1;
 const ORDER_GOOD_CAPTURE: u8 = 2;
@@ -311,6 +324,8 @@ struct RootSearchResult {
     index: usize,
     mv: Move,
     score: i32,
+    /// false when the move failed low against the shared alpha (score is an upper bound).
+    exact: bool,
 }
 
 struct PonderState {
@@ -342,6 +357,13 @@ pub struct Engine {
     time_manager: Option<Arc<TimeManager>>,
     search_history: Vec<u64>,
     ponder: Option<PonderState>,
+    last_nodes: u64,
+    /// Nodes searched by this engine instance not yet added to the shared
+    /// `TimeManager::node_count` (flushed every `NODE_FLUSH_INTERVAL` nodes).
+    local_nodes: u64,
+    /// Index in `search_history` before which no position can repeat the current
+    /// one (set after irreversible moves and null moves).
+    rep_floor: usize,
 }
 
 impl Clone for Engine {
@@ -359,12 +381,17 @@ impl Clone for Engine {
             time_manager: self.time_manager.clone(),
             search_history: self.search_history.clone(),
             ponder: None,
+            last_nodes: 0,
+            local_nodes: 0,
+            rep_floor: self.rep_floor,
         }
     }
 }
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        // Search workers are clones: make their remaining nodes visible to the parent.
+        self.flush_nodes();
         self.stop_ponder();
     }
 }
@@ -392,6 +419,9 @@ impl Engine {
             time_manager: None,
             search_history: Vec::new(),
             ponder: None,
+            last_nodes: 0,
+            local_nodes: 0,
+            rep_floor: 0,
         }
     }
 
@@ -490,8 +520,15 @@ impl Engine {
             self.best_move_parallel(game, max_depth)
         };
 
+        self.flush_nodes();
+        self.last_nodes = self.time_manager.as_ref().map_or(0, |tm| tm.nodes());
         self.time_manager = None;
         result
+    }
+
+    /// Number of nodes visited by the most recent search.
+    pub fn last_search_nodes(&self) -> u64 {
+        self.last_nodes
     }
 
     fn ponder_matches(&self, game: &Game, actual_move: Move) -> bool {
@@ -569,59 +606,6 @@ impl Engine {
         hit
     }
 
-    fn string_to_move(&self, board: &Board, s: &str, e: &str) -> Move {
-        let (sx, sy) = Board::algebraic_to_index(s).unwrap();
-        let (ex, ey) = Board::algebraic_to_index(e).unwrap();
-        let from = (sy * 8 + sx) as u8;
-        let to = (ey * 8 + ex) as u8;
-
-        let piece = board.get_index(sx, sy).unwrap();
-        let captured = board.get_index(ex, ey);
-
-        let is_capture = captured.is_some();
-        let mut flags = Move::FLAG_NORMAL;
-
-        match piece.piece_type {
-            PieceType::Pawn => {
-                let diff_y = (ey as isize - sy as isize).abs();
-                let diff_x = (ex as isize - sx as isize).abs();
-
-                if ey == 0 || ey == 7 {
-                    if is_capture {
-                        flags = Move::FLAG_PROMO_QUEEN_CAP;
-                    } else {
-                        flags = Move::FLAG_PROMO_QUEEN;
-                    }
-                } else if diff_y == 2 && diff_x == 0 {
-                    flags = Move::FLAG_DOUBLE_PUSH;
-                } else if diff_x != 0 && !is_capture {
-                    flags = Move::FLAG_EP_CAPTURE;
-                } else if is_capture {
-                    flags = Move::FLAG_CAPTURE;
-                }
-            }
-            PieceType::King => {
-                let diff_x = (ex as isize - sx as isize).abs();
-                if diff_x == 2 {
-                    if ex > sx {
-                        flags = Move::FLAG_KING_CASTLE;
-                    } else {
-                        flags = Move::FLAG_QUEEN_CASTLE;
-                    }
-                } else if is_capture {
-                    flags = Move::FLAG_CAPTURE;
-                }
-            }
-            _ => {
-                if is_capture {
-                    flags = Move::FLAG_CAPTURE;
-                }
-            }
-        }
-
-        Move::new(from, to, flags)
-    }
-
     fn generate_legal_moves(&self, board: &mut Board, color: Color) -> crate::types::MoveList {
         let mut list = crate::types::MoveList::new();
         crate::movegen::generate_moves_fast(board, color, &mut list);
@@ -661,19 +645,18 @@ impl Engine {
 
     #[inline(always)]
     fn lmr_value(depth: u32, idx: usize) -> u32 {
-        if depth < 3 || idx < 3 {
-            return 0;
-        }
-        let d = (depth as f64).ln();
-        let m = ((idx + 1) as f64).ln();
-        let mut r = (d * m / 1.5) as i32;
-        if r < 1 {
-            r = 1;
-        }
-        if r as u32 > depth - 1 {
-            r = (depth - 1) as i32;
-        }
-        r as u32
+        LMR_TABLE[(depth as usize).min(63)][idx.min(63)] as u32
+    }
+
+    /// Adjusts late-move reductions using the quiet move's learned history.
+    /// Moves with positive history have earned a deeper search; moves with
+    /// negative history can be reduced one ply more. Keep at least one ply
+    /// for the child search.
+    #[inline(always)]
+    fn lmr_reduction(depth: u32, idx: usize, history_score: i32) -> u32 {
+        let base = Self::lmr_value(depth, idx) as i32;
+        let history_adjustment = (history_score / 8_192).clamp(-1, 1);
+        (base - history_adjustment).clamp(0, depth.saturating_sub(2) as i32) as u32
     }
 
     fn probe_syzygy(&self, board: &Board, color: Color, ply: usize) -> Option<i32> {
@@ -695,103 +678,131 @@ impl Engine {
         })
     }
 
+    /// Ordering score of a move (without the stage), as used by `classify_move`.
+    #[cfg(test)]
     fn move_score(&self, board: &Board, mv: Move, ply: usize, prev: Option<&Move>) -> i32 {
-        let mut score = 0;
-        let capture = mv.is_capture();
-        let from = mv.from_sq() as usize;
-        let to = mv.to_sq() as usize;
+        let cont_base = Self::cont_history_base(board, prev);
+        self.classify_move(board, mv, ply, cont_base, None).1
+    }
 
-        if capture {
-            score += self.capture_history[from][to];
-
-            let victim_idx = if mv.is_ep() {
-                0 // Pawn
-            } else {
-                let tx = to % 8;
-                let ty = to / 8;
-                board.piece_type_idx_at((ty * 8 + tx) as u8)
-            };
-
-            let attacker_idx = board.piece_type_idx_at(from as u8);
-
-            if victim_idx < 6 && attacker_idx < 6 {
-                score += mvv_lva_score(victim_idx, attacker_idx) * 100;
-            }
-
-            if self.static_exchange_eval(board, mv) < 0 {
-                score -= 1000;
-            }
-        } else {
-            score += self.quiet_history[from][to];
-            if let Some(k) = self.killers.get(ply) {
-                if let Some(m) = &k[0] {
-                    if m.0 == mv.0 {
-                        score += 10_000;
-                    }
-                }
-                if let Some(m) = &k[1] {
-                    if m.0 == mv.0 {
-                        score += 9_000;
-                    }
-                }
-            }
+    /// Offset of the continuation-history row selected by `prev`, the move that led to
+    /// `board`. Computed once per node; `None` when there is no usable previous move.
+    #[inline(always)]
+    fn cont_history_base(board: &Board, prev: Option<&Move>) -> Option<usize> {
+        let prev_to = prev?.to_sq() as usize;
+        let prev_piece = board.piece_type_idx_at(prev_to as u8);
+        if prev_piece >= 6 {
+            return None;
         }
+        Some(Self::cont_history_index(prev_piece, prev_to, 0, 0))
+    }
 
-        if let Some(pmv) = prev {
-            score +=
-                Self::continuation_history_score(self.cont_history.as_slice(), board, *pmv, mv);
+    #[inline(always)]
+    fn cont_history_slot(board: &Board, base: usize, mv: Move) -> Option<usize> {
+        let curr_piece = board.piece_type_idx_at(mv.from_sq());
+        if curr_piece >= 6 {
+            return None;
         }
-        score
+        Some(base + curr_piece * CONT_HISTORY_SQUARES + mv.to_sq() as usize)
     }
 
     #[inline(always)]
     fn continuation_history_score(
         cont_history: &[i32],
         board: &Board,
-        prev: Move,
+        base: usize,
         mv: Move,
     ) -> i32 {
-        let prev_to = prev.to_sq() as usize;
-        let curr_from = mv.from_sq() as usize;
-        let curr_to = mv.to_sq() as usize;
+        Self::cont_history_slot(board, base, mv).map_or(0, |idx| cont_history[idx])
+    }
 
-        let prev_piece = board.piece_type_idx_at(prev_to as u8);
-        if prev_piece >= 6 {
-            return 0;
-        }
+    #[inline(always)]
+    fn history_bonus(depth: u32) -> i32 {
+        let d = depth.min(MAX_DEPTH) as i32;
+        (16 * d * d + 32 * d).min(1_200)
+    }
 
-        let curr_piece = board.piece_type_idx_at(curr_from as u8);
-        if curr_piece >= 6 {
-            return 0;
-        }
-
-        cont_history[Self::cont_history_index(prev_piece, prev_to, curr_piece, curr_to)]
+    /// Gravity update: keeps the entry within +-HISTORY_MAX and makes large values
+    /// harder to push further in the same direction.
+    #[inline(always)]
+    fn apply_history(entry: &mut i32, delta: i32) {
+        *entry += delta - *entry * delta.abs() / HISTORY_MAX;
     }
 
     #[inline(always)]
     fn update_continuation_history(
         cont_history: &mut [i32],
         board: &Board,
-        prev: Move,
+        base: usize,
         mv: Move,
         delta: i32,
     ) {
-        let prev_to = prev.to_sq() as usize;
-        let curr_from = mv.from_sq() as usize;
-        let curr_to = mv.to_sq() as usize;
+        if let Some(idx) = Self::cont_history_slot(board, base, mv) {
+            Self::apply_history(&mut cont_history[idx], delta);
+        }
+    }
 
-        let prev_piece = board.piece_type_idx_at(prev_to as u8);
-        if prev_piece >= 6 {
-            return;
+    /// History update after a beta cutoff by `best`: reward it and penalise the moves of
+    /// the same kind that were searched before it without producing the cutoff.
+    fn update_histories_on_cutoff(
+        &mut self,
+        board: &Board,
+        depth: u32,
+        best: Move,
+        cont_base: Option<usize>,
+        quiets_tried: &[Move],
+        captures_tried: &[Move],
+    ) {
+        let bonus = Self::history_bonus(depth);
+
+        if best.is_capture() {
+            let (from, to) = (best.from_sq() as usize, best.to_sq() as usize);
+            Self::apply_history(&mut self.capture_history[from][to], bonus);
+        } else if !best.is_promotion() {
+            let (from, to) = (best.from_sq() as usize, best.to_sq() as usize);
+            Self::apply_history(&mut self.quiet_history[from][to], bonus);
+            if let Some(base) = cont_base {
+                Self::update_continuation_history(&mut self.cont_history, board, base, best, bonus);
+            }
+            for &mv in quiets_tried {
+                let (from, to) = (mv.from_sq() as usize, mv.to_sq() as usize);
+                Self::apply_history(&mut self.quiet_history[from][to], -bonus);
+                if let Some(base) = cont_base {
+                    Self::update_continuation_history(
+                        &mut self.cont_history,
+                        board,
+                        base,
+                        mv,
+                        -bonus,
+                    );
+                }
+            }
         }
 
-        let curr_piece = board.piece_type_idx_at(curr_from as u8);
-        if curr_piece >= 6 {
-            return;
+        for &mv in captures_tried {
+            let (from, to) = (mv.from_sq() as usize, mv.to_sq() as usize);
+            Self::apply_history(&mut self.capture_history[from][to], -bonus);
         }
+    }
 
-        let idx = Self::cont_history_index(prev_piece, prev_to, curr_piece, curr_to);
-        cont_history[idx] += delta;
+    /// Called at the start of each search: keep what was learned, but let it decay.
+    fn age_histories(&mut self) {
+        for row in self.quiet_history.iter_mut() {
+            for v in row.iter_mut() {
+                *v /= 2;
+            }
+        }
+        for row in self.capture_history.iter_mut() {
+            for v in row.iter_mut() {
+                *v /= 2;
+            }
+        }
+        for v in self.cont_history.iter_mut() {
+            *v /= 2;
+        }
+        for k in self.killers.iter_mut() {
+            *k = [None, None];
+        }
     }
 
     #[inline(always)]
@@ -834,8 +845,8 @@ impl Engine {
     }
 
     #[inline(always)]
-    fn tt_move_matches(mv: Move, tt_best: Option<(u8, u8)>) -> bool {
-        tt_best.is_some_and(|(from, to)| mv.from_sq() == from && mv.to_sq() == to)
+    fn tt_move_matches(mv: Move, tt_best: Option<Move>) -> bool {
+        tt_best == Some(mv)
     }
 
     #[inline(always)]
@@ -850,23 +861,51 @@ impl Engine {
         }
     }
 
+    /// Counts earlier occurrences of `hash`, the position about to be pushed onto
+    /// `search_history` at `ply`. Returns 2 (a draw) on the second occurrence, or
+    /// on the first one when it lies strictly inside the search tree (fewer than
+    /// `ply` plies back). Only positions with the same side to move (every second
+    /// entry) at least four plies back and after the last irreversible move
+    /// (`rep_floor`) can match.
     #[inline(always)]
-    fn repetition_count(&self, hash: u64) -> usize {
+    fn repetition_count(&self, hash: u64, ply: usize) -> usize {
+        let history = &self.search_history;
+        let len = history.len();
+        let floor = self.rep_floor;
         let mut count = 0;
-        for &seen in self.search_history.iter().rev() {
-            if seen == hash {
+        let Some(mut idx) = len.checked_sub(4) else {
+            return 0;
+        };
+        while idx >= floor {
+            if history[idx] == hash {
                 count += 1;
-                if count >= 2 {
-                    break;
+                if count >= 2 || len - idx < ply {
+                    return 2;
                 }
             }
+            if idx < 2 {
+                break;
+            }
+            idx -= 2;
         }
         count
     }
 
+    /// Whether `prev` (the move that reached `board`) makes every earlier position
+    /// unrepeatable: captures, promotions, pawn moves and null moves (`None`).
     #[inline(always)]
-    fn is_repetition_draw(&self, hash: u64) -> bool {
-        self.repetition_count(hash) >= 2
+    fn is_irreversible(board: &Board, prev: Option<Move>) -> bool {
+        match prev {
+            None => true,
+            Some(mv) => {
+                mv.is_capture() || mv.is_promotion() || board.piece_type_idx_at(mv.to_sq()) == 0
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn is_repetition_draw(&self, hash: u64, ply: usize) -> bool {
+        self.repetition_count(hash, ply) >= 2
     }
 
     fn classify_move(
@@ -874,91 +913,144 @@ impl Engine {
         board: &Board,
         mv: Move,
         ply: usize,
-        prev: Option<&Move>,
-        tt_best: Option<(u8, u8)>,
-    ) -> (u8, i32, i32) {
+        cont_base: Option<usize>,
+        tt_best: Option<Move>,
+    ) -> (u8, i32) {
         if Self::tt_move_matches(mv, tt_best) {
-            return (ORDER_TT, i32::MAX, 0);
+            return (ORDER_TT, i32::MAX);
         }
 
-        let mut score = self.move_score(board, mv, ply, prev);
-        let mut see = 0;
-
-        if mv.is_promotion() {
-            score += Self::promotion_bonus(mv);
-            return (ORDER_PROMOTION, score, see);
-        }
+        let from = mv.from_sq() as usize;
+        let to = mv.to_sq() as usize;
+        let mut score = match cont_base {
+            Some(base) => Self::continuation_history_score(&self.cont_history, board, base, mv),
+            None => 0,
+        };
 
         if mv.is_capture() {
-            see = self.static_exchange_eval(board, mv);
+            score += self.capture_history[from][to];
+
+            let victim_idx = if mv.is_ep() {
+                0 // Pawn
+            } else {
+                board.piece_type_idx_at(to as u8)
+            };
+            let attacker_idx = board.piece_type_idx_at(from as u8);
+            if victim_idx < 6 && attacker_idx < 6 {
+                score += mvv_lva_score(victim_idx, attacker_idx) * 100;
+            }
+
+            let see = self.static_exchange_eval(board, mv);
+            if see < 0 {
+                score -= 1000;
+            }
+
+            if mv.is_promotion() {
+                return (ORDER_PROMOTION, score + Self::promotion_bonus(mv));
+            }
+
             score += see * 128;
             let stage = if see >= 0 {
                 ORDER_GOOD_CAPTURE
             } else {
                 ORDER_BAD_CAPTURE
             };
-            return (stage, score, see);
+            return (stage, score);
+        }
+
+        score += self.quiet_history[from][to];
+
+        if mv.is_promotion() {
+            return (ORDER_PROMOTION, score + Self::promotion_bonus(mv));
         }
 
         if let Some(k) = self.killers.get(ply) {
             if k[0] == Some(mv) {
-                return (ORDER_KILLER_1, score + 20_000, see);
+                return (ORDER_KILLER_1, score + 30_000);
             }
             if k[1] == Some(mv) {
-                return (ORDER_KILLER_2, score + 15_000, see);
+                return (ORDER_KILLER_2, score + 24_000);
             }
         }
 
-        (ORDER_QUIET, score, see)
+        (ORDER_QUIET, score)
     }
 
-    fn pick_next_move(
-        moves: &mut crate::types::MoveList,
-        stages: &mut [u8; 256],
-        scores: &mut [i32; 256],
-        sees: &mut [i32; 256],
-        start: usize,
-    ) -> Move {
+    /// Packs (stage, score) into one key: larger key = searched earlier.
+    #[inline(always)]
+    fn order_key(stage: u8, score: i32) -> i64 {
+        (((ORDER_BAD_CAPTURE - stage) as i64) << 32) | ((score as u32) ^ 0x8000_0000) as i64
+    }
+
+    #[inline(always)]
+    fn key_score(key: i64) -> i32 {
+        ((key as u32) ^ 0x8000_0000) as i32
+    }
+
+    #[inline(always)]
+    fn key_stage(key: i64) -> u8 {
+        ORDER_BAD_CAPTURE - (key >> 32) as u8
+    }
+
+    /// Scores every move into `buf` (only the first `moves.len()` slots are written).
+    fn score_moves<'a>(
+        &self,
+        board: &Board,
+        moves: &crate::types::MoveList,
+        ply: usize,
+        cont_base: Option<usize>,
+        tt_best: Option<Move>,
+        buf: &'a mut [std::mem::MaybeUninit<i64>; crate::types::MAX_MOVES],
+    ) -> &'a mut [i64] {
         let len = moves.len();
+        for idx in 0..len {
+            let (stage, score) = self.classify_move(board, moves[idx], ply, cont_base, tt_best);
+            buf[idx].write(Self::order_key(stage, score));
+        }
+        // SAFETY: the first `len` elements were initialised above.
+        unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut i64, len) }
+    }
+
+    #[inline(always)]
+    fn pick_next_move(moves: &mut crate::types::MoveList, keys: &mut [i64], start: usize) -> Move {
         let mut best = start;
-        for idx in (start + 1)..len {
-            if stages[idx] < stages[best]
-                || (stages[idx] == stages[best] && scores[idx] > scores[best])
-            {
+        let mut best_key = keys[start];
+        for idx in (start + 1)..keys.len() {
+            let key = keys[idx];
+            if key > best_key {
                 best = idx;
+                best_key = key;
             }
         }
 
         if best != start {
             moves.swap(start, best);
-            stages.swap(start, best);
-            scores.swap(start, best);
-            sees.swap(start, best);
+            keys.swap(start, best);
         }
 
         moves[start]
     }
 
-    fn find_tt_move(&self, board: &Board, color: Color, best: Option<(u8, u8)>) -> Option<Move> {
-        let (from, to) = best?;
+    /// Returns the TT move if it is legal in `board` (guards against hash collisions).
+    fn find_tt_move(&self, board: &Board, color: Color, best: Option<Move>) -> Option<Move> {
+        let best = best?;
         let mut board_clone = board.clone();
         let moves = self.generate_legal_moves(&mut board_clone, color);
-        for mv in moves.iter() {
-            if mv.from_sq() == from && mv.to_sq() == to {
-                return Some(*mv);
-            }
-        }
-        None
+        moves.iter().copied().find(|mv| *mv == best)
     }
 
+    /// Counts one node and reports whether the search must stop. The shared
+    /// node counter and the clock are only touched every `NODE_FLUSH_INTERVAL` nodes.
     #[inline(always)]
-    fn should_stop(&self) -> bool {
+    fn should_stop(&mut self) -> bool {
         if self.stop_flag.load(Ordering::Relaxed) {
             return true;
         }
-        if let Some(tm) = &self.time_manager {
-            let count = tm.node_count.fetch_add(1, Ordering::Relaxed);
-            if count & 2047 == 0 {
+        self.local_nodes += 1;
+        if self.local_nodes >= NODE_FLUSH_INTERVAL {
+            let batch = std::mem::take(&mut self.local_nodes);
+            if let Some(tm) = &self.time_manager {
+                tm.node_count.fetch_add(batch, Ordering::Relaxed);
                 if tm.should_stop() {
                     self.stop_flag.store(true, Ordering::Release);
                     return true;
@@ -966,6 +1058,17 @@ impl Engine {
             }
         }
         false
+    }
+
+    /// Adds the locally counted nodes to the shared counter.
+    fn flush_nodes(&mut self) {
+        if self.local_nodes == 0 {
+            return;
+        }
+        if let Some(tm) = &self.time_manager {
+            tm.node_count.fetch_add(self.local_nodes, Ordering::Relaxed);
+        }
+        self.local_nodes = 0;
     }
 
     #[inline(always)]
@@ -981,17 +1084,32 @@ impl Engine {
             return 0;
         }
 
-        let hash = board.hash(color);
-        if self.is_repetition_draw(hash) {
-            return 0;
+        // No repetition detection here: the entry position was checked by `pvs`,
+        // and the side not in check only plays (irreversible) captures. The ply
+        // cap bounds the one exception, endless mutual quiet check evasions.
+        let in_check = board.in_check_fast(color);
+        if ply >= MAX_PLY - 1 {
+            return Self::evaluate(board, color);
         }
-        self.search_history.push(hash);
+
+        let hash = board.hash(color);
+        if let Some(entry) = self.tt.get(hash) {
+            let value = Self::score_from_tt(entry.value, ply);
+            match entry.bound {
+                Bound::Exact => return value,
+                Bound::Lower if value >= beta => return value,
+                Bound::Upper if value <= alpha => return value,
+                _ => {}
+            }
+        }
+
+        let alpha_orig = alpha;
+        let mut best_move: Option<Move> = None;
+        let mut stand_pat = -MATE_VALUE;
 
         let result = 'q: {
-            let in_check = board.in_check_fast(color);
-
             if !in_check {
-                let stand_pat = Self::evaluate(board, color);
+                stand_pat = Self::evaluate(board, color);
 
                 if stand_pat >= beta {
                     break 'q stand_pat;
@@ -1015,25 +1133,30 @@ impl Engine {
                     alpha
                 }
             } else {
-                let mut stages = [ORDER_QUIET; 256];
-                let mut scores = [0i32; 256];
-                let mut sees = [0i32; 256];
-
-                for idx in 0..moves.len() {
-                    let mv = moves[idx];
-                    let (stage, score, see) = self.classify_move(board, mv, ply, None, None);
-                    stages[idx] = stage;
-                    scores[idx] = score;
-                    sees[idx] = see;
-                }
+                let mut key_buf = [std::mem::MaybeUninit::<i64>::uninit(); crate::types::MAX_MOVES];
+                let keys = self.score_moves(board, &moves, ply, None, None, &mut key_buf);
 
                 let mut best = alpha;
                 for idx in 0..moves.len() {
-                    let m =
-                        Self::pick_next_move(&mut moves, &mut stages, &mut scores, &mut sees, idx);
+                    let m = Self::pick_next_move(&mut moves, keys, idx);
 
-                    if !in_check && !m.is_promotion() && stages[idx] == ORDER_BAD_CAPTURE {
+                    if !in_check
+                        && !m.is_promotion()
+                        && Self::key_stage(keys[idx]) == ORDER_BAD_CAPTURE
+                    {
                         continue;
+                    }
+                    // Delta pruning: even winning the victim for free cannot reach alpha.
+                    if !in_check && !m.is_promotion() {
+                        let victim = if m.is_ep() {
+                            0
+                        } else {
+                            board.piece_type_idx_at(m.to_sq())
+                        };
+                        let gain = QS_DELTA_VALUES.get(victim).copied().unwrap_or(0);
+                        if stand_pat + gain + QS_DELTA_MARGIN <= best {
+                            continue;
+                        }
                     }
 
                     let undo = board.make_move_fast(m, color);
@@ -1045,10 +1168,12 @@ impl Engine {
                     }
 
                     if score >= beta {
+                        best_move = Some(m);
                         break 'q score;
                     }
                     if score > best {
                         best = score;
+                        best_move = Some(m);
                     }
                 }
 
@@ -1056,7 +1181,24 @@ impl Engine {
             }
         };
 
-        self.search_history.pop();
+        if !self.stop_flag.load(Ordering::Relaxed) {
+            let bound = if result >= beta {
+                Bound::Lower
+            } else if result > alpha_orig {
+                Bound::Exact
+            } else {
+                Bound::Upper
+            };
+            self.tt.store(
+                hash,
+                TTEntry {
+                    depth: 0,
+                    value: Self::score_to_tt(result, ply),
+                    bound,
+                    best: best_move,
+                },
+            );
+        }
         result
     }
 
@@ -1069,14 +1211,19 @@ impl Engine {
         mut beta: i32,
         ply: usize,
         prev_move: Option<Move>,
-        _use_iir: bool,
+        use_iir: bool,
     ) -> i32 {
         if self.should_stop() {
             return 0;
         }
 
         let hash = board.hash(color);
-        if self.is_repetition_draw(hash) {
+        let saved_rep_floor = self.rep_floor;
+        if ply > 0 && Self::is_irreversible(board, prev_move) {
+            self.rep_floor = self.search_history.len();
+        }
+        if self.is_repetition_draw(hash, ply) {
+            self.rep_floor = saved_rep_floor;
             return 0;
         }
         self.search_history.push(hash);
@@ -1096,7 +1243,7 @@ impl Engine {
 
             let is_pv = beta - alpha > 1;
             let alpha_orig = alpha;
-            let mut tt_best: Option<(u8, u8)> = None;
+            let mut tt_best: Option<Move> = None;
 
             if let Some(entry) = self.tt.get(hash) {
                 let value = Self::score_from_tt(entry.value, ply);
@@ -1115,11 +1262,25 @@ impl Engine {
                 tt_best = entry.best;
             }
 
-            if let Some(tb_val) = self.probe_syzygy(board, color, ply) {
+            // Never probe at the root (it must return a move) or at the horizon
+            // (the FEN round-trip is too slow for leaf nodes).
+            let tb_val = if ply > 0 && depth >= 1 && self.tb.is_some() {
+                self.probe_syzygy(board, color, ply)
+            } else {
+                None
+            };
+            if let Some(tb_val) = tb_val {
                 tb_val
             } else if depth == 0 {
                 self.quiescence(board, color, alpha, beta, ply)
             } else {
+                // Internal iterative reduction: without a TT move, ordering is poor
+                // and the node is likely unimportant, so search it one ply shallower.
+                let depth = if use_iir && tt_best.is_none() && depth >= 4 {
+                    depth - 1
+                } else {
+                    depth
+                };
                 let in_check = board.in_check_fast(color);
                 let static_eval = if in_check {
                     None
@@ -1134,17 +1295,24 @@ impl Engine {
                     }
                 }
 
-                let can_null =
-                    !is_pv && !in_check && board.piece_count_total(color) > 3 && depth >= 3;
+                // Null move: skipped right after another null move (`prev_move` is
+                // None) and when the static eval does not already beat beta.
+                let null_eval = static_eval.unwrap_or(-MATE_VALUE);
+                let can_null = !is_pv
+                    && !in_check
+                    && prev_move.is_some()
+                    && depth >= 3
+                    && null_eval >= beta
+                    && board.has_non_pawn_material(color);
                 if can_null {
-                    let r = if depth > 6 { 3 } else { 2 };
+                    let r = 3 + depth / 4 + ((null_eval - beta) / 200).clamp(0, 3) as u32;
                     let ep = board.en_passant;
 
                     board.en_passant = None;
                     let score = -self.pvs(
                         board,
                         opposite(color),
-                        depth - 1 - r,
+                        depth.saturating_sub(1 + r),
                         -beta,
                         -beta + 1,
                         ply + 1,
@@ -1158,11 +1326,17 @@ impl Engine {
                     }
 
                     if score >= beta {
+                        // Do not trust unproven mate scores from a null-move search.
+                        let score = if score >= MATE_VALUE - MAX_PLY as i32 {
+                            beta
+                        } else {
+                            score
+                        };
                         if depth > 8 {
                             let verify = self.pvs(
                                 board,
                                 color,
-                                depth - r - 1,
+                                depth.saturating_sub(1 + r),
                                 beta - 1,
                                 beta,
                                 ply,
@@ -1190,61 +1364,44 @@ impl Engine {
                     break 'search 0;
                 }
 
-                let mut stages = [ORDER_QUIET; 256];
-                let mut scores = [0i32; 256];
-                let mut sees = [0i32; 256];
-
-                for idx in 0..moves_list.len() {
-                    let mv = moves_list[idx];
-                    let (stage, score, see) =
-                        self.classify_move(board, mv, ply, prev_move.as_ref(), tt_best);
-                    stages[idx] = stage;
-                    scores[idx] = score;
-                    sees[idx] = see;
-                }
+                let mut key_buf = [std::mem::MaybeUninit::<i64>::uninit(); crate::types::MAX_MOVES];
+                let cont_base = Self::cont_history_base(board, prev_move.as_ref());
+                let keys =
+                    self.score_moves(board, &moves_list, ply, cont_base, tt_best, &mut key_buf);
 
                 let mut best_move: Option<Move> = None;
                 let mut best_score = -MATE_VALUE;
                 let mut skip_quiets = false;
+                let mut quiets_tried = [Move::NONE; MAX_TRIED_QUIETS];
+                let mut quiet_count = 0usize;
+                let mut captures_tried = [Move::NONE; MAX_TRIED_CAPTURES];
+                let mut capture_count = 0usize;
 
                 for idx in 0..moves_list.len() {
-                    let m = Self::pick_next_move(
-                        &mut moves_list,
-                        &mut stages,
-                        &mut scores,
-                        &mut sees,
-                        idx,
-                    );
+                    let m = Self::pick_next_move(&mut moves_list, keys, idx);
 
                     let capture = m.is_capture();
                     let promotion = m.is_promotion();
                     let is_quiet = !capture && !promotion;
 
-                    if !is_pv
-                        && !in_check
-                        && is_quiet
-                        && depth <= 4
-                        && idx >= LMP_LIMITS[depth as usize]
-                    {
-                        continue;
-                    }
-                    if skip_quiets && is_quiet {
-                        continue;
-                    }
-                    if !is_pv && !in_check && is_quiet && depth <= HLP_THRESHOLD && idx > 0 {
-                        if scores[idx] < HLP_BASE {
+                    // Quiet-move pruning (late move pruning, history pruning, futility).
+                    // Quiet checks are never pruned: they are exactly the moves the
+                    // static eval and the history tables misjudge.
+                    if !is_pv && !in_check && is_quiet {
+                        let late = depth <= 4 && idx >= LMP_LIMITS[depth as usize];
+                        let bad_history = depth <= HLP_THRESHOLD
+                            && idx > 0
+                            && Self::key_score(keys[idx]) < HLP_BASE * depth as i32;
+                        let futile = depth <= 4
+                            && static_eval.is_some_and(|eval| {
+                                eval + FUTILITY_MARGIN[depth as usize] <= alpha
+                            });
+                        if bad_history {
                             skip_quiets = true;
+                        }
+                        if (late || skip_quiets || futile) && !board.gives_check(m, color) {
                             continue;
                         }
-                    }
-                    if !is_pv
-                        && !in_check
-                        && depth <= 4
-                        && is_quiet
-                        && static_eval
-                            .is_some_and(|eval| eval + FUTILITY_MARGIN[depth as usize] <= alpha)
-                    {
-                        continue;
                     }
 
                     let undo = board.make_move_fast(m, color);
@@ -1257,10 +1414,15 @@ impl Engine {
 
                     let can_reduce =
                         !is_pv && depth > 2 && is_quiet && !in_check && !gives_check && idx >= 3;
-                    if can_reduce {
-                        let r = Self::lmr_value(depth, idx + 1);
-                        new_depth = new_depth.saturating_sub(r);
-                    }
+                    let reduced_depth = if can_reduce {
+                        new_depth.saturating_sub(Self::lmr_reduction(
+                            depth,
+                            idx + 1,
+                            Self::key_score(keys[idx]),
+                        ))
+                    } else {
+                        new_depth
+                    };
 
                     let mut score;
                     if idx == 0 {
@@ -1275,21 +1437,36 @@ impl Engine {
                             true,
                         );
                     } else {
+                        // Null-window search, reduced for late quiet moves.
                         score = -self.pvs(
                             board,
                             opposite(color),
-                            new_depth,
+                            reduced_depth,
                             -alpha - 1,
                             -alpha,
                             ply + 1,
                             Some(m),
                             true,
                         );
+                        // A reduced move that beats alpha is verified at full depth.
+                        if score > alpha && reduced_depth < new_depth {
+                            score = -self.pvs(
+                                board,
+                                opposite(color),
+                                new_depth,
+                                -alpha - 1,
+                                -alpha,
+                                ply + 1,
+                                Some(m),
+                                true,
+                            );
+                        }
+                        // Inside a PV window, a move that beats alpha needs its exact score.
                         if score > alpha && score < beta {
                             score = -self.pvs(
                                 board,
                                 opposite(color),
-                                depth - 1 + u32::from(gives_check),
+                                new_depth,
                                 -beta,
                                 -alpha,
                                 ply + 1,
@@ -1317,25 +1494,14 @@ impl Engine {
                             }
                         }
 
-                        let from = m.from_sq() as usize;
-                        let to = m.to_sq() as usize;
-                        let bonus = (depth * depth) as i32;
-
-                        if capture {
-                            self.capture_history[from][to] += bonus;
-                        } else {
-                            self.quiet_history[from][to] += bonus;
-                        }
-
-                        if let Some(pmv) = prev_move {
-                            Self::update_continuation_history(
-                                self.cont_history.as_mut(),
-                                board,
-                                pmv,
-                                m,
-                                bonus,
-                            );
-                        }
+                        self.update_histories_on_cutoff(
+                            board,
+                            depth,
+                            m,
+                            cont_base,
+                            &quiets_tried[..quiet_count],
+                            &captures_tried[..capture_count],
+                        );
 
                         self.tt.store(
                             hash,
@@ -1343,20 +1509,19 @@ impl Engine {
                                 depth,
                                 value: Self::score_to_tt(score, ply),
                                 bound: Bound::Lower,
-                                best: Some((from as u8, to as u8)),
+                                best: Some(m),
                             },
                         );
 
                         break 'search score;
-                    } else {
-                        let from = m.from_sq() as usize;
-                        let to = m.to_sq() as usize;
-                        let penalty = (depth * depth) as i32;
-                        if capture {
-                            self.capture_history[from][to] -= penalty;
-                        } else {
-                            self.quiet_history[from][to] -= penalty;
+                    } else if is_quiet {
+                        if quiet_count < MAX_TRIED_QUIETS {
+                            quiets_tried[quiet_count] = m;
+                            quiet_count += 1;
                         }
+                    } else if capture && capture_count < MAX_TRIED_CAPTURES {
+                        captures_tried[capture_count] = m;
+                        capture_count += 1;
                     }
 
                     if score > best_score {
@@ -1374,7 +1539,6 @@ impl Engine {
                     Bound::Exact
                 };
 
-                let best_idx = best_move.map(|m| (m.from_sq(), m.to_sq()));
                 let tt_value = if alpha <= alpha_orig {
                     best_score.max(alpha)
                 } else {
@@ -1387,7 +1551,7 @@ impl Engine {
                         depth,
                         value: Self::score_to_tt(tt_value, ply),
                         bound,
-                        best: best_idx,
+                        best: best_move,
                     },
                 );
 
@@ -1396,6 +1560,7 @@ impl Engine {
         };
 
         self.search_history.pop();
+        self.rep_floor = saved_rep_floor;
         result
     }
 
@@ -1413,21 +1578,12 @@ impl Engine {
             return Vec::new();
         }
 
-        let mut stages = [ORDER_QUIET; 256];
-        let mut scores = [0i32; 256];
-        let mut sees = [0i32; 256];
-
-        for idx in 0..moves.len() {
-            let mv = moves[idx];
-            let (stage, score, see) = self.classify_move(board, mv, 0, None, tt_best);
-            stages[idx] = stage;
-            scores[idx] = score;
-            sees[idx] = see;
-        }
+        let mut key_buf = [std::mem::MaybeUninit::<i64>::uninit(); crate::types::MAX_MOVES];
+        let keys = self.score_moves(board, &moves, 0, None, tt_best, &mut key_buf);
 
         let mut ordered = Vec::with_capacity(moves.len());
         for idx in 0..moves.len() {
-            let mv = Self::pick_next_move(&mut moves, &mut stages, &mut scores, &mut sees, idx);
+            let mv = Self::pick_next_move(&mut moves, keys, idx);
             ordered.push(mv);
         }
 
@@ -1448,6 +1604,8 @@ impl Engine {
         color: Color,
         depth: u32,
         mv: Move,
+        alpha: i32,
+        beta: i32,
     ) -> Option<i32> {
         if self.stop_flag.load(Ordering::Relaxed) {
             return None;
@@ -1461,8 +1619,8 @@ impl Engine {
             &mut board,
             opposite(color),
             child_depth,
-            -MATE_VALUE,
-            MATE_VALUE,
+            -beta,
+            -alpha,
             1,
             Some(mv),
             true,
@@ -1476,64 +1634,84 @@ impl Engine {
         }
     }
 
-    fn search_root_parallel(&self, board: &Board, color: Color, depth: u32) -> Option<(Move, i32)> {
-        let root_moves = self.ordered_root_moves(board, color);
-        if root_moves.is_empty() {
-            return None;
-        }
+    /// Root search split across `workers` (kept alive across iterations so their
+    /// histories accumulate). The first (PV) move is searched alone, inside an aspiration
+    /// window around `guess` when available; the remaining moves are searched in parallel
+    /// with a null window around the shared best score and re-searched on fail high.
+    fn search_root_parallel(
+        workers: &mut [Engine],
+        board: &Board,
+        color: Color,
+        depth: u32,
+        guess: Option<i32>,
+    ) -> Option<(Move, i32)> {
+        const ASPIRATION: i32 = 40;
+        let root_moves = workers.first()?.ordered_root_moves(board, color);
+        let (&first, rest) = root_moves.split_first()?;
 
-        let worker_count = self.threads.max(1).min(root_moves.len());
-        if worker_count == 1 {
-            let mut worker = self.clone();
-            let mut best: Option<RootSearchResult> = None;
-            for (index, mv) in root_moves.iter().copied().enumerate() {
-                let score = worker.search_root_move(board, color, depth, mv)?;
-                let candidate = RootSearchResult { index, mv, score };
-                let replace = match best {
-                    Some(current) => {
-                        candidate.score > current.score
-                            || (candidate.score == current.score && candidate.index < current.index)
-                    }
-                    None => true,
-                };
-                if replace {
-                    best = Some(candidate);
-                }
+        let lead = &mut workers[0];
+        let mut first_score = None;
+        if let Some(g) = guess.filter(|_| depth >= 5) {
+            let (lo, hi) = (g - ASPIRATION, g + ASPIRATION);
+            let score = lead.search_root_move(board, color, depth, first, lo, hi)?;
+            if score > lo && score < hi {
+                first_score = Some(score);
             }
-            return best.map(|result| (result.mv, result.score));
+        }
+        let first_score = match first_score {
+            Some(score) => score,
+            None => lead.search_root_move(board, color, depth, first, -MATE_VALUE, MATE_VALUE)?,
+        };
+        if rest.is_empty() {
+            return Some((first, first_score));
         }
 
-        let root_moves = Arc::new(root_moves);
-        let next_index = Arc::new(AtomicUsize::new(0));
-        let history_base = self.search_history.clone();
-        let root_board = board.clone();
+        let shared_alpha = std::sync::atomic::AtomicI32::new(first_score);
+        let next_index = AtomicUsize::new(0);
+        let worker_count = workers.len().min(rest.len());
         let (tx, rx) = mpsc::channel();
 
         thread::scope(|scope| {
-            for _ in 0..worker_count {
+            for worker in workers.iter_mut().take(worker_count) {
                 let tx = tx.clone();
-                let root_moves = Arc::clone(&root_moves);
-                let next_index = Arc::clone(&next_index);
-                let history_base = history_base.clone();
-                let root_board = root_board.clone();
-                let mut worker = self.clone();
+                let shared_alpha = &shared_alpha;
+                let next_index = &next_index;
 
                 scope.spawn(move || {
-                    worker.search_history = history_base;
-
                     while !worker.stop_flag.load(Ordering::Relaxed) {
-                        let index = next_index.fetch_add(1, Ordering::Relaxed);
-                        if index >= root_moves.len() {
-                            break;
-                        }
-
-                        let mv = root_moves[index];
-                        let Some(score) = worker.search_root_move(&root_board, color, depth, mv)
-                        else {
+                        let offset = next_index.fetch_add(1, Ordering::Relaxed);
+                        let Some(&mv) = rest.get(offset) else {
                             break;
                         };
 
-                        if tx.send(RootSearchResult { index, mv, score }).is_err() {
+                        let alpha = shared_alpha.load(Ordering::Relaxed);
+                        let Some(mut score) =
+                            worker.search_root_move(board, color, depth, mv, alpha, alpha + 1)
+                        else {
+                            break;
+                        };
+                        let mut exact = false;
+                        if score > alpha {
+                            let alpha = shared_alpha.load(Ordering::Relaxed);
+                            let Some(full) =
+                                worker.search_root_move(board, color, depth, mv, alpha, MATE_VALUE)
+                            else {
+                                break;
+                            };
+                            score = full;
+                            if score > alpha {
+                                exact = true;
+                                shared_alpha.fetch_max(score, Ordering::Relaxed);
+                            }
+                        }
+
+                        let result = RootSearchResult {
+                            index: offset + 1,
+                            mv,
+                            score,
+                            exact,
+                        };
+                        if tx.send(result).is_err() {
                             break;
                         }
                     }
@@ -1543,24 +1721,25 @@ impl Engine {
             drop(tx);
 
             let mut completed = 0usize;
-            let mut best: Option<RootSearchResult> = None;
+            let mut best = RootSearchResult {
+                index: 0,
+                mv: first,
+                score: first_score,
+                exact: true,
+            };
 
             while let Ok(result) = rx.recv() {
                 completed += 1;
-                let replace = match best {
-                    Some(current) => {
-                        result.score > current.score
-                            || (result.score == current.score && result.index < current.index)
-                    }
-                    None => true,
-                };
-                if replace {
-                    best = Some(result);
+                if result.exact
+                    && (result.score > best.score
+                        || (result.score == best.score && result.index < best.index))
+                {
+                    best = result;
                 }
             }
 
-            if completed == root_moves.len() {
-                best.map(|result| (result.mv, result.score))
+            if completed == rest.len() {
+                Some((best.mv, best.score))
             } else {
                 None
             }
@@ -1575,6 +1754,20 @@ impl Engine {
         self.stop_ponder();
         self.reset_stop();
         self.search_with_current_stop_flag(game, config, true)
+    }
+
+    /// Like `best_move_timed`, but lets the caller disable the opening book and
+    /// supply the stop flag, so another thread (e.g. a UCI `stop`) can end the search.
+    pub fn best_move_timed_opts(
+        &mut self,
+        game: &mut Game,
+        config: &TimeConfig,
+        allow_book: bool,
+        stop_flag: Arc<AtomicBool>,
+    ) -> Option<((String, String), u32)> {
+        self.stop_ponder();
+        self.stop_flag = stop_flag;
+        self.search_with_current_stop_flag(game, config, allow_book)
     }
 
     fn should_use_parallel_search(config: &TimeConfig, max_depth: u32) -> bool {
@@ -1624,6 +1817,7 @@ impl Engine {
 
         self.search_history = game.hash_history.clone();
         self.search_history.pop();
+        self.age_histories();
 
         for d in 1..=max_depth {
             if let Some(ref tm) = self.time_manager {
@@ -1685,12 +1879,6 @@ impl Engine {
                 if let Some(entry) = self.tt.get(root_hash) {
                     if let Some(mv) = self.find_tt_move(&game.board, color, entry.best) {
                         best_move = Some(mv);
-                    } else if let Some((fs, ts)) = entry.best {
-                        let f_str = Board::index_to_algebraic((fs % 8) as usize, (fs / 8) as usize)
-                            .unwrap();
-                        let t_str = Board::index_to_algebraic((ts % 8) as usize, (ts / 8) as usize)
-                            .unwrap();
-                        best_move = Some(self.string_to_move(&game.board, &f_str, &t_str));
                     }
                 }
                 break;
@@ -1732,6 +1920,11 @@ impl Engine {
 
         self.search_history = game.hash_history.clone();
         self.search_history.pop();
+        self.age_histories();
+
+        // Workers live for the whole search so their histories and killers carry over
+        // between iterations; the first worker's tables are kept for the next search.
+        let mut workers: Vec<Engine> = (0..self.threads.max(1)).map(|_| self.clone()).collect();
 
         for d in 1..=max_depth {
             if let Some(ref tm) = self.time_manager {
@@ -1754,7 +1947,8 @@ impl Engine {
                 .as_ref()
                 .map(|tm| tm.elapsed_ms())
                 .unwrap_or(0);
-            let result = self.search_root_parallel(&game.board, color, d);
+            let result =
+                Self::search_root_parallel(&mut workers, &game.board, color, d, last_score);
             let Some((mv, score)) = result else {
                 break;
             };
@@ -1765,7 +1959,7 @@ impl Engine {
                     depth: d,
                     value: Self::score_to_tt(score, 0),
                     bound: Bound::Exact,
-                    best: Some((mv.from_sq(), mv.to_sq())),
+                    best: Some(mv),
                 },
             );
 
@@ -1783,6 +1977,12 @@ impl Engine {
             if self.stop_flag.load(Ordering::Relaxed) {
                 break;
             }
+        }
+
+        if let Some(lead) = workers.first_mut() {
+            self.quiet_history = lead.quiet_history;
+            self.capture_history = lead.capture_history;
+            self.cont_history = std::mem::take(&mut lead.cont_history);
         }
 
         best_move.map(|m| (Self::move_to_strings(m), reached_depth))
@@ -1825,6 +2025,18 @@ fn opposite(c: Color) -> Color {
 mod tests {
     use super::*;
     use crate::pieces::Piece;
+
+    #[test]
+    fn lmr_uses_history_without_exceeding_child_depth() {
+        let base = Engine::lmr_value(8, 12);
+        let favored = Engine::lmr_reduction(8, 12, 8_192);
+        let disfavored = Engine::lmr_reduction(8, 12, -8_192);
+
+        assert_eq!(favored, base - 1);
+        assert_eq!(disfavored, base + 1);
+        assert_eq!(Engine::lmr_reduction(3, 4, -16_384), 1);
+        assert_eq!(Engine::lmr_reduction(8, 12, i32::MAX), base - 1);
+    }
 
     fn setup_game() -> Game {
         Game::new()
@@ -2409,16 +2621,28 @@ mod tests {
         let mut engine = Engine::new(1);
         let hash = board.hash(Color::White);
 
-        engine.search_history = vec![hash];
+        // A position can only recur an even number (>= 4) of plies later.
+        let cycle = [hash, 1, 2, 3];
+        engine.search_history = cycle.to_vec();
         assert!(
-            !engine.is_repetition_draw(hash),
-            "One prior occurrence should not be treated as a draw"
+            !engine.is_repetition_draw(hash, 0),
+            "One prior occurrence before the root should not be treated as a draw"
+        );
+        assert!(
+            engine.is_repetition_draw(hash, 5),
+            "One prior occurrence inside the search tree is a draw"
         );
 
-        engine.search_history.push(hash);
+        engine.search_history.extend_from_slice(&cycle);
         assert!(
-            engine.is_repetition_draw(hash),
+            engine.is_repetition_draw(hash, 0),
             "Two prior occurrences should trigger a repetition draw"
+        );
+
+        engine.rep_floor = 1;
+        assert!(
+            !engine.is_repetition_draw(hash, 0),
+            "Positions before the last irreversible move cannot repeat"
         );
     }
 

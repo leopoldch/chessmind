@@ -1,4 +1,4 @@
-use crate::attacks::{bishop_attacks, rook_attacks};
+use crate::attacks::{between_mask, bishop_attacks, rook_attacks};
 use crate::board::{Board, color_idx, piece_index};
 use crate::eval_cache::{EVAL_CACHE, PAWN_CACHE, pawn_hash};
 use crate::movegen::{KING_TABLE, KNIGHT_TABLE};
@@ -248,6 +248,112 @@ const OPPOSITE_BISHOPS_SCALE_DEN: i32 = 4;
 
 const TEMPO_BONUS: i32 = 15;
 
+const FILE_A: u64 = 0x0101010101010101;
+const FILE_H: u64 = 0x8080808080808080;
+
+const fn file_mask(file: usize) -> u64 {
+    FILE_A << file
+}
+
+/// Squares on the files directly left and right of `file`.
+const ADJACENT_FILES: [u64; 8] = {
+    let mut table = [0u64; 8];
+    let mut file = 0;
+    while file < 8 {
+        if file > 0 {
+            table[file] |= file_mask(file - 1);
+        }
+        if file < 7 {
+            table[file] |= file_mask(file + 1);
+        }
+        file += 1;
+    }
+    table
+};
+
+/// Squares of ranks `lo..hi` (exclusive upper bound).
+const fn ranks_mask(lo: usize, hi: usize) -> u64 {
+    let mut mask = 0u64;
+    let mut r = lo;
+    while r < hi {
+        mask |= 0xFFu64 << (r * 8);
+        r += 1;
+    }
+    mask
+}
+
+/// Squares at (rank, file - 1) and (rank, file + 1), if on the board.
+const fn side_squares(rank: usize, file: usize) -> u64 {
+    let mut mask = 0u64;
+    if file > 0 {
+        mask |= 1u64 << (rank * 8 + file - 1);
+    }
+    if file < 7 {
+        mask |= 1u64 << (rank * 8 + file + 1);
+    }
+    mask
+}
+
+/// Precomputed pawn-structure masks indexed by `[color][square]`
+/// (color 0 = white, 1 = black) or by `[square]`.
+struct PawnMasks {
+    /// Own pawns on adjacent files within one rank (connected-passer check).
+    neighbor: [u64; 64],
+    /// Own pawns on adjacent files at or behind the pawn's rank support it.
+    backward_support: [[u64; 64]; 2],
+    /// Enemy pawns here attack the pawn's advance square.
+    backward_attack: [[u64; 64]; 2],
+    /// Own pawns here defend a knight on the square.
+    outpost_support: [[u64; 64]; 2],
+    /// Enemy pawns here could eventually attack a knight on the square.
+    outpost_attack: [[u64; 64]; 2],
+}
+
+static PAWN_MASKS: PawnMasks = {
+    let mut m = PawnMasks {
+        neighbor: [0; 64],
+        backward_support: [[0; 64]; 2],
+        backward_attack: [[0; 64]; 2],
+        outpost_support: [[0; 64]; 2],
+        outpost_attack: [[0; 64]; 2],
+    };
+    let mut sq = 0;
+    while sq < 64 {
+        let file = sq % 8;
+        let rank = sq / 8;
+        let adj = ADJACENT_FILES[file];
+        let white_front = ranks_mask(rank + 1, 8);
+        let black_front = ranks_mask(0, rank);
+
+        let lo = if rank > 0 { rank - 1 } else { 0 };
+        let hi = if rank < 7 { rank + 2 } else { 8 };
+        m.neighbor[sq] = adj & ranks_mask(lo, hi);
+
+        m.backward_support[0][sq] = adj & ranks_mask(0, rank + 1);
+        m.backward_support[1][sq] = adj & ranks_mask(rank, 8);
+
+        if rank < 6 {
+            m.backward_attack[0][sq] = side_squares(rank + 2, file);
+        }
+        if rank > 1 {
+            m.backward_attack[1][sq] = side_squares(rank - 2, file);
+        }
+
+        if rank > 0 {
+            m.outpost_support[0][sq] = side_squares(rank - 1, file);
+        }
+        if rank < 7 {
+            m.outpost_support[1][sq] = side_squares(rank + 1, file);
+        }
+
+        m.outpost_attack[0][sq] = adj & white_front;
+        m.outpost_attack[1][sq] = adj & black_front;
+
+        sq += 1;
+    }
+    m
+};
+
 #[inline(always)]
 pub(crate) fn piece_eval_delta(piece: Piece, sq: usize) -> (i32, i32, i32) {
     let idx = piece_index(piece.piece_type);
@@ -313,6 +419,13 @@ impl<'a> Evaluator<'a> {
             return 0;
         }
 
+        self.evaluate_non_drawn()
+    }
+
+    /// Full evaluation (using the pawn cache), assuming the caller has already
+    /// ruled out `is_drawn_endgame`.
+    #[inline(always)]
+    fn evaluate_non_drawn(&self) -> i32 {
         let mut score = Score::ZERO;
 
         score += self.eval_material_and_pst();
@@ -382,6 +495,7 @@ impl<'a> Evaluator<'a> {
         let mut score = Score::ZERO;
         let mut pawns = own_pawns;
         let own_pawn_attacks = Self::pawn_attack_map(color, own_pawns);
+        let passers = Self::passed_pawns(color, own_pawns, enemy_pawns);
 
         while pawns != 0 {
             let sq = pawns.trailing_zeros() as u8;
@@ -392,22 +506,16 @@ impl<'a> Evaluator<'a> {
                 7 - Square::rank(sq) as usize
             };
 
-            let file_mask = 0x0101010101010101u64 << file;
-            let pawns_on_file = (own_pawns & file_mask).count_ones();
+            let pawns_on_file = (own_pawns & file_mask(file)).count_ones();
             if pawns_on_file > 1 {
                 score -= DOUBLED_PAWN_PENALTY;
             }
 
-            let adjacent_files = match file {
-                0 => 0x0202020202020202u64,
-                7 => 0x4040404040404040u64,
-                _ => (0x0101010101010101u64 << (file - 1)) | (0x0101010101010101u64 << (file + 1)),
-            };
-            if (own_pawns & adjacent_files) == 0 {
+            if (own_pawns & ADJACENT_FILES[file]) == 0 {
                 score -= ISOLATED_PAWN_PENALTY;
             }
 
-            if self.is_passed_pawn(sq, color, enemy_pawns) {
+            if (passers & (1u64 << sq)) != 0 {
                 let bonus = Score::new(PASSED_PAWN_BONUS_MG[rank], PASSED_PAWN_BONUS_EG[rank]);
                 score += bonus;
 
@@ -442,31 +550,28 @@ impl<'a> Evaluator<'a> {
         enemy_pawns: u64,
     ) -> Score {
         let mut score = Score::ZERO;
-        let mut pawns = own_pawns;
+        let mut passers = Self::passed_pawns(color, own_pawns, enemy_pawns);
 
-        while pawns != 0 {
-            let sq = pawns.trailing_zeros() as u8;
+        while passers != 0 {
+            let sq = passers.trailing_zeros() as u8;
+            let rank = if color == Color::White {
+                Square::rank(sq) as usize
+            } else {
+                7 - Square::rank(sq) as usize
+            };
 
-            if self.is_passed_pawn(sq, color, enemy_pawns) {
-                let rank = if color == Color::White {
-                    Square::rank(sq) as usize
-                } else {
-                    7 - Square::rank(sq) as usize
-                };
-
-                if let Some(stop_sq) = Self::advance_square(sq, color) {
-                    if (self.occupied & (1u64 << stop_sq)) != 0 {
-                        score -= Score::new(
-                            BLOCKED_PASSED_PAWN_PENALTY_MG[rank],
-                            BLOCKED_PASSED_PAWN_PENALTY_EG[rank],
-                        );
-                    }
+            if let Some(stop_sq) = Self::advance_square(sq, color) {
+                if (self.occupied & (1u64 << stop_sq)) != 0 {
+                    score -= Score::new(
+                        BLOCKED_PASSED_PAWN_PENALTY_MG[rank],
+                        BLOCKED_PASSED_PAWN_PENALTY_EG[rank],
+                    );
                 }
-
-                score += self.eval_passed_pawn_rook_support(color, sq);
             }
 
-            pawns &= pawns - 1;
+            score += self.eval_passed_pawn_rook_support(color, sq);
+
+            passers &= passers - 1;
         }
 
         score
@@ -493,120 +598,43 @@ impl<'a> Evaluator<'a> {
         }
     }
 
-    fn is_passed_pawn(&self, sq: u8, color: Color, enemy_pawns: u64) -> bool {
-        let file = Square::file(sq) as usize;
-        let rank = Square::rank(sq) as usize;
-
-        let mut mask = 0u64;
-
-        match color {
+    /// Own pawns with no enemy pawn in front of them on the same or an
+    /// adjacent file.
+    #[inline(always)]
+    fn passed_pawns(color: Color, own_pawns: u64, enemy_pawns: u64) -> u64 {
+        // Squares strictly behind each enemy pawn (from the enemy's point of
+        // view) on its own file, then widened to the adjacent files.
+        let mut span = match color {
             Color::White => {
-                for r in (rank + 1)..8 {
-                    for f in file.saturating_sub(1)..=(file + 1).min(7) {
-                        mask |= 1u64 << (r * 8 + f);
-                    }
-                }
+                let mut s = enemy_pawns >> 8;
+                s |= s >> 8;
+                s |= s >> 16;
+                s |= s >> 32;
+                s
             }
             Color::Black => {
-                for r in 0..rank {
-                    for f in file.saturating_sub(1)..=(file + 1).min(7) {
-                        mask |= 1u64 << (r * 8 + f);
-                    }
-                }
+                let mut s = enemy_pawns << 8;
+                s |= s << 8;
+                s |= s << 16;
+                s |= s << 32;
+                s
             }
-        }
-
-        (enemy_pawns & mask) == 0
+        };
+        span |= ((span & !FILE_A) >> 1) | ((span & !FILE_H) << 1);
+        own_pawns & !span
     }
 
+    #[inline(always)]
     fn has_adjacent_pawn(&self, sq: u8, _color: Color, own_pawns: u64) -> bool {
-        let file = Square::file(sq) as usize;
-        let rank = Square::rank(sq) as usize;
-
-        for f in file.saturating_sub(1)..=(file + 1).min(7) {
-            if f == file {
-                continue;
-            }
-            for r in rank.saturating_sub(1)..=(rank + 1).min(7) {
-                let check_sq = r * 8 + f;
-                if (own_pawns & (1u64 << check_sq)) != 0 {
-                    return true;
-                }
-            }
-        }
-        false
+        (own_pawns & PAWN_MASKS.neighbor[sq as usize]) != 0
     }
 
+    #[inline(always)]
     fn is_backward_pawn(&self, sq: u8, color: Color, own_pawns: u64, enemy_pawns: u64) -> bool {
-        let file = Square::file(sq) as usize;
-        let rank = Square::rank(sq) as usize;
-
-        let _support_files = match file {
-            0 => 0x0202020202020202u64,
-            7 => 0x4040404040404040u64,
-            _ => (0x0101010101010101u64 << (file - 1)) | (0x0101010101010101u64 << (file + 1)),
-        };
-
-        let support_mask = match color {
-            Color::White => {
-                let mut m = 0u64;
-                for r in 0..=rank {
-                    for f in file.saturating_sub(1)..=(file + 1).min(7) {
-                        if f != file {
-                            m |= 1u64 << (r * 8 + f);
-                        }
-                    }
-                }
-                m
-            }
-            Color::Black => {
-                let mut m = 0u64;
-                for r in rank..8 {
-                    for f in file.saturating_sub(1)..=(file + 1).min(7) {
-                        if f != file {
-                            m |= 1u64 << (r * 8 + f);
-                        }
-                    }
-                }
-                m
-            }
-        };
-
-        if (own_pawns & support_mask) == 0 {
-            let advance_sq = match color {
-                Color::White if rank < 7 => Some((rank + 1) * 8 + file),
-                Color::Black if rank > 0 => Some((rank - 1) * 8 + file),
-                _ => None,
-            };
-
-            if let Some(_adv) = advance_sq {
-                let enemy_attacks = match color {
-                    Color::White => {
-                        let mut attacks = 0u64;
-                        if file > 0 && rank < 6 {
-                            attacks |= 1u64 << ((rank + 2) * 8 + file - 1);
-                        }
-                        if file < 7 && rank < 6 {
-                            attacks |= 1u64 << ((rank + 2) * 8 + file + 1);
-                        }
-                        attacks
-                    }
-                    Color::Black => {
-                        let mut attacks = 0u64;
-                        if file > 0 && rank > 1 {
-                            attacks |= 1u64 << ((rank - 2) * 8 + file - 1);
-                        }
-                        if file < 7 && rank > 1 {
-                            attacks |= 1u64 << ((rank - 2) * 8 + file + 1);
-                        }
-                        attacks
-                    }
-                };
-                return (enemy_pawns & enemy_attacks) != 0;
-            }
-        }
-
-        false
+        let cidx = color_idx(color);
+        let sq = sq as usize;
+        (own_pawns & PAWN_MASKS.backward_support[cidx][sq]) == 0
+            && (enemy_pawns & PAWN_MASKS.backward_attack[cidx][sq]) != 0
     }
 
     fn eval_pieces(&self) -> Score {
@@ -619,19 +647,22 @@ impl<'a> Evaluator<'a> {
             score -= BISHOP_PAIR_BONUS;
         }
 
-        score += self.eval_rooks(Color::White);
-        score -= self.eval_rooks(Color::Black);
-
-        score += self.eval_knight_outposts(Color::White);
-        score -= self.eval_knight_outposts(Color::Black);
-
-        score += self.eval_piece_activity_for_color(Color::White);
-        score -= self.eval_piece_activity_for_color(Color::Black);
+        score += self.eval_pieces_for_color::<true>(Color::White);
+        score -= self.eval_pieces_for_color::<true>(Color::Black);
 
         score
     }
 
+    #[cfg(test)]
     fn eval_piece_activity_for_color(&self, color: Color) -> Score {
+        self.eval_pieces_for_color::<false>(color)
+    }
+
+    /// Mobility and king-zone pressure for knights, bishops, rooks and queens.
+    /// With `FULL`, also knight outposts and rook file / 7th-rank terms, so
+    /// each piece set is walked only once.
+    #[inline(always)]
+    fn eval_pieces_for_color<const FULL: bool>(&self, color: Color) -> Score {
         let mut score = Score::ZERO;
         let cidx = color_idx(color);
         let own_occ = if color == Color::White {
@@ -639,6 +670,8 @@ impl<'a> Evaluator<'a> {
         } else {
             self.black_pieces
         };
+        let own_pawns = self.board.bitboards[cidx][0];
+        let enemy_pawns = self.board.bitboards[1 - cidx][0];
         let enemy_king = self.board.bitboards[1 - cidx][5];
         let enemy_king_zone = if enemy_king != 0 {
             let enemy_king_sq = enemy_king.trailing_zeros() as usize;
@@ -647,131 +680,30 @@ impl<'a> Evaluator<'a> {
             0
         };
 
-        for pt in 1..=4 {
-            let mut bb = self.board.bitboards[cidx][pt];
-            while bb != 0 {
-                let sq = bb.trailing_zeros() as u8;
-                let attacks = self.attacks_for_piece(pt, sq) & !own_occ;
-                let mobility = attacks.count_ones() as i32;
-                score += MOBILITY_BONUS[pt] * mobility;
-
-                if enemy_king_zone != 0 {
-                    let pressure = (attacks & enemy_king_zone).count_ones() as i32;
-                    score += KING_ZONE_ATTACK_BONUS[pt] * pressure;
-                }
-
-                bb &= bb - 1;
+        let activity = |pt: usize, attacks: u64| -> Score {
+            let attacks = attacks & !own_occ;
+            let mut s = MOBILITY_BONUS[pt] * attacks.count_ones() as i32;
+            if enemy_king_zone != 0 {
+                s += KING_ZONE_ATTACK_BONUS[pt] * (attacks & enemy_king_zone).count_ones() as i32;
             }
-        }
+            s
+        };
 
-        score
-    }
-
-    fn eval_rooks(&self, color: Color) -> Score {
-        let mut score = Score::ZERO;
-        let cidx = color_idx(color);
-        let own_pawns = self.board.bitboards[cidx][0];
-        let enemy_pawns = self.board.bitboards[1 - cidx][0];
-        let rooks = self.board.bitboards[cidx][3];
-
-        let mut bb = rooks;
+        let mut bb = self.board.bitboards[cidx][1];
         while bb != 0 {
             let sq = bb.trailing_zeros() as usize;
-            let file = sq % 8;
-            let rank = sq / 8;
+            score += activity(1, KNIGHT_TABLE[sq]);
 
-            let file_mask = 0x0101010101010101u64 << file;
-
-            if (own_pawns & file_mask) == 0 && (enemy_pawns & file_mask) == 0 {
-                score += ROOK_OPEN_FILE_BONUS;
-            } else if (own_pawns & file_mask) == 0 {
-                score += ROOK_SEMI_OPEN_FILE_BONUS;
-            }
-
-            let seventh = if color == Color::White { 6 } else { 1 };
-            if rank == seventh {
-                score += ROOK_ON_7TH_BONUS;
-            }
-
-            bb &= bb - 1;
-        }
-
-        score
-    }
-
-    fn eval_knight_outposts(&self, color: Color) -> Score {
-        let mut score = Score::ZERO;
-        let cidx = color_idx(color);
-        let own_pawns = self.board.bitboards[cidx][0];
-        let enemy_pawns = self.board.bitboards[1 - cidx][0];
-        let knights = self.board.bitboards[cidx][1];
-
-        let mut bb = knights;
-        while bb != 0 {
-            let sq = bb.trailing_zeros() as usize;
-            let file = sq % 8;
-            let rank = sq / 8;
-
-            let in_enemy_territory = match color {
-                Color::White => rank >= 4,
-                Color::Black => rank <= 3,
-            };
-
-            if in_enemy_territory {
-                let supported = match color {
-                    Color::White => {
-                        let support_mask = if file > 0 && rank > 0 {
-                            1u64 << ((rank - 1) * 8 + file - 1)
-                        } else {
-                            0
-                        } | if file < 7 && rank > 0 {
-                            1u64 << ((rank - 1) * 8 + file + 1)
-                        } else {
-                            0
-                        };
-                        (own_pawns & support_mask) != 0
-                    }
-                    Color::Black => {
-                        let support_mask = if file > 0 && rank < 7 {
-                            1u64 << ((rank + 1) * 8 + file - 1)
-                        } else {
-                            0
-                        } | if file < 7 && rank < 7 {
-                            1u64 << ((rank + 1) * 8 + file + 1)
-                        } else {
-                            0
-                        };
-                        (own_pawns & support_mask) != 0
-                    }
+            if FULL {
+                let rank = sq / 8;
+                let in_enemy_territory = match color {
+                    Color::White => rank >= 4,
+                    Color::Black => rank <= 3,
                 };
-
-                let adjacent_files = match file {
-                    0 => 0x0202020202020202u64,
-                    7 => 0x4040404040404040u64,
-                    _ => {
-                        (0x0101010101010101u64 << (file - 1))
-                            | (0x0101010101010101u64 << (file + 1))
-                    }
-                };
-
-                let cant_be_attacked = match color {
-                    Color::White => {
-                        let mut attack_mask = 0u64;
-                        for r in (rank + 1)..8 {
-                            attack_mask |= adjacent_files & (0xFFu64 << (r * 8));
-                        }
-                        (enemy_pawns & attack_mask) == 0
-                    }
-                    Color::Black => {
-                        let mut attack_mask = 0u64;
-                        for r in 0..rank {
-                            attack_mask |= adjacent_files & (0xFFu64 << (r * 8));
-                        }
-                        (enemy_pawns & attack_mask) == 0
-                    }
-                };
-
-                if supported && cant_be_attacked {
+                if in_enemy_territory
+                    && (own_pawns & PAWN_MASKS.outpost_support[cidx][sq]) != 0
+                    && (enemy_pawns & PAWN_MASKS.outpost_attack[cidx][sq]) == 0
+                {
                     score += KNIGHT_OUTPOST_BONUS;
                 }
             }
@@ -779,29 +711,54 @@ impl<'a> Evaluator<'a> {
             bb &= bb - 1;
         }
 
-        score
-    }
-
-    #[inline(always)]
-    fn attacks_for_piece(&self, pt: usize, sq: u8) -> u64 {
-        match pt {
-            1 => KNIGHT_TABLE[sq as usize],
-            2 => bishop_attacks(sq as usize, self.occupied),
-            3 => rook_attacks(sq as usize, self.occupied),
-            4 => {
-                bishop_attacks(sq as usize, self.occupied)
-                    | rook_attacks(sq as usize, self.occupied)
-            }
-            _ => 0,
+        let mut bb = self.board.bitboards[cidx][2];
+        while bb != 0 {
+            let sq = bb.trailing_zeros() as usize;
+            score += activity(2, bishop_attacks(sq, self.occupied));
+            bb &= bb - 1;
         }
+
+        let seventh = if color == Color::White { 6 } else { 1 };
+        let mut bb = self.board.bitboards[cidx][3];
+        while bb != 0 {
+            let sq = bb.trailing_zeros() as usize;
+            score += activity(3, rook_attacks(sq, self.occupied));
+
+            if FULL {
+                let file_bb = file_mask(sq % 8);
+                if (own_pawns & file_bb) == 0 && (enemy_pawns & file_bb) == 0 {
+                    score += ROOK_OPEN_FILE_BONUS;
+                } else if (own_pawns & file_bb) == 0 {
+                    score += ROOK_SEMI_OPEN_FILE_BONUS;
+                }
+
+                if sq / 8 == seventh {
+                    score += ROOK_ON_7TH_BONUS;
+                }
+            }
+
+            bb &= bb - 1;
+        }
+
+        let mut bb = self.board.bitboards[cidx][4];
+        while bb != 0 {
+            let sq = bb.trailing_zeros() as usize;
+            score += activity(
+                4,
+                bishop_attacks(sq, self.occupied) | rook_attacks(sq, self.occupied),
+            );
+            bb &= bb - 1;
+        }
+
+        score
     }
 
     fn eval_passed_pawn_rook_support(&self, color: Color, pawn_sq: u8) -> Score {
         let cidx = color_idx(color);
-        let file_mask = 0x0101010101010101u64 << Square::file(pawn_sq);
+        let file_bb = file_mask(Square::file(pawn_sq) as usize);
         let mut score = Score::ZERO;
 
-        let mut own_rooks = self.board.bitboards[cidx][3] & file_mask;
+        let mut own_rooks = self.board.bitboards[cidx][3] & file_bb;
         while own_rooks != 0 {
             let rook_sq = own_rooks.trailing_zeros() as u8;
             if Self::is_rook_behind_passed_pawn(color, rook_sq, pawn_sq)
@@ -813,7 +770,7 @@ impl<'a> Evaluator<'a> {
             own_rooks &= own_rooks - 1;
         }
 
-        let mut enemy_rooks = self.board.bitboards[1 - cidx][3] & file_mask;
+        let mut enemy_rooks = self.board.bitboards[1 - cidx][3] & file_bb;
         while enemy_rooks != 0 {
             let rook_sq = enemy_rooks.trailing_zeros() as u8;
             if Self::is_rook_in_front_of_passed_pawn(color, rook_sq, pawn_sq)
@@ -852,23 +809,10 @@ impl<'a> Evaluator<'a> {
         }
     }
 
+    #[inline(always)]
     fn clear_file_between(&self, a: u8, b: u8) -> bool {
-        if Square::file(a) != Square::file(b) {
-            return false;
-        }
-
-        let file = Square::file(a);
-        let start = Square::rank(a).min(Square::rank(b)) + 1;
-        let end = Square::rank(a).max(Square::rank(b));
-
-        for rank in start..end {
-            let sq = Square::make(file, rank);
-            if (self.occupied & (1u64 << sq)) != 0 {
-                return false;
-            }
-        }
-
-        true
+        Square::file(a) == Square::file(b)
+            && (between_mask(a as usize, b as usize) & self.occupied) == 0
     }
 
     fn eval_king_safety(&self) -> Score {
@@ -963,7 +907,7 @@ impl<'a> Evaluator<'a> {
     }
 }
 
-#[inline]
+#[cfg(test)]
 pub(crate) fn evaluate_uncached(board: &Board) -> i32 {
     let evaluator = Evaluator::new(board);
     evaluator.evaluate_uncached()
@@ -975,7 +919,10 @@ pub fn evaluate(board: &Board, color: Color) -> i32 {
         return 0;
     }
 
-    let base = EVAL_CACHE.get_or_insert_with(board.hash, || evaluate_uncached(board));
+    // The pawn-structure cache returns exactly what the uncached computation
+    // would, so the search path uses it on eval-cache misses.
+    let base =
+        EVAL_CACHE.get_or_insert_with(board.hash, || Evaluator::new(board).evaluate_non_drawn());
 
     if color == Color::White {
         base + TEMPO_BONUS
@@ -1551,5 +1498,171 @@ mod tests {
         assert_eq!(cached_restored, uncached_restored);
         assert_eq!(cached_restored, cached_start);
         assert_ne!(mid_hash, start_hash);
+    }
+
+    // Straightforward loop-based versions of the pawn masks, kept as a
+    // reference for the precomputed tables and bitboard tricks.
+    fn ref_passed(sq: usize, color: Color, enemy: u64) -> bool {
+        let (file, rank) = (sq % 8, sq / 8);
+        let ranks = match color {
+            Color::White => (rank + 1)..8,
+            Color::Black => 0..rank,
+        };
+        let mut mask = 0u64;
+        for r in ranks {
+            for f in file.saturating_sub(1)..=(file + 1).min(7) {
+                mask |= 1u64 << (r * 8 + f);
+            }
+        }
+        enemy & mask == 0
+    }
+
+    fn ref_adjacent(sq: usize, own: u64) -> bool {
+        let (file, rank) = (sq % 8, sq / 8);
+        for f in file.saturating_sub(1)..=(file + 1).min(7) {
+            if f == file {
+                continue;
+            }
+            for r in rank.saturating_sub(1)..=(rank + 1).min(7) {
+                if own & (1u64 << (r * 8 + f)) != 0 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn ref_backward(sq: usize, color: Color, own: u64, enemy: u64) -> bool {
+        let (file, rank) = (sq % 8, sq / 8);
+        let ranks = match color {
+            Color::White => 0..(rank + 1),
+            Color::Black => rank..8,
+        };
+        let mut support = 0u64;
+        for r in ranks {
+            for f in file.saturating_sub(1)..=(file + 1).min(7) {
+                if f != file {
+                    support |= 1u64 << (r * 8 + f);
+                }
+            }
+        }
+        if own & support != 0 {
+            return false;
+        }
+        let mut attacks = 0u64;
+        match color {
+            Color::White if rank < 6 => {
+                if file > 0 {
+                    attacks |= 1u64 << ((rank + 2) * 8 + file - 1);
+                }
+                if file < 7 {
+                    attacks |= 1u64 << ((rank + 2) * 8 + file + 1);
+                }
+            }
+            Color::Black if rank > 1 => {
+                if file > 0 {
+                    attacks |= 1u64 << ((rank - 2) * 8 + file - 1);
+                }
+                if file < 7 {
+                    attacks |= 1u64 << ((rank - 2) * 8 + file + 1);
+                }
+            }
+            _ => {}
+        }
+        enemy & attacks != 0
+    }
+
+    fn ref_outpost(sq: usize, color: Color, own: u64, enemy: u64) -> bool {
+        let (file, rank) = (sq % 8, sq / 8);
+        let support_rank = match color {
+            Color::White if rank > 0 => Some(rank - 1),
+            Color::Black if rank < 7 => Some(rank + 1),
+            _ => None,
+        };
+        let mut support = 0u64;
+        if let Some(r) = support_rank {
+            if file > 0 {
+                support |= 1u64 << (r * 8 + file - 1);
+            }
+            if file < 7 {
+                support |= 1u64 << (r * 8 + file + 1);
+            }
+        }
+        let ranks = match color {
+            Color::White => (rank + 1)..8,
+            Color::Black => 0..rank,
+        };
+        let mut attack = 0u64;
+        for r in ranks {
+            for f in [file.wrapping_sub(1), file + 1] {
+                if f < 8 {
+                    attack |= 1u64 << (r * 8 + f);
+                }
+            }
+        }
+        own & support != 0 && enemy & attack == 0
+    }
+
+    #[test]
+    fn test_pawn_masks_match_reference() {
+        let board = bare_board();
+        let mut eval = Evaluator::new(&board);
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        for _ in 0..4000 {
+            let density = next() % 3;
+            let mut own = next() & 0x00FF_FFFF_FFFF_FF00;
+            let mut enemy = next() & 0x00FF_FFFF_FFFF_FF00;
+            for _ in 0..density {
+                own &= next();
+                enemy &= next();
+            }
+            enemy &= !own;
+
+            for color in [Color::White, Color::Black] {
+                let cidx = color_idx(color);
+                let passers = Evaluator::passed_pawns(color, own, enemy);
+                for sq in 0..64usize {
+                    let bit = 1u64 << sq;
+                    if own & bit != 0 {
+                        assert_eq!(passers & bit != 0, ref_passed(sq, color, enemy));
+                    }
+                    assert_eq!(
+                        eval.has_adjacent_pawn(sq as u8, color, own),
+                        ref_adjacent(sq, own)
+                    );
+                    assert_eq!(
+                        eval.is_backward_pawn(sq as u8, color, own, enemy),
+                        ref_backward(sq, color, own, enemy),
+                        "backward sq={sq} color={color:?}"
+                    );
+                    let outpost = (own & PAWN_MASKS.outpost_support[cidx][sq]) != 0
+                        && (enemy & PAWN_MASKS.outpost_attack[cidx][sq]) == 0;
+                    assert_eq!(outpost, ref_outpost(sq, color, own, enemy));
+                }
+            }
+
+            eval.occupied = own | enemy;
+            for a in 0..64u8 {
+                for b in 0..64u8 {
+                    let expected = if Square::file(a) != Square::file(b) {
+                        false
+                    } else {
+                        let lo = Square::rank(a).min(Square::rank(b)) + 1;
+                        let hi = Square::rank(a).max(Square::rank(b));
+                        (lo..hi).all(|r| {
+                            eval.occupied & (1u64 << Square::make(Square::file(a), r)) == 0
+                        })
+                    };
+                    assert_eq!(eval.clear_file_between(a, b), expected);
+                }
+            }
+        }
     }
 }
