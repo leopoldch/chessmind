@@ -648,17 +648,6 @@ impl Engine {
         LMR_TABLE[(depth as usize).min(63)][idx.min(63)] as u32
     }
 
-    /// Adjusts late-move reductions using the quiet move's learned history.
-    /// Moves with positive history have earned a deeper search; moves with
-    /// negative history can be reduced one ply more. Keep at least one ply
-    /// for the child search.
-    #[inline(always)]
-    fn lmr_reduction(depth: u32, idx: usize, history_score: i32) -> u32 {
-        let base = Self::lmr_value(depth, idx) as i32;
-        let history_adjustment = (history_score / 8_192).clamp(-1, 1);
-        (base - history_adjustment).clamp(0, depth.saturating_sub(2) as i32) as u32
-    }
-
     fn probe_syzygy(&self, board: &Board, color: Color, ply: usize) -> Option<i32> {
         let tb = self.tb.as_ref()?;
         if board.piece_count_all() > tb.max_pieces() {
@@ -1415,11 +1404,7 @@ impl Engine {
                     let can_reduce =
                         !is_pv && depth > 2 && is_quiet && !in_check && !gives_check && idx >= 3;
                     let reduced_depth = if can_reduce {
-                        new_depth.saturating_sub(Self::lmr_reduction(
-                            depth,
-                            idx + 1,
-                            Self::key_score(keys[idx]),
-                        ))
+                        new_depth.saturating_sub(Self::lmr_value(depth, idx + 1))
                     } else {
                         new_depth
                     };
@@ -2025,18 +2010,6 @@ fn opposite(c: Color) -> Color {
 mod tests {
     use super::*;
     use crate::pieces::Piece;
-
-    #[test]
-    fn lmr_uses_history_without_exceeding_child_depth() {
-        let base = Engine::lmr_value(8, 12);
-        let favored = Engine::lmr_reduction(8, 12, 8_192);
-        let disfavored = Engine::lmr_reduction(8, 12, -8_192);
-
-        assert_eq!(favored, base - 1);
-        assert_eq!(disfavored, base + 1);
-        assert_eq!(Engine::lmr_reduction(3, 4, -16_384), 1);
-        assert_eq!(Engine::lmr_reduction(8, 12, i32::MAX), base - 1);
-    }
 
     fn setup_game() -> Game {
         Game::new()
