@@ -373,6 +373,7 @@ pub struct UndoState {
     pub prev_eval_mg: i32,
     pub prev_eval_eg: i32,
     pub prev_eval_phase: i32,
+    pub prev_halfmove: u16,
 }
 
 impl UndoState {

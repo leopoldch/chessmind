@@ -469,3 +469,120 @@ fn search_underpromotes_to_avoid_stalemate() {
         .expect("missing move");
     assert_eq!(result.0, ("c7".to_string(), "c8r".to_string()));
 }
+
+fn check_has_legal_move(board: &mut Board, color: Color, depth: u32, positions: &mut usize) {
+    let moves = legal_moves(board, color);
+    assert_eq!(
+        board.has_legal_move(color),
+        !moves.is_empty(),
+        "has_legal_move disagrees with the generator in {}",
+        board.to_fen(color)
+    );
+    *positions += 1;
+    if depth == 0 {
+        return;
+    }
+    for mv in moves {
+        let undo = board.make_move_fast(mv, color);
+        check_has_legal_move(board, opposite(color), depth - 1, positions);
+        board.unmake_move_fast(undo, color);
+    }
+}
+
+#[test]
+fn has_legal_move_matches_full_generation() {
+    let fens = [
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        // Stalemates, pins and en passant corner cases.
+        "k7/8/1Q6/8/8/8/8/7K b - - 0 1",
+        "7k/5Q2/6K1/8/8/8/8/8 b - - 0 1",
+        "8/8/8/KPp4r/8/8/8/7k w - c6 0 1",
+        "k7/P7/1K6/8/8/8/8/8 b - - 0 1",
+        "5k2/5P2/5K2/8/8/8/8/3r4 w - - 0 1",
+        "K7/1r6/2k5/8/8/8/8/8 w - - 0 1",
+    ];
+    let mut positions = 0;
+    for fen in fens {
+        let game = chessmind::fen::game_from_fen(fen).expect("valid FEN");
+        let mut board = game.board.clone();
+        check_has_legal_move(&mut board, game.current_turn, 3, &mut positions);
+    }
+    assert!(positions > 10_000);
+}
+
+/// White: Kh1, Qe3. Black: Ka8, Pb6. Qxb6 wins a pawn but stalemates; the
+/// quiescence search at the horizon must see the stalemate (depth 1).
+#[test]
+fn search_sees_stalemate_at_the_horizon() {
+    for depth in 1..=4 {
+        let mut game =
+            chessmind::fen::game_from_fen("k7/8/1p6/8/8/4Q3/8/7K w - - 0 1").expect("valid FEN");
+        let mut engine = Engine::new(depth);
+        let ((from, to), _) = engine
+            .best_move_timed(&mut game, &TimeConfig::fixed_depth(depth))
+            .expect("missing move");
+        assert_ne!(
+            (from.as_str(), to.as_str()),
+            ("e3", "b6"),
+            "depth {depth}: Qxb6 is stalemate"
+        );
+    }
+}
+
+#[test]
+fn halfmove_clock_follows_the_game_and_is_restored_by_unmake() {
+    let mut game = Game::new();
+    assert_eq!(game.board.halfmove, 0);
+    for (mv, expected) in [
+        ("g1f3", 1),
+        ("g8f6", 2),
+        ("f3g1", 3),
+        ("f6g8", 4),
+        ("e2e4", 0),
+    ] {
+        let (from, to) = mv.split_at(2);
+        assert!(game.make_move(from, to));
+        assert_eq!(game.board.halfmove, expected, "after {mv}");
+    }
+
+    let mut board = game.board.clone();
+    board.halfmove = 57;
+    for mv in legal_moves(&mut board, Color::Black) {
+        let undo = board.make_move_fast(mv, Color::Black);
+        let zeroing = mv.is_capture() || board.piece_type_idx_at(mv.to_sq()) == 0;
+        assert_eq!(board.halfmove, if zeroing { 0 } else { 58 });
+        board.unmake_move_fast(undo, Color::Black);
+        assert_eq!(board.halfmove, 57);
+    }
+}
+
+/// White (Kc3, Qh1, Pa2) against a bare king, with the halfmove clock at 99:
+/// every move except a pawn push draws by the fifty-move rule.
+#[test]
+fn search_respects_the_fifty_move_rule() {
+    for depth in 1..=6 {
+        let mut game =
+            chessmind::fen::game_from_fen("8/8/8/4k3/8/2K5/P7/7Q w - - 0 1").expect("valid FEN");
+        game.board.halfmove = 99;
+        let mut engine = Engine::new(depth);
+        let ((from, _), _) = engine
+            .best_move_timed(&mut game, &TimeConfig::fixed_depth(depth))
+            .expect("missing move");
+        assert_eq!(
+            from, "a2",
+            "depth {depth}: only a pawn move avoids the draw"
+        );
+    }
+
+    // Checkmate on the hundredth ply still wins: White Kg6, Qb1 v Kh8 (Qb8 mates).
+    let mut game =
+        chessmind::fen::game_from_fen("7k/8/6K1/8/8/8/8/1Q6 w - - 0 1").expect("valid FEN");
+    game.board.halfmove = 99;
+    let mut engine = Engine::new(3);
+    let ((from, to), _) = engine
+        .best_move_timed(&mut game, &TimeConfig::fixed_depth(3))
+        .expect("missing move");
+    assert_eq!((from.as_str(), to.as_str()), ("b1", "b8"));
+}

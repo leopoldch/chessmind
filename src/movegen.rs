@@ -620,6 +620,97 @@ pub fn generate_evasions_fast(board: &mut Board, color: Color, list: &mut MoveLi
     generate_legal_moves_with_mode(board, color, list, mode, &ctx);
 }
 
+/// Whether `color` has at least one legal move. Stops at the first one found and
+/// never builds a move list, so it is much cheaper than a full generation when
+/// the king can move (the usual case). Castling is not tried: a legal castle
+/// implies a legal king step to the adjacent square.
+pub fn has_legal_move(board: &mut Board, color: Color) -> bool {
+    let ctx = LegalityContext::new(board, color);
+    if ctx.king_bb == 0 {
+        let mut list = MoveList::new();
+        generate_legal_moves_with_mode(board, color, &mut list, MoveGenMode::All, &ctx);
+        return !list.is_empty();
+    }
+
+    let cidx = color_idx(color);
+    let opp = opposite_color(color);
+    let occ_self = board.all_pieces(color);
+    let occ_opp = board.all_pieces(opp);
+    let occ_all = occ_self | occ_opp;
+
+    let occ_no_king = occ_all & !ctx.king_bb;
+    let mut king_targets = KING_TABLE[ctx.king_sq] & !occ_self;
+    while king_targets != 0 {
+        let to = king_targets.trailing_zeros() as u8;
+        king_targets &= king_targets - 1;
+        if !board.is_square_attacked_by_occ(to, opp, occ_no_king) {
+            return true;
+        }
+    }
+    if ctx.checkers.count_ones() > 1 {
+        return false;
+    }
+
+    let target_mask = if ctx.checkers != 0 {
+        ctx.evasion_mask
+    } else {
+        !0u64
+    };
+    let own = board.bitboards[cidx];
+    let ep_bb = ep_mask(board.en_passant);
+
+    let mut pawns = own[piece_index(PieceType::Pawn)];
+    while pawns != 0 {
+        let sq = pawns.trailing_zeros() as usize;
+        pawns &= pawns - 1;
+        let targets = pawn_moves(sq, color, occ_all, occ_opp, board.en_passant) & !occ_self;
+        let ep_targets = targets & ep_bb & !occ_opp;
+        let mut normal = targets & !ep_targets & target_mask;
+        if (ctx.pinned >> sq) & 1 != 0 {
+            normal &= ctx.pin_ray_of(sq as u8);
+        }
+        if normal != 0 {
+            return true;
+        }
+        if ep_targets != 0 && ((sq ^ ep_targets.trailing_zeros() as usize) & 7) != 0 {
+            let mv = Move::new(
+                sq as u8,
+                ep_targets.trailing_zeros() as u8,
+                Move::FLAG_EP_CAPTURE,
+            );
+            if board.is_generated_move_legal(mv, color) {
+                return true;
+            }
+        }
+    }
+
+    let queens = own[piece_index(PieceType::Queen)];
+    let sliders_and_knights = [
+        (own[piece_index(PieceType::Knight)], 0u8),
+        (own[piece_index(PieceType::Bishop)] | queens, 1),
+        (own[piece_index(PieceType::Rook)] | queens, 2),
+    ];
+    for (mut bb, kind) in sliders_and_knights {
+        while bb != 0 {
+            let sq = bb.trailing_zeros() as usize;
+            bb &= bb - 1;
+            let mut targets = match kind {
+                0 => KNIGHT_TABLE[sq],
+                1 => bishop_attacks(sq, occ_all),
+                _ => rook_attacks(sq, occ_all),
+            } & !occ_self
+                & target_mask;
+            if (ctx.pinned >> sq) & 1 != 0 {
+                targets &= ctx.pin_ray_of(sq as u8);
+            }
+            if targets != 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1604,5 +1695,5 @@ pub(crate) mod perft_tests {
 
     // Captures-only lists emit queen promotions only (under-promotions are
     // skipped), which is folded into this signature.
-    const EXPECTED_SIGNATURE: u64 = 0x1ace0a0692f04604;
+    const EXPECTED_SIGNATURE: u64 = 0xcadf066bb15f743c;
 }

@@ -52,6 +52,13 @@ impl TimeConfig {
     }
 }
 
+/// Time allocation for one search.
+///
+/// * `soft_time_ms`: no new iteration is started past this point (it is stretched
+///   when the best move or the score is unstable, see `should_continue_iterating`),
+///   and none is started when the previous one suggests it could not finish in time.
+/// * `hard_time_ms`: the only limit that aborts an iteration in progress. It is
+///   already net of the move overhead, so it stays safe against the clock.
 #[allow(dead_code)]
 struct TimeManager {
     start_time: Instant,
@@ -60,6 +67,8 @@ struct TimeManager {
     move_overhead_ms: u64,
     increment_ms: u64,
     in_crisis: bool,
+    /// `go movetime`: the whole budget is usable, no soft-limit scaling.
+    fixed_time: bool,
     stop_flag: Arc<AtomicBool>,
     node_count: Arc<AtomicU64>,
 }
@@ -71,14 +80,15 @@ impl TimeManager {
 
         if let Some(movetime) = config.movetime {
             let move_overhead_ms = Self::move_overhead_ms(movetime, 0);
-            let soft_time_ms = movetime.saturating_sub(move_overhead_ms).max(10);
+            let budget = movetime.saturating_sub(move_overhead_ms).max(10);
             return Self {
                 start_time: Instant::now(),
-                soft_time_ms,
-                hard_time_ms: movetime.max(10),
+                soft_time_ms: budget,
+                hard_time_ms: budget,
                 move_overhead_ms,
                 increment_ms: 0,
                 in_crisis: false,
+                fixed_time: true,
                 stop_flag,
                 node_count,
             };
@@ -92,6 +102,7 @@ impl TimeManager {
                 move_overhead_ms: 0,
                 increment_ms: 0,
                 in_crisis: false,
+                fixed_time: false,
                 stop_flag,
                 node_count,
             };
@@ -117,6 +128,7 @@ impl TimeManager {
             move_overhead_ms,
             increment_ms: increment,
             in_crisis,
+            fixed_time: false,
             stop_flag,
             node_count,
         }
@@ -167,11 +179,17 @@ impl TimeManager {
             };
         }
 
-        let mut hard_time_ms = if increment_ms > 0 {
-            (usable_time_ms / 2) + (increment_ms / 2)
+        // The hard limit ends an iteration in progress: a few soft budgets, but never
+        // more than a slice of the clock (the increment only refills it afterwards).
+        let clock_cap = if increment_ms > 0 {
+            usable_time_ms / 3 + increment_ms / 2
         } else {
-            (usable_time_ms * 3) / 10
+            usable_time_ms / 4
         };
+        let mut hard_time_ms = soft_time_ms
+            .saturating_mul(4)
+            .min(clock_cap)
+            .min(usable_time_ms * 3 / 4);
 
         let reserve_ms = move_overhead_ms.max(10);
         if hard_time_ms <= reserve_ms {
@@ -194,6 +212,7 @@ impl TimeManager {
         base.clamp(10, 50)
     }
 
+    /// Mid-iteration check: only the hard limit (or an external stop) aborts a search.
     #[inline(always)]
     fn should_stop(&self) -> bool {
         if self.stop_flag.load(Ordering::Relaxed) {
@@ -201,7 +220,7 @@ impl TimeManager {
         }
 
         let elapsed = self.start_time.elapsed().as_millis() as u64;
-        elapsed >= self.soft_time_ms || elapsed >= self.hard_time_ms
+        elapsed >= self.hard_time_ms
     }
 
     #[allow(dead_code)]
@@ -225,6 +244,34 @@ impl TimeManager {
         self.node_count.load(Ordering::Relaxed)
     }
 
+    /// Soft limit for the next iteration, in percent of `soft_time_ms`: stretched
+    /// when the best move just changed or the score dropped.
+    fn soft_scale_pct(
+        depth_completed: u32,
+        current_score: i32,
+        previous_score: Option<i32>,
+        current_best_move: Option<Move>,
+        previous_best_move: Option<Move>,
+    ) -> u64 {
+        let mut pct = 100;
+        if depth_completed >= 4
+            && current_best_move.is_some()
+            && previous_best_move.is_some()
+            && current_best_move != previous_best_move
+        {
+            pct += 40;
+        }
+        if let Some(prev) = previous_score {
+            let drop = prev - current_score;
+            if drop >= 60 {
+                pct += 40;
+            } else if drop >= 25 {
+                pct += 20;
+            }
+        }
+        pct
+    }
+
     fn should_continue_iterating(
         &self,
         depth_completed: u32,
@@ -238,16 +285,35 @@ impl TimeManager {
             return false;
         }
         let elapsed = self.start_time.elapsed().as_millis() as u64;
-        if elapsed >= self.hard_time_ms || elapsed >= self.soft_time_ms {
+        if elapsed >= self.hard_time_ms {
             return false;
         }
 
-        let remaining = self.soft_time_ms - elapsed;
         let reserve = if self.increment_ms > 0 {
             self.move_overhead_ms.saturating_sub(5).max(10)
         } else {
             self.move_overhead_ms.max(10)
         };
+
+        let soft_limit = if self.fixed_time {
+            self.soft_time_ms
+        } else {
+            let pct = Self::soft_scale_pct(
+                depth_completed,
+                current_score,
+                previous_score,
+                current_best_move,
+                previous_best_move,
+            );
+            (self.soft_time_ms.saturating_mul(pct) / 100)
+                .min(self.hard_time_ms.saturating_sub(reserve))
+                .max(self.soft_time_ms.min(self.hard_time_ms))
+        };
+        if elapsed >= soft_limit {
+            return false;
+        }
+
+        let remaining = soft_limit - elapsed;
         if remaining <= reserve {
             return false;
         }
@@ -266,12 +332,12 @@ impl TimeManager {
             && current_best_move == previous_best_move
             && score_delta.is_some_and(|delta| delta <= 16);
 
+        // The next iteration is expected to end before the (stretched) soft limit;
+        // when it overruns, the hard limit still lets it complete.
         let required = if self.in_crisis {
             iter_cost.saturating_add(reserve * 2)
         } else if stable_move {
             iter_cost.saturating_mul(2).saturating_add(reserve)
-        } else if score_delta.is_some_and(|delta| delta >= 80) {
-            iter_cost.saturating_mul(4) / 3 + reserve
         } else {
             iter_cost.saturating_mul(3) / 2 + reserve
         };
@@ -292,6 +358,8 @@ const MAX_TRIED_QUIETS: usize = 64;
 const MAX_TRIED_CAPTURES: usize = 32;
 const LMP_LIMITS: [usize; 5] = [0, 5, 7, 10, 14];
 const MATE_VALUE: i32 = 10000;
+/// Halfmove clock value at which the fifty-move rule makes the game a draw.
+const FIFTY_MOVE_PLIES: u16 = 100;
 const MAX_PLY: usize = 128;
 const MAX_DEPTH: u32 = 64;
 const NODE_FLUSH_INTERVAL: u64 = 2048;
@@ -648,13 +716,22 @@ impl Engine {
         LMR_TABLE[(depth as usize).min(63)][idx.min(63)] as u32
     }
 
+    /// FEN for the tablebase probe, with the real halfmove clock
+    /// (`Board::to_fen` always ends with " 0 1").
+    fn syzygy_fen(board: &Board, color: Color) -> String {
+        let fen = board.to_fen(color);
+        match fen.strip_suffix(" 0 1") {
+            Some(base) => format!("{base} {} 1", board.halfmove),
+            None => fen,
+        }
+    }
+
     fn probe_syzygy(&self, board: &Board, color: Color, ply: usize) -> Option<i32> {
         let tb = self.tb.as_ref()?;
         if board.piece_count_all() > tb.max_pieces() {
             return None;
         }
-        let fen = board.to_fen(color);
-        let pos: Chess = fen
+        let pos: Chess = Self::syzygy_fen(board, color)
             .parse::<Fen>()
             .ok()?
             .into_position(CastlingMode::Standard)
@@ -1098,6 +1175,11 @@ impl Engine {
 
         let result = 'q: {
             if !in_check {
+                // Stalemate at the horizon: only checked when the side to move has
+                // nothing but king and pawns, where it is both plausible and cheap.
+                if !board.has_non_pawn_material(color) && !board.has_legal_move(color) {
+                    break 'q 0;
+                }
                 stand_pat = Self::evaluate(board, color);
 
                 if stand_pat >= beta {
@@ -1213,6 +1295,14 @@ impl Engine {
         }
         if self.is_repetition_draw(hash, ply) {
             self.rep_floor = saved_rep_floor;
+            return 0;
+        }
+        // Fifty-move rule: a draw, unless the side to move is checkmated.
+        if ply > 0 && board.halfmove >= FIFTY_MOVE_PLIES {
+            self.rep_floor = saved_rep_floor;
+            if board.in_check_fast(color) && !board.has_legal_move(color) {
+                return -MATE_VALUE + ply as i32;
+            }
             return 0;
         }
         self.search_history.push(hash);
@@ -1375,11 +1465,11 @@ impl Engine {
 
                     // Quiet-move pruning (late move pruning, history pruning, futility).
                     // Quiet checks are never pruned: they are exactly the moves the
-                    // static eval and the history tables misjudge.
-                    if !is_pv && !in_check && is_quiet {
+                    // static eval and the history tables misjudge. The first move
+                    // (the TT move when there is one) is always searched.
+                    if idx > 0 && !is_pv && !in_check && is_quiet {
                         let late = depth <= 4 && idx >= LMP_LIMITS[depth as usize];
                         let bad_history = depth <= HLP_THRESHOLD
-                            && idx > 0
                             && Self::key_score(keys[idx]) < HLP_BASE * depth as i32;
                         let futile = depth <= 4
                             && static_eval.is_some_and(|eval| {
@@ -1597,6 +1687,9 @@ impl Engine {
         }
 
         let mut board = board.clone();
+        // `search_history` ends just before the root (as for `pvs` at ply 0): push the
+        // root so the child at ply 1 sees the same history as in the single-thread search.
+        self.search_history.push(board.hash(color));
         let undo = board.make_move_fast(mv, color);
         let gives_check = board.in_check_fast(opposite(color));
         let child_depth = Self::root_child_depth(depth, gives_check);
@@ -1611,6 +1704,7 @@ impl Engine {
             true,
         );
         board.unmake_move_fast(undo, color);
+        self.search_history.pop();
 
         if self.stop_flag.load(Ordering::Relaxed) {
             None
@@ -2275,6 +2369,69 @@ mod tests {
     }
 
     #[test]
+    fn test_only_hard_limit_aborts_an_iteration() {
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let config = TimeConfig {
+            wtime: Some(10_000),
+            ..Default::default()
+        };
+        let mut tm = TimeManager::new(&config, Color::White, stop_flag);
+        tm.soft_time_ms = 100;
+        tm.hard_time_ms = 1_000;
+        tm.start_time = std::time::Instant::now() - std::time::Duration::from_millis(300);
+
+        assert!(
+            !tm.should_stop(),
+            "past soft but before hard: keep searching"
+        );
+        assert!(
+            !tm.should_continue_iterating(5, Some(50), 0, Some(0), None, None),
+            "past soft: do not start another iteration"
+        );
+
+        tm.start_time = std::time::Instant::now() - std::time::Duration::from_millis(1_000);
+        assert!(tm.should_stop(), "the hard limit aborts the iteration");
+    }
+
+    #[test]
+    fn test_soft_limit_stretches_on_instability() {
+        let stable = Move::normal(12, 28);
+        let changed = Move::normal(11, 27);
+        assert_eq!(
+            TimeManager::soft_scale_pct(8, 10, Some(12), Some(stable), Some(stable)),
+            100
+        );
+        assert_eq!(
+            TimeManager::soft_scale_pct(8, 10, Some(12), Some(changed), Some(stable)),
+            140
+        );
+        assert_eq!(
+            TimeManager::soft_scale_pct(8, -60, Some(10), Some(changed), Some(stable)),
+            180
+        );
+    }
+
+    #[test]
+    fn test_hard_limit_leaves_clock_margin() {
+        for &(time, inc) in &[
+            (200u64, 10u64),
+            (1_000, 20),
+            (300, 0),
+            (5_000, 0),
+            (60_000, 0),
+            (60_000, 2_000),
+            (1_000, 5_000),
+        ] {
+            let (soft, hard, overhead, _) = TimeManager::calculate_time(time, inc, None);
+            assert!(soft < hard, "{time}+{inc}: soft {soft} hard {hard}");
+            assert!(
+                hard + overhead <= time.max(40),
+                "{time}+{inc}: hard {hard} must stay within the clock"
+            );
+        }
+    }
+
+    #[test]
     fn test_iteration_gate_prefers_stable_positions_to_stop_earlier() {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let config = TimeConfig {
@@ -2727,5 +2884,101 @@ mod tests {
             score > -MATE_VALUE,
             "Depth-0 search should explore evasions instead of treating any check node as lost"
         );
+    }
+
+    /// Black (a queen up) to move, in a position seen twice already; h8g8 would
+    /// recreate a position that also occurred twice before: a threefold draw.
+    fn repetition_avoidance_game() -> Game {
+        let mut game =
+            crate::fen::game_from_fen("6k1/5ppp/8/8/3q4/8/8/R6K w - - 0 1").expect("valid FEN");
+        for mv in ["a1a2", "g8h8", "a2a1", "h8g8", "a1a2", "g8h8", "a2a1"] {
+            let (from, to) = mv.split_at(2);
+            assert!(game.make_move(from, to), "illegal move {mv}");
+        }
+        assert_eq!(game.current_turn, Color::Black);
+        game
+    }
+
+    #[test]
+    fn test_parallel_root_search_sees_game_history_repetitions() {
+        let game = repetition_avoidance_game();
+        let color = game.current_turn;
+        let repeat = game.board.encode_move("h8", "g8", color).unwrap();
+        let depth = 5;
+
+        // Single-thread path: the root pvs sees the draw at ply 1.
+        let mut single = Engine::new(depth);
+        single.search_history = game.hash_history.clone();
+        single.search_history.pop();
+        let mut board = game.board.clone();
+        let undo = board.make_move_fast(repeat, color);
+        single.search_history.push(game.board.hash(color));
+        let single_score = -single.pvs(
+            &mut board,
+            opposite(color),
+            depth - 1,
+            -MATE_VALUE,
+            MATE_VALUE,
+            1,
+            Some(repeat),
+            true,
+        );
+        board.unmake_move_fast(undo, color);
+        assert_eq!(single_score, 0);
+
+        // Parallel path: same history as `best_move_parallel` sets up.
+        let mut worker = Engine::with_threads(depth, 3);
+        worker.search_history = game.hash_history.clone();
+        worker.search_history.pop();
+        let len_before = worker.search_history.len();
+        let score = worker
+            .search_root_move(&game.board, color, depth, repeat, -MATE_VALUE, MATE_VALUE)
+            .unwrap();
+        assert_eq!(
+            score, 0,
+            "the repetition must be a draw in the parallel search too"
+        );
+        assert_eq!(worker.search_history.len(), len_before);
+    }
+
+    #[test]
+    fn test_single_and_parallel_search_both_avoid_repetition() {
+        for threads in [1, 3] {
+            let mut game = repetition_avoidance_game();
+            let mut engine = Engine::with_threads(9, threads);
+            let ((from, to), _) = engine
+                .best_move_timed(&mut game, &TimeConfig::fixed_depth(9))
+                .expect("a move");
+            assert_ne!(
+                (from.as_str(), to.as_str()),
+                ("h8", "g8"),
+                "threads={threads}: the winning side must not allow the threefold"
+            );
+        }
+    }
+
+    #[test]
+    fn test_quiescence_scores_stalemate_as_draw() {
+        // Black to move: Ka8 has no legal move and is not in check.
+        let game = crate::fen::game_from_fen("k7/8/1Q6/8/8/8/8/7K b - - 0 1").unwrap();
+        let mut board = game.board.clone();
+        let mut engine = Engine::new(1);
+        let score = engine.quiescence(&mut board, Color::Black, -MATE_VALUE, MATE_VALUE, 1);
+        assert_eq!(score, 0);
+        // Same when the window would let stand-pat fail low or high.
+        let mut engine = Engine::new(1);
+        assert_eq!(engine.quiescence(&mut board, Color::Black, -50, 50, 1), 0);
+    }
+
+    #[test]
+    fn test_syzygy_fen_carries_the_halfmove_clock() {
+        let mut game = crate::fen::game_from_fen("8/8/8/4k3/8/2K5/P7/7Q w - - 0 1").unwrap();
+        game.board.halfmove = 137;
+        let fen = Engine::syzygy_fen(&game.board, Color::White);
+        assert!(fen.ends_with(" 137 1"), "{fen}");
+        let setup = fen.parse::<Fen>().unwrap();
+        let pos: Chess = setup.into_position(CastlingMode::Standard).unwrap();
+        use shakmaty::Position;
+        assert_eq!(pos.halfmoves(), 137);
     }
 }

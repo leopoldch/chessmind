@@ -1,4 +1,4 @@
-use crate::attacks::{bishop_attacks, rook_attacks};
+use crate::attacks::{BISHOP_PSEUDO, ROOK_PSEUDO, between_mask, bishop_attacks, rook_attacks};
 use crate::board::{Board, color_idx, piece_index};
 use crate::movegen::{BLACK_PAWN_ATTACKS, KING_TABLE, KNIGHT_TABLE, WHITE_PAWN_ATTACKS};
 use crate::pieces::{Color, PieceType};
@@ -23,6 +23,48 @@ fn is_promotion_square(color: Color, sq: u8) -> bool {
         Color::White => sq / 8 == 7,
         Color::Black => sq / 8 == 0,
     }
+}
+
+/// Pieces of `color` that may not recapture on `target` because they are pinned
+/// to their king along a line that does not contain `target`, plus the pinners.
+/// `occ` is the occupancy after the initial capture. The pins only hold while
+/// every pinner is still in place (`pinners & occ == pinners`).
+#[inline(always)]
+fn pinned_away_from(bbs: &[[u64; 6]; 2], occ: u64, color: Color, target: u8) -> (u64, u64) {
+    let own = &bbs[color_idx(color)];
+    let king = own[piece_index(PieceType::King)];
+    if king == 0 {
+        return (0, 0);
+    }
+    let king_sq = king.trailing_zeros() as usize;
+    let opp = &bbs[color_idx(opposite(color))];
+    let queens = opp[piece_index(PieceType::Queen)];
+    let mut snipers = ((ROOK_PSEUDO[king_sq] & (opp[piece_index(PieceType::Rook)] | queens))
+        | (BISHOP_PSEUDO[king_sq] & (opp[piece_index(PieceType::Bishop)] | queens)))
+        & occ
+        & !sq_bb(target);
+    if snipers == 0 {
+        return (0, 0);
+    }
+    let own_occ = (own[0] | own[1] | own[2] | own[3] | own[4]) & occ;
+    let target_bb = sq_bb(target);
+    let (mut blocked, mut pinners) = (0u64, 0u64);
+    while snipers != 0 {
+        let sniper_sq = snipers.trailing_zeros() as usize;
+        let sniper_bb = snipers & snipers.wrapping_neg();
+        snipers &= snipers - 1;
+        let between = between_mask(king_sq, sniper_sq);
+        let blockers = between & occ;
+        if blockers != 0
+            && (blockers & (blockers - 1)) == 0
+            && (blockers & own_occ) != 0
+            && (between & target_bb) == 0
+        {
+            blocked |= blockers;
+            pinners |= sniper_bb;
+        }
+    }
+    (blocked, pinners)
 }
 
 /// Static exchange evaluation of `mv` on its destination square.
@@ -95,13 +137,31 @@ pub fn static_exchange_eval(board: &Board, mv: Move) -> i32 {
     gain[0] = captured_value + promotion_bonus;
 
     let mut side = opp;
+    // Pin data per side (`[opp, mover]`), computed the first time that side recaptures.
+    let mut pins: [Option<(u64, u64)>; 2] = [None, None];
 
     loop {
-        let side_attackers = attackers & board.all_pieces(side);
+        let mut side_attackers = attackers & board.all_pieces(side);
         if side_attackers == 0 {
             break;
         }
+        // Only attackers on a line through their own king can be pinned.
         let side_bbs = &bbs[color_idx(side)];
+        let king = side_bbs[piece_index(PieceType::King)];
+        if king != 0 {
+            let king_sq = king.trailing_zeros() as usize;
+            if side_attackers & (ROOK_PSEUDO[king_sq] | BISHOP_PSEUDO[king_sq]) != 0 {
+                let slot = (side == color) as usize;
+                let (blocked, pinners) =
+                    *pins[slot].get_or_insert_with(|| pinned_away_from(bbs, occ, side, to_sq));
+                if blocked != 0 && (pinners & occ) == pinners {
+                    side_attackers &= !blocked;
+                    if side_attackers == 0 {
+                        break;
+                    }
+                }
+            }
+        }
         let mut attacker_piece_idx = 0;
         let mut candidates = side_bbs[0] & side_attackers;
         while candidates == 0 && attacker_piece_idx < 5 {
@@ -286,9 +346,18 @@ mod reference {
 
         let mut side = opp;
         let mut occupant_color = color;
+        let pin_occ = occ;
+        let pins = [
+            super::pinned_away_from(&board.bitboards, pin_occ, opp, to_sq),
+            super::pinned_away_from(&board.bitboards, pin_occ, color, to_sq),
+        ];
 
         loop {
-            let attackers = attackers_to_square(&pieces, occ, to_sq, side);
+            let mut attackers = attackers_to_square(&pieces, occ, to_sq, side);
+            let (blocked, pinners) = pins[(side == color) as usize];
+            if (pinners & occ) == pinners {
+                attackers &= !blocked;
+            }
             let Some((attacker_sq, attacker_piece_idx)) =
                 least_valuable_attacker(&pieces, attackers, side)
             else {
@@ -377,6 +446,46 @@ mod tests {
 
         let mv = Move::promotion(52, 61, PieceType::Queen, true);
         assert!(static_exchange_eval(&board, mv) >= PieceValues::ROOK);
+    }
+
+    #[test]
+    fn see_ignores_recaptures_by_pinned_pieces() {
+        // Nf3xe5: the only defender, d6, is pinned to Kd8 by Rd1 along the d-file.
+        let mut board = Board::new();
+        put(&mut board, "h1", PieceType::King, Color::White);
+        put(&mut board, "d1", PieceType::Rook, Color::White);
+        put(&mut board, "f3", PieceType::Knight, Color::White);
+        put(&mut board, "d8", PieceType::King, Color::Black);
+        put(&mut board, "d6", PieceType::Pawn, Color::Black);
+        put(&mut board, "e5", PieceType::Pawn, Color::Black);
+        let nxe5 = Move::capture(21, 36);
+        assert_eq!(static_exchange_eval(&board, nxe5), PieceValues::PAWN);
+
+        // Without the pinner, d6 defends e5 and the capture loses the knight.
+        let mut board = Board::new();
+        put(&mut board, "h1", PieceType::King, Color::White);
+        put(&mut board, "f3", PieceType::Knight, Color::White);
+        put(&mut board, "d8", PieceType::King, Color::Black);
+        put(&mut board, "d6", PieceType::Pawn, Color::Black);
+        put(&mut board, "e5", PieceType::Pawn, Color::Black);
+        assert_eq!(
+            static_exchange_eval(&board, nxe5),
+            PieceValues::PAWN - PieceValues::KNIGHT
+        );
+
+        // Ba5xb6 puts the bishop on the c7-d8 diagonal: the capturer itself is
+        // never treated as a pinner, so Bc7 still recaptures on its own line.
+        let mut board = Board::new();
+        put(&mut board, "h1", PieceType::King, Color::White);
+        put(&mut board, "a5", PieceType::Bishop, Color::White);
+        put(&mut board, "d8", PieceType::King, Color::Black);
+        put(&mut board, "c7", PieceType::Bishop, Color::Black);
+        put(&mut board, "b6", PieceType::Knight, Color::Black);
+        let bxb6 = Move::capture(32, 41);
+        assert_eq!(
+            static_exchange_eval(&board, bxb6),
+            PieceValues::KNIGHT - PieceValues::BISHOP
+        );
     }
 
     fn compare_tree(board: &mut Board, color: Color, depth: u32, checked: &mut u64) {

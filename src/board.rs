@@ -29,6 +29,9 @@ pub struct Board {
     pub eval_phase: i32,
     pub en_passant: Option<(usize, usize)>,
     pub castling: [[bool; 2]; 2],
+    /// Plies since the last capture or pawn move (fifty-move rule). Counted from
+    /// the position the board was set up from, where it starts at 0.
+    pub halfmove: u16,
 }
 
 #[inline(always)]
@@ -58,10 +61,12 @@ impl Board {
             eval_phase: 0,
             en_passant: None,
             castling: [[true, true], [true, true]],
+            halfmove: 0,
         }
     }
 
     pub fn setup_standard(&mut self) {
+        self.halfmove = 0;
         self.white_occ = 0;
         self.black_occ = 0;
         self.hash = 0;
@@ -761,6 +766,11 @@ impl Board {
     /// Whether `color` has at least one knight, bishop, rook or queen. Used to
     /// disable null-move pruning in king-and-pawn endings (zugzwang).
     #[inline(always)]
+    /// Whether `color` has any legal move (early exit, see `movegen::has_legal_move`).
+    pub fn has_legal_move(&mut self, color: Color) -> bool {
+        crate::movegen::has_legal_move(self, color)
+    }
+
     pub fn has_non_pawn_material(&self, color: Color) -> bool {
         let bb = &self.bitboards[color_idx(color)];
         (bb[piece_index(PieceType::Knight)]
@@ -918,6 +928,12 @@ impl Board {
 
         let piece = self.squares[from_y][from_x].unwrap();
         let captured = self.squares[to_y][to_x];
+        let halfmove = self.halfmove;
+        self.halfmove = if piece.piece_type == PieceType::Pawn || captured.is_some() {
+            0
+        } else {
+            halfmove.saturating_add(1)
+        };
 
         let prev_ep = self
             .en_passant
@@ -934,6 +950,7 @@ impl Board {
             prev_eval_mg: self.eval_mg,
             prev_eval_eg: self.eval_eg,
             prev_eval_phase: self.eval_phase,
+            prev_halfmove: halfmove,
         };
 
         let mut captured_piece_idx = UndoState::NO_CAPTURE;
@@ -1084,6 +1101,7 @@ impl Board {
         self.eval_mg = state.prev_eval_mg;
         self.eval_eg = state.prev_eval_eg;
         self.eval_phase = state.prev_eval_phase;
+        self.halfmove = state.prev_halfmove;
     }
 
     pub fn recompute_eval_state(&mut self) {
