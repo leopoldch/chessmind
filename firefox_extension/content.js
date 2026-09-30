@@ -7,6 +7,23 @@
   let observer = null;
   let myColor = null;
   let shouldReconnect = false;
+  const RECONNECT_MIN_MS = 1000;
+  const RECONNECT_MAX_MS = 10000;
+  let reconnectDelay = RECONNECT_MIN_MS;
+  let reconnectTimer = null;
+  let boardEl = null;
+  let scanScheduled = false;
+
+  // requestAnimationFrame is paused in hidden tabs; fall back to a timer there.
+  function nextFrame(cb) {
+    if (document.hidden) setTimeout(cb, 0);
+    else requestAnimationFrame(cb);
+  }
+
+  function waitRandom(minMs, maxMs) {
+    const delay = minMs + Math.floor(Math.random() * (maxMs - minMs + 1));
+    return new Promise(resolve => setTimeout(resolve, delay));
+  }
 
   function parseMove(node) {
     if (node && node.dataset && node.dataset.uci) {
@@ -76,6 +93,8 @@
     // Réinitialiser l'état pour permettre l'envoi de l'historique
     lastMoves = [];
     myColor = null;
+    boardEl = null;
+    reconnectDelay = RECONNECT_MIN_MS;
 
     try {
       // Attendre que le plateau et la liste des coups soient chargés
@@ -97,6 +116,10 @@
   function stopGame() {
     shouldReconnect = false;
     gameStarted = false;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
     if (observer) {
       observer.disconnect();
       observer = null;
@@ -107,26 +130,41 @@
     }
   }
 
+  function scheduleReconnect() {
+    if (!shouldReconnect || reconnectTimer) return;
+    const delay = reconnectDelay;
+    // Exponential backoff: 1, 2, 4, 8, 10, 10... seconds.
+    reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, delay);
+  }
+
   function connect() {
     if (!shouldReconnect) return;
     if (ws && ws.readyState !== WebSocket.CLOSED) {
       try { ws.close(); } catch (e) { }
     }
-    ws = new WebSocket(WS_URL);
-    ws.addEventListener('open', () => {
+    const socket = new WebSocket(WS_URL);
+    ws = socket;
+    socket.addEventListener('open', () => {
+      reconnectDelay = RECONNECT_MIN_MS;
       myColor = detectColor();
-      ws.send(JSON.stringify({ type: 'color', color: myColor }));
-      sendMoves(getAllMoves());
+      socket.send(JSON.stringify({ type: 'color', color: myColor }));
+      // Always resend the full history: the server resets its position on
+      // 'color', and this message is what triggers its search.
+      sendMoves(getAllMoves(), true);
       observeMoves();
     });
-    ws.addEventListener('message', onMessage);
-    ws.addEventListener('close', () => {
-      ws = null;
-      if (shouldReconnect) setTimeout(connect, 1000);
+    socket.addEventListener('message', onMessage);
+    socket.addEventListener('close', () => {
+      if (ws === socket) ws = null;
+      scheduleReconnect();
     });
-    ws.addEventListener('error', () => {
-      if (ws && ws.readyState !== WebSocket.CLOSED) {
-        ws.close();
+    socket.addEventListener('error', () => {
+      if (socket.readyState !== WebSocket.CLOSED) {
+        socket.close();
       }
     });
   }
@@ -199,9 +237,9 @@
     return moves;
   }
 
-  function sendMoves(moves) {
+  function sendMoves(moves, force = false) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    if (JSON.stringify(moves) === JSON.stringify(lastMoves)) return;
+    if (!force && JSON.stringify(moves) === JSON.stringify(lastMoves)) return;
     lastMoves = moves;
 
     const timeData = extractTimeData();
@@ -229,16 +267,23 @@
     if (!container) return;
     if (observer) observer.disconnect();
 
+    // A single move triggers a burst of mutations: scan once per frame.
     observer = new MutationObserver(() => {
-      const currentMoves = getAllMoves();
-      for (let i = lastMoves.length; i < currentMoves.length; i++) {
-        const { move, color } = currentMoves[i];
-        if (color !== myColor) {
-          // We pass the RAW move here as before; extractTimeData is called inside sendNewMove
-          sendNewMove(move);
+      if (scanScheduled) return;
+      scanScheduled = true;
+      nextFrame(() => {
+        scanScheduled = false;
+        if (!observer) return;
+        const currentMoves = getAllMoves();
+        for (let i = lastMoves.length; i < currentMoves.length; i++) {
+          const { move, color } = currentMoves[i];
+          if (color !== myColor) {
+            // We pass the RAW move here as before; extractTimeData is called inside sendNewMove
+            sendNewMove(move);
+          }
         }
-      }
-      lastMoves = currentMoves;
+        lastMoves = currentMoves;
+      });
     });
 
     observer.observe(container, { childList: true, subtree: true });
@@ -260,12 +305,23 @@
     return file * 10 + rank;
   }
 
+  function getBoard() {
+    if (!boardEl || !boardEl.isConnected) {
+      boardEl = document.querySelector('wc-chess-board.board');
+    }
+    return boardEl;
+  }
+
   function clickSquare(idx, square) {
-    const board = document.querySelector('wc-chess-board.board');
+    const board = getBoard();
+    if (!board) {
+      console.warn('[ChessMind] Board not found');
+      return;
+    }
     const rect = board.getBoundingClientRect();
     const file = square.charCodeAt(0) - 'a'.charCodeAt(0);
     const rank = parseInt(square[1], 10);
-    const orientation = detectColor();
+    const orientation = myColor || detectColor();
     let fileIdx = orientation === 'white' ? file : 7 - file;
     let rankIdx = orientation === 'white' ? 8 - rank : rank - 1;
     const x = rect.left + (fileIdx + 0.5) * (rect.width / 8);
@@ -297,11 +353,13 @@
     }
   }
 
-  function simulateMove(from, to) {
+  async function simulateMove(from, to) {
     const fromIdx = algebraicToSquareIndex(from);
     const toIdx = algebraicToSquareIndex(to);
+    await waitRandom(500, 1500);
     clickSquare(fromIdx, from);
-    setTimeout(() => clickSquare(toIdx, to), 100);
+    await waitRandom(200, 1000);
+    clickSquare(toIdx, to);
   }
 
 

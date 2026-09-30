@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::board::{Board, color_idx, piece_index};
 use crate::pieces::{Color, PieceType};
+use crate::types::Move;
 
 #[derive(Clone, Copy)]
 pub enum Bound {
@@ -17,39 +18,34 @@ pub struct TTEntry {
     pub depth: u32,
     pub value: i32,
     pub bound: Bound,
-    pub best: Option<(u8, u8)>,
+    /// Full move (including promotion piece and flags), so a probe can match
+    /// the exact generated move rather than just its squares.
+    pub best: Option<Move>,
 }
 
+/// One TT slot. Lockless: `key` holds `zobrist ^ data`, so a torn write
+/// (key from one store, data from another) fails the `key ^ data == zobrist`
+/// check on probe and is simply treated as a miss.
+#[derive(Default)]
 struct RawEntry {
     key: AtomicU64,
     data: AtomicU64,
 }
 
-impl Default for RawEntry {
-    fn default() -> Self {
-        Self {
-            key: AtomicU64::new(0),
-            data: AtomicU64::new(0),
-        }
-    }
-}
-
+/// Exactly one cache line: 4 x 16-byte entries, 64-byte aligned.
+#[repr(C, align(64))]
+#[derive(Default)]
 struct Bucket {
-    lock: AtomicU8,
     entries: [RawEntry; CLUSTER_SIZE],
 }
 
-impl Default for Bucket {
-    fn default() -> Self {
-        Self {
-            lock: AtomicU8::new(0),
-            entries: std::array::from_fn(|_| RawEntry::default()),
-        }
-    }
-}
+const _: () = assert!(std::mem::size_of::<Bucket>() == 64);
+const _: () = assert!(std::mem::align_of::<Bucket>() == 64);
 
 struct Inner {
     buckets: Vec<Bucket>,
+    /// `buckets.len() - 1`; `buckets.len()` is a power of two.
+    mask: usize,
     age: AtomicU8,
 }
 
@@ -58,25 +54,28 @@ pub struct Table(Arc<Inner>);
 
 const CLUSTER_SIZE: usize = 4;
 const DATA_OCCUPIED_BIT: u64 = 1 << 63;
-const VALUE_MASK: u64 = 0xFFFF_FFFF;
+const VALUE_MASK: u64 = 0xFFFF;
+const MOVE_SHIFT: u64 = 16;
+const MOVE_MASK: u64 = 0xFFFF;
 const DEPTH_SHIFT: u64 = 32;
 const DEPTH_MASK: u64 = 0x7F;
 const AGE_SHIFT: u64 = 39;
 const AGE_MASK: u64 = 0xFF;
 const BOUND_SHIFT: u64 = 47;
 const BOUND_MASK: u64 = 0x03;
-const FROM_SHIFT: u64 = 49;
-const TO_SHIFT: u64 = 56;
-const MOVE_MASK: u64 = 0x7F;
-const NO_SQUARE: u8 = 0x7F;
+const MOVE_BITS: u64 = MOVE_MASK << MOVE_SHIFT;
 
 impl Table {
+    /// `size` is a number of entries. The bucket count is rounded down to a
+    /// power of two (never above the requested memory, minimum one bucket).
     pub fn new(size: usize) -> Self {
-        let bucket_count = size.max(1).div_ceil(CLUSTER_SIZE);
+        let wanted = (size / CLUSTER_SIZE).max(1);
+        let bucket_count = 1usize << (usize::BITS - 1 - wanted.leading_zeros());
         let mut buckets = Vec::with_capacity(bucket_count);
         buckets.resize_with(bucket_count, Bucket::default);
         Self(Arc::new(Inner {
             buckets,
+            mask: bucket_count - 1,
             age: AtomicU8::new(0),
         }))
     }
@@ -93,44 +92,45 @@ impl Table {
     pub fn get(&self, key: u64) -> Option<TTEntry> {
         let bucket = self.bucket(key);
         for entry in &bucket.entries {
-            let key_before = entry.key.load(Ordering::Acquire);
             let data = entry.data.load(Ordering::Relaxed);
-            let key_after = entry.key.load(Ordering::Acquire);
-
-            if key_before != key_after || key_after != key || !Self::is_occupied(data) {
-                continue;
+            let stored = entry.key.load(Ordering::Relaxed);
+            if Self::is_occupied(data) && stored ^ data == key {
+                return Some(Self::decode_entry(data));
             }
-
-            return Some(Self::decode_entry(data));
         }
         None
     }
 
     pub fn store(&self, key: u64, entry: TTEntry) {
         let age = self.current_age();
-        let incoming = Self::encode_entry(entry, age);
+        let mut incoming = Self::encode_entry(entry, age);
         let bucket = self.bucket(key);
-        Self::lock_bucket(bucket);
 
         let mut empty_slot: Option<&RawEntry> = None;
         let mut victim = &bucket.entries[0];
         let mut victim_score = i32::MAX;
 
         for slot in &bucket.entries {
-            let existing_key = slot.key.load(Ordering::Acquire);
             let existing_data = slot.data.load(Ordering::Relaxed);
-
-            if Self::is_occupied(existing_data) && existing_key == key {
-                if Self::should_replace(existing_data, incoming, age) {
-                    slot.data.store(incoming, Ordering::Release);
-                }
-                Self::unlock_bucket(bucket);
-                return;
-            }
+            let existing_key = slot.key.load(Ordering::Relaxed) ^ existing_data;
 
             if !Self::is_occupied(existing_data) {
-                empty_slot = Some(slot);
+                if empty_slot.is_none() {
+                    empty_slot = Some(slot);
+                }
                 continue;
+            }
+
+            if existing_key == key {
+                // Fail-low stores carry no move: keep the previously known one
+                // so move ordering still gets a hash move for this position.
+                if !Self::has_best_move(incoming) && Self::has_best_move(existing_data) {
+                    incoming = (incoming & !MOVE_BITS) | (existing_data & MOVE_BITS);
+                }
+                if Self::should_replace(existing_data, incoming, age) {
+                    Self::write(slot, key, incoming);
+                }
+                return;
             }
 
             let score = Self::retention_score(existing_data, age);
@@ -140,31 +140,41 @@ impl Table {
             }
         }
 
-        let slot = empty_slot.unwrap_or(victim);
-        slot.data.store(incoming, Ordering::Relaxed);
-        slot.key.store(key, Ordering::Release);
-        Self::unlock_bucket(bucket);
+        Self::write(empty_slot.unwrap_or(victim), key, incoming);
     }
 
-    fn bucket(&self, key: u64) -> &Bucket {
-        let idx = (key as usize) % self.0.buckets.len();
-        &self.0.buckets[idx]
-    }
-
-    fn lock_bucket(bucket: &Bucket) {
-        while bucket
-            .lock
-            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            while bucket.lock.load(Ordering::Relaxed) != 0 {
-                std::hint::spin_loop();
-            }
+    /// Hint the CPU to pull the bucket for `key` into cache ahead of a probe.
+    #[inline(always)]
+    pub fn prefetch(&self, key: u64) {
+        let ptr = self.bucket(key) as *const Bucket;
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            _mm_prefetch::<_MM_HINT_T0>(ptr as *const i8);
         }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            std::arch::asm!(
+                "prfm pldl1keep, [{0}]",
+                in(reg) ptr,
+                options(nostack, readonly, preserves_flags)
+            );
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let _ = ptr;
     }
 
-    fn unlock_bucket(bucket: &Bucket) {
-        bucket.lock.store(0, Ordering::Release);
+    #[inline(always)]
+    fn write(slot: &RawEntry, key: u64, data: u64) {
+        slot.data.store(data, Ordering::Relaxed);
+        slot.key.store(key ^ data, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    fn bucket(&self, key: u64) -> &Bucket {
+        let idx = (key as usize) & self.0.mask;
+        // SAFETY: `mask == buckets.len() - 1`, so `idx < buckets.len()`.
+        unsafe { self.0.buckets.get_unchecked(idx) }
     }
 
     fn encode_entry(entry: TTEntry, age: u8) -> u64 {
@@ -174,33 +184,28 @@ impl Table {
             Bound::Lower => 1,
             Bound::Upper => 2,
         } as u64;
-        let from = entry.best.map(|mv| mv.0).unwrap_or(NO_SQUARE) as u64;
-        let to = entry.best.map(|mv| mv.1).unwrap_or(NO_SQUARE) as u64;
+        // Search scores are bounded by the mate value, far inside i16.
+        let value = entry.value.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        let mv = entry.best.unwrap_or(Move::NONE).0 as u64;
 
         DATA_OCCUPIED_BIT
-            | ((entry.value as u32 as u64) & VALUE_MASK)
+            | ((value as u16 as u64) & VALUE_MASK)
+            | (mv << MOVE_SHIFT)
             | (depth << DEPTH_SHIFT)
             | ((age as u64) << AGE_SHIFT)
             | (bound << BOUND_SHIFT)
-            | (from << FROM_SHIFT)
-            | (to << TO_SHIFT)
     }
 
     fn decode_entry(data: u64) -> TTEntry {
-        let value = (data & VALUE_MASK) as u32 as i32;
+        let value = (data & VALUE_MASK) as u16 as i16 as i32;
         let depth = ((data >> DEPTH_SHIFT) & DEPTH_MASK) as u32;
         let bound = match ((data >> BOUND_SHIFT) & BOUND_MASK) as u8 {
             1 => Bound::Lower,
             2 => Bound::Upper,
             _ => Bound::Exact,
         };
-        let from = ((data >> FROM_SHIFT) & MOVE_MASK) as u8;
-        let to = ((data >> TO_SHIFT) & MOVE_MASK) as u8;
-        let best = if from == NO_SQUARE || to == NO_SQUARE {
-            None
-        } else {
-            Some((from, to))
-        };
+        let mv = Move(((data >> MOVE_SHIFT) & MOVE_MASK) as u16);
+        let best = mv.is_valid().then_some(mv);
 
         TTEntry {
             depth,
@@ -231,8 +236,7 @@ impl Table {
     }
 
     fn has_best_move(data: u64) -> bool {
-        ((data >> FROM_SHIFT) & MOVE_MASK) as u8 != NO_SQUARE
-            && ((data >> TO_SHIFT) & MOVE_MASK) as u8 != NO_SQUARE
+        (data & MOVE_BITS) != 0
     }
 
     fn retention_score(data: u64, current_age: u8) -> i32 {
@@ -397,6 +401,7 @@ pub const TABLE_SIZE: usize = 4_194_304;
 #[cfg(test)]
 mod tests {
     use super::{Bound, TTEntry, Table};
+    use crate::types::Move;
     use std::sync::Arc;
     use std::thread;
 
@@ -412,7 +417,7 @@ mod tests {
                     depth: 4 + idx as u32,
                     value: 50 + idx as i32,
                     bound: Bound::Exact,
-                    best: Some((idx as u8, (idx + 1) as u8)),
+                    best: Some(Move::normal(idx as u8, (idx + 1) as u8)),
                 },
             );
         }
@@ -421,7 +426,7 @@ mod tests {
             let entry = table.get(key).expect("clustered slot should retain key");
             assert_eq!(entry.depth, 4 + idx as u32);
             assert_eq!(entry.value, 50 + idx as i32);
-            assert_eq!(entry.best, Some((idx as u8, (idx + 1) as u8)));
+            assert_eq!(entry.best, Some(Move::normal(idx as u8, (idx + 1) as u8)));
         }
     }
 
@@ -434,7 +439,7 @@ mod tests {
                 depth: 10,
                 value: 100,
                 bound: Bound::Exact,
-                best: Some((1, 2)),
+                best: Some(Move::normal(1, 2)),
             },
         );
         table.store(
@@ -443,7 +448,7 @@ mod tests {
                 depth: 2,
                 value: -20,
                 bound: Bound::Upper,
-                best: Some((3, 4)),
+                best: Some(Move::normal(3, 4)),
             },
         );
         table.store(
@@ -452,7 +457,7 @@ mod tests {
                 depth: 3,
                 value: -10,
                 bound: Bound::Lower,
-                best: Some((5, 6)),
+                best: Some(Move::normal(5, 6)),
             },
         );
         table.store(
@@ -471,14 +476,95 @@ mod tests {
                 depth: 2,
                 value: 5,
                 bound: Bound::Upper,
-                best: Some((7, 8)),
+                best: Some(Move::normal(7, 8)),
             },
         );
 
         let kept = table.get(0).expect("deep exact entry should be retained");
         assert_eq!(kept.depth, 10);
         assert_eq!(kept.value, 100);
-        assert_eq!(kept.best, Some((1, 2)));
+        assert_eq!(kept.best, Some(Move::normal(1, 2)));
+    }
+
+    #[test]
+    fn fail_low_store_preserves_previous_best_move() {
+        let table = Table::new(64);
+        let key = 0xDEAD_BEEF_1234_5678;
+        table.store(
+            key,
+            TTEntry {
+                depth: 3,
+                value: 40,
+                bound: Bound::Exact,
+                best: Some(Move::normal(12, 28)),
+            },
+        );
+        // Deeper fail-low result with no move replaces the entry...
+        table.store(
+            key,
+            TTEntry {
+                depth: 6,
+                value: -15,
+                bound: Bound::Upper,
+                best: None,
+            },
+        );
+        let entry = table.get(key).expect("entry should be present");
+        assert_eq!(entry.depth, 6);
+        assert_eq!(entry.value, -15);
+        assert!(matches!(entry.bound, Bound::Upper));
+        // ...but keeps the previously stored move.
+        assert_eq!(entry.best, Some(Move::normal(12, 28)));
+
+        // A new real move still overrides it.
+        table.store(
+            key,
+            TTEntry {
+                depth: 7,
+                value: 10,
+                bound: Bound::Lower,
+                best: Some(Move::normal(1, 18)),
+            },
+        );
+        assert_eq!(table.get(key).unwrap().best, Some(Move::normal(1, 18)));
+    }
+
+    #[test]
+    fn bucket_count_is_power_of_two_and_rounds_down() {
+        assert_eq!(std::mem::size_of::<super::Bucket>(), 64);
+        for (size, buckets) in [
+            (1, 1),
+            (4, 1),
+            (7, 1),
+            (8, 2),
+            (100, 16),
+            (1 << 22, 1 << 20),
+        ] {
+            let table = Table::new(size);
+            assert_eq!(table.0.buckets.len(), buckets, "size {size}");
+            assert_eq!(table.0.buckets.as_ptr() as usize % 64, 0);
+        }
+    }
+
+    #[test]
+    fn torn_entry_is_rejected() {
+        let table = Table::new(4);
+        let entry = TTEntry {
+            depth: 5,
+            value: 7,
+            bound: Bound::Exact,
+            best: Some(Move::normal(2, 3)),
+        };
+        table.store(42, entry);
+        table.store(43, entry);
+        // Simulate a torn write: pair the data of one slot with the key of another.
+        let slots = &table.0.buckets[0].entries;
+        let d1 = slots[1].data.load(std::sync::atomic::Ordering::Relaxed);
+        slots[0]
+            .data
+            .store(d1 ^ 1, std::sync::atomic::Ordering::Relaxed);
+        assert!(table.get(42).is_none());
+        assert!(table.get(43).is_some());
     }
 
     #[test]
@@ -503,15 +589,15 @@ mod tests {
                             } else {
                                 Bound::Upper
                             },
-                            best: Some(((n % 64) as u8, ((n + 1) % 64) as u8)),
+                            best: Some(Move::normal((n % 64) as u8, ((n + 1) % 64) as u8)),
                         },
                     );
 
                     if let Some(entry) = table.get(key) {
                         assert!(entry.depth <= 32);
-                        if let Some((from, to)) = entry.best {
-                            assert!(from < 64);
-                            assert!(to < 64);
+                        if let Some(mv) = entry.best {
+                            assert!(mv.from_sq() < 64);
+                            assert!(mv.to_sq() < 64);
                         }
                     }
                 }

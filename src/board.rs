@@ -1,6 +1,6 @@
 use core::option::Option::None;
 
-use crate::attacks::{bishop_attacks, rook_attacks};
+use crate::attacks::{BISHOP_PSEUDO, ROOK_PSEUDO, bishop_attacks, rook_attacks};
 use crate::pieces::{Color, Piece, PieceType};
 use crate::transposition::ZOBRIST;
 use crate::types::{Move, UndoState};
@@ -29,24 +29,19 @@ pub struct Board {
     pub eval_phase: i32,
     pub en_passant: Option<(usize, usize)>,
     pub castling: [[bool; 2]; 2],
+    /// Plies since the last capture or pawn move (fifty-move rule). Counted from
+    /// the position the board was set up from, where it starts at 0.
+    pub halfmove: u16,
 }
 
+#[inline(always)]
 pub fn color_idx(color: Color) -> usize {
-    match color {
-        Color::White => 0,
-        Color::Black => 1,
-    }
+    color as usize
 }
 
+#[inline(always)]
 pub fn piece_index(pt: PieceType) -> usize {
-    match pt {
-        PieceType::Pawn => 0,
-        PieceType::Knight => 1,
-        PieceType::Bishop => 2,
-        PieceType::Rook => 3,
-        PieceType::Queen => 4,
-        PieceType::King => 5,
-    }
+    pt as usize
 }
 
 fn sq_mask(x: usize, y: usize) -> u64 {
@@ -66,10 +61,12 @@ impl Board {
             eval_phase: 0,
             en_passant: None,
             castling: [[true, true], [true, true]],
+            halfmove: 0,
         }
     }
 
     pub fn setup_standard(&mut self) {
+        self.halfmove = 0;
         self.white_occ = 0;
         self.black_occ = 0;
         self.hash = 0;
@@ -766,6 +763,23 @@ impl Board {
         }
     }
 
+    /// Whether `color` has at least one knight, bishop, rook or queen. Used to
+    /// disable null-move pruning in king-and-pawn endings (zugzwang).
+    #[inline(always)]
+    /// Whether `color` has any legal move (early exit, see `movegen::has_legal_move`).
+    pub fn has_legal_move(&mut self, color: Color) -> bool {
+        crate::movegen::has_legal_move(self, color)
+    }
+
+    pub fn has_non_pawn_material(&self, color: Color) -> bool {
+        let bb = &self.bitboards[color_idx(color)];
+        (bb[piece_index(PieceType::Knight)]
+            | bb[piece_index(PieceType::Bishop)]
+            | bb[piece_index(PieceType::Rook)]
+            | bb[piece_index(PieceType::Queen)])
+            != 0
+    }
+
     pub fn piece_count_all(&self) -> usize {
         (self.white_occ | self.black_occ).count_ones() as usize
     }
@@ -837,24 +851,107 @@ impl Board {
         fen
     }
 
+    /// Removes `piece` from `sq`, updating bitboards, occupancy, eval and hash.
+    #[inline(always)]
+    fn remove_piece(&mut self, sq: usize, piece: Piece) {
+        let sq = sq & 63;
+        let (mg, eg, phase) = crate::eval::piece_eval_delta(piece, sq);
+        self.eval_mg -= mg;
+        self.eval_eg -= eg;
+        self.eval_phase -= phase;
+        self.hash ^= ZOBRIST[color_idx(piece.color)][piece_index(piece.piece_type)][sq];
+        self.remove_raw(sq, piece);
+    }
+
+    /// Puts `piece` on the empty square `sq`, updating eval and hash too.
+    #[inline(always)]
+    fn add_piece(&mut self, sq: usize, piece: Piece) {
+        let sq = sq & 63;
+        let (mg, eg, phase) = crate::eval::piece_eval_delta(piece, sq);
+        self.eval_mg += mg;
+        self.eval_eg += eg;
+        self.eval_phase += phase;
+        self.hash ^= ZOBRIST[color_idx(piece.color)][piece_index(piece.piece_type)][sq];
+        self.put_raw(sq, piece);
+    }
+
+    /// Mailbox/bitboard/occupancy-only removal (no eval or hash update).
+    #[inline(always)]
+    fn remove_raw(&mut self, sq: usize, piece: Piece) {
+        let sq = sq & 63;
+        let mask = 1u64 << sq;
+        self.squares[sq >> 3][sq & 7] = None;
+        self.bitboards[color_idx(piece.color)][piece_index(piece.piece_type)] &= !mask;
+        if piece.color == Color::White {
+            self.white_occ &= !mask;
+        } else {
+            self.black_occ &= !mask;
+        }
+    }
+
+    /// Mailbox/bitboard/occupancy-only placement on an empty square.
+    #[inline(always)]
+    fn put_raw(&mut self, sq: usize, piece: Piece) {
+        let sq = sq & 63;
+        let mask = 1u64 << sq;
+        self.squares[sq >> 3][sq & 7] = Some(piece);
+        self.bitboards[color_idx(piece.color)][piece_index(piece.piece_type)] |= mask;
+        if piece.color == Color::White {
+            self.white_occ |= mask;
+        } else {
+            self.black_occ |= mask;
+        }
+    }
+
+    /// `set_index` without eval or hash maintenance.
+    #[inline(always)]
+    fn set_raw(&mut self, sq: usize, piece: Option<Piece>) {
+        let sq = sq & 63;
+        if let Some(old) = self.squares[sq >> 3][sq & 7] {
+            self.remove_raw(sq, old);
+        }
+        if let Some(pce) = piece {
+            self.put_raw(sq, pce);
+        }
+    }
+
     #[inline]
     pub fn make_move_fast(&mut self, mv: Move, color: Color) -> UndoState {
         let from_sq = mv.from_sq();
         let to_sq = mv.to_sq();
-        let from_x = (from_sq % 8) as usize;
-        let from_y = (from_sq / 8) as usize;
-        let to_x = (to_sq % 8) as usize;
-        let to_y = (to_sq / 8) as usize;
+        let from = (from_sq & 63) as usize;
+        let to = (to_sq & 63) as usize;
+        let from_x = from & 7;
+        let from_y = from >> 3;
+        let to_x = to & 7;
+        let to_y = to >> 3;
 
-        let piece = self.get_index(from_x, from_y).unwrap();
-        let captured = self.get_index(to_x, to_y);
+        let piece = self.squares[from_y][from_x].unwrap();
+        let captured = self.squares[to_y][to_x];
+        let halfmove = self.halfmove;
+        self.halfmove = if piece.piece_type == PieceType::Pawn || captured.is_some() {
+            0
+        } else {
+            halfmove.saturating_add(1)
+        };
 
         let prev_ep = self
             .en_passant
             .map(|(x, y)| (y * 8 + x) as u8)
             .unwrap_or(UndoState::NO_EP);
         let prev_castling = self.pack_castling();
-        let prev_hash = self.hash;
+        let undo_base = UndoState {
+            mv,
+            captured: UndoState::NO_CAPTURE,
+            captured_sq: to_sq,
+            prev_ep,
+            prev_castling,
+            prev_hash: self.hash,
+            prev_eval_mg: self.eval_mg,
+            prev_eval_eg: self.eval_eg,
+            prev_eval_phase: self.eval_phase,
+            prev_halfmove: halfmove,
+        };
 
         let mut captured_piece_idx = UndoState::NO_CAPTURE;
         let mut captured_sq = to_sq;
@@ -866,9 +963,9 @@ impl Board {
                 to_y + 1
             };
             captured_sq = (cap_y * 8 + to_x) as u8;
-            let cap_piece = self.get_index(to_x, cap_y).unwrap();
+            let cap_piece = self.squares[cap_y][to_x].unwrap();
             captured_piece_idx = piece_index(cap_piece.piece_type) as u8;
-            self.set_index(to_x, cap_y, None);
+            self.remove_piece(captured_sq as usize, cap_piece);
         } else if let Some(cap) = captured {
             captured_piece_idx = piece_index(cap.piece_type) as u8;
         }
@@ -891,15 +988,11 @@ impl Board {
 
         if captured.is_some() {
             let opp = 1 - cidx;
-            if to_x == 0 && (to_y == 0 || to_y == 7) {
-                let rank = if opp == 0 { 0 } else { 7 };
-                if to_y == rank {
+            let opp_rank = if opp == 0 { 0 } else { 7 };
+            if to_y == opp_rank {
+                if to_x == 0 {
                     self.castling[opp][1] = false;
-                }
-            }
-            if to_x == 7 && (to_y == 0 || to_y == 7) {
-                let rank = if opp == 0 { 0 } else { 7 };
-                if to_y == rank {
+                } else if to_x == 7 {
                     self.castling[opp][0] = false;
                 }
             }
@@ -938,51 +1031,44 @@ impl Board {
             piece
         };
 
-        self.set_index(to_x, to_y, Some(moving_piece));
-        self.set_index(from_x, from_y, None);
+        // Same net effect as set_index(to, moving) followed by set_index(from, None).
+        if let Some(cap) = self.squares[to_y][to_x] {
+            self.remove_piece(to, cap);
+        }
+        self.add_piece(to, moving_piece);
+        self.remove_piece(from, piece);
 
         UndoState {
-            mv,
             captured: captured_piece_idx,
             captured_sq,
-            prev_ep,
-            prev_castling,
-            prev_hash,
+            ..undo_base
         }
     }
 
     #[inline]
     pub fn unmake_move_fast(&mut self, state: UndoState, color: Color) {
         let mv = state.mv;
-        let from_sq = mv.from_sq();
-        let to_sq = mv.to_sq();
-        let from_x = (from_sq % 8) as usize;
-        let from_y = (from_sq / 8) as usize;
-        let to_x = (to_sq % 8) as usize;
-        let to_y = (to_sq / 8) as usize;
+        let from = (mv.from_sq() & 63) as usize;
+        let to = (mv.to_sq() & 63) as usize;
 
-        let mut moving_piece = self.get_index(to_x, to_y).unwrap();
-
+        let on_target = self.squares[to >> 3][to & 7].unwrap();
+        let mut moving_piece = on_target;
         if mv.is_promotion() {
             moving_piece.piece_type = PieceType::Pawn;
         }
 
-        self.set_index(from_x, from_y, Some(moving_piece));
-        self.set_index(to_x, to_y, None);
+        self.set_raw(from, Some(moving_piece));
+        self.remove_raw(to, on_target);
 
         if state.has_capture() {
-            let cap_sq = state.captured_sq;
-            let cap_x = (cap_sq % 8) as usize;
-            let cap_y = (cap_sq / 8) as usize;
             let opp_color = if color == Color::White {
                 Color::Black
             } else {
                 Color::White
             };
             let cap_type = Self::piece_type_from_idx(state.captured as usize);
-            self.set_index(
-                cap_x,
-                cap_y,
+            self.set_raw(
+                state.captured_sq as usize,
                 Some(Piece {
                     piece_type: cap_type,
                     color: opp_color,
@@ -991,15 +1077,15 @@ impl Board {
         }
 
         if mv.is_castle() {
-            let rank = from_y;
+            let base = from & !7;
             if mv.flags() == Move::FLAG_KING_CASTLE {
-                let rook = self.get_index(5, rank);
-                self.set_index(7, rank, rook);
-                self.set_index(5, rank, None);
+                let rook = self.squares[base >> 3][5];
+                self.set_raw(base + 7, rook);
+                self.set_raw(base + 5, None);
             } else {
-                let rook = self.get_index(3, rank);
-                self.set_index(0, rank, rook);
-                self.set_index(3, rank, None);
+                let rook = self.squares[base >> 3][3];
+                self.set_raw(base, rook);
+                self.set_raw(base + 3, None);
             }
         }
 
@@ -1012,6 +1098,10 @@ impl Board {
         self.unpack_castling(state.prev_castling);
 
         self.hash = state.prev_hash;
+        self.eval_mg = state.prev_eval_mg;
+        self.eval_eg = state.prev_eval_eg;
+        self.eval_phase = state.prev_eval_phase;
+        self.halfmove = state.prev_halfmove;
     }
 
     pub fn recompute_eval_state(&mut self) {
@@ -1067,14 +1157,15 @@ impl Board {
 
     #[inline(always)]
     fn piece_type_from_idx(idx: usize) -> PieceType {
-        match idx {
-            0 => PieceType::Pawn,
-            1 => PieceType::Knight,
-            2 => PieceType::Bishop,
-            3 => PieceType::Rook,
-            4 => PieceType::Queen,
-            _ => PieceType::King,
-        }
+        const TYPES: [PieceType; 6] = [
+            PieceType::Pawn,
+            PieceType::Knight,
+            PieceType::Bishop,
+            PieceType::Rook,
+            PieceType::Queen,
+            PieceType::King,
+        ];
+        TYPES[idx.min(5)]
     }
 
     #[inline(always)]
@@ -1093,43 +1184,35 @@ impl Board {
 
     #[inline]
     pub fn is_square_attacked_by(&self, sq: u8, by_color: Color) -> bool {
-        let cidx = color_idx(by_color);
-        let sq_bb = 1u64 << sq;
-        let occ = self.occupied();
+        self.is_square_attacked_by_occ(sq, by_color, self.occupied())
+    }
 
-        let pawn_attacks = if by_color == Color::White {
-            let pawns = self.bitboards[cidx][0];
-            ((pawns & !0x0101010101010101) << 7) | ((pawns & !0x8080808080808080) << 9)
-        } else {
-            let pawns = self.bitboards[cidx][0];
-            ((pawns & !0x8080808080808080) >> 7) | ((pawns & !0x0101010101010101) >> 9)
-        };
-        if (pawn_attacks & sq_bb) != 0 {
+    /// Like `is_square_attacked_by`, but slider attacks use `occ` as occupancy
+    /// (e.g. with the moving king removed).
+    #[inline]
+    pub fn is_square_attacked_by_occ(&self, sq: u8, by_color: Color, occ: u64) -> bool {
+        let sq = (sq & 63) as usize;
+        let by = &self.bitboards[color_idx(by_color)];
+
+        if (crate::movegen::pawn_attackers_to_square(sq, by_color) & by[0]) != 0 {
+            return true;
+        }
+        if (crate::movegen::KNIGHT_TABLE[sq] & by[1]) != 0 {
+            return true;
+        }
+        if (crate::movegen::KING_TABLE[sq] & by[5]) != 0 {
             return true;
         }
 
-        let knights = self.bitboards[cidx][1];
-        if (crate::movegen::KNIGHT_TABLE[sq as usize] & knights) != 0 {
+        let bishops_queens = by[2] | by[4];
+        if (BISHOP_PSEUDO[sq] & bishops_queens) != 0
+            && (bishop_attacks(sq, occ) & bishops_queens) != 0
+        {
             return true;
         }
 
-        let kings = self.bitboards[cidx][5];
-        if (crate::movegen::KING_TABLE[sq as usize] & kings) != 0 {
-            return true;
-        }
-
-        let bishops_queens = self.bitboards[cidx][2] | self.bitboards[cidx][4];
-        let rooks_queens = self.bitboards[cidx][3] | self.bitboards[cidx][4];
-
-        if bishop_attacks(sq as usize, occ) & bishops_queens != 0 {
-            return true;
-        }
-
-        if rook_attacks(sq as usize, occ) & rooks_queens != 0 {
-            return true;
-        }
-
-        false
+        let rooks_queens = by[3] | by[4];
+        (ROOK_PSEUDO[sq] & rooks_queens) != 0 && (rook_attacks(sq, occ) & rooks_queens) != 0
     }
 
     #[inline]
@@ -1146,6 +1229,60 @@ impl Board {
             Color::White
         };
         self.is_square_attacked_by(king_sq, opp)
+    }
+
+    /// Whether `mv` (a legal move of `color`) leaves the opponent in check,
+    /// computed before making it. Handles direct and discovered checks,
+    /// promotions, en passant and castling (the rook gives the check).
+    #[inline]
+    pub fn gives_check(&self, mv: Move, color: Color) -> bool {
+        let them = if color == Color::White {
+            Color::Black
+        } else {
+            Color::White
+        };
+        let king_bb = self.bitboards[color_idx(them)][5];
+        if king_bb == 0 {
+            return false;
+        }
+        let ksq = king_bb.trailing_zeros() as usize;
+
+        let from = (mv.from_sq() & 63) as usize;
+        let to = (mv.to_sq() & 63) as usize;
+        let from_bb = 1u64 << from;
+        let to_bb = 1u64 << to;
+
+        let mut pieces = self.bitboards[color_idx(color)];
+        let Some(moved) = (0..6).find(|&pt| pieces[pt] & from_bb != 0) else {
+            return false;
+        };
+        let landed = mv.promotion_piece().map_or(moved, piece_index);
+        pieces[moved] &= !from_bb;
+        pieces[landed] |= to_bb;
+
+        let mut occ = (self.occupied() & !from_bb) | to_bb;
+        if mv.is_ep() {
+            let captured = if color == Color::White {
+                to - 8
+            } else {
+                to + 8
+            };
+            occ &= !(1u64 << captured);
+        } else if mv.is_castle() {
+            let (rook_from, rook_to) = if mv.flags() == Move::FLAG_KING_CASTLE {
+                (from + 3, from + 1)
+            } else {
+                (from - 4, from - 1)
+            };
+            let rook_move = (1u64 << rook_from) | (1u64 << rook_to);
+            pieces[3] ^= rook_move;
+            occ = (occ & !(1u64 << rook_from)) | (1u64 << rook_to);
+        }
+
+        (crate::movegen::pawn_attackers_to_square(ksq, color) & pieces[0]) != 0
+            || (crate::movegen::KNIGHT_TABLE[ksq] & pieces[1]) != 0
+            || (bishop_attacks(ksq, occ) & (pieces[2] | pieces[4])) != 0
+            || (rook_attacks(ksq, occ) & (pieces[3] | pieces[4])) != 0
     }
 
     #[inline(always)]
@@ -1287,6 +1424,36 @@ mod tests {
         assert!(board.get("e5").is_some());
         assert!(board.get("d5").is_some()); // Black pawn restored
         assert!(board.get("d6").is_none());
+    }
+
+    #[test]
+    fn test_has_non_pawn_material() {
+        let mut board = Board::new();
+        let put = |board: &mut Board, sq: &str, piece_type: PieceType, color: Color| {
+            board.set(sq, Some(Piece { piece_type, color }));
+        };
+        put(&mut board, "e1", PieceType::King, Color::White);
+        put(&mut board, "e8", PieceType::King, Color::Black);
+        for sq in ["a2", "b2", "c2", "d2"] {
+            put(&mut board, sq, PieceType::Pawn, Color::White);
+        }
+        // King + pawns only: no non-pawn material, whatever the piece count.
+        assert!(!board.has_non_pawn_material(Color::White));
+        assert!(!board.has_non_pawn_material(Color::Black));
+
+        for (sq, piece_type) in [
+            ("b8", PieceType::Knight),
+            ("c8", PieceType::Bishop),
+            ("a8", PieceType::Rook),
+            ("d8", PieceType::Queen),
+        ] {
+            put(&mut board, sq, piece_type, Color::Black);
+            assert!(board.has_non_pawn_material(Color::Black), "{piece_type:?}");
+            assert!(!board.has_non_pawn_material(Color::White));
+            board.set(sq, None);
+        }
+        assert!(!board.has_non_pawn_material(Color::Black));
+        assert!(setup_board().has_non_pawn_material(Color::White));
     }
 
     #[test]

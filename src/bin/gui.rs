@@ -7,7 +7,31 @@ use chessmind::{
 use eframe::{App, Frame, egui};
 use egui::Color32;
 use num_cpus;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant};
+
+/// Repaint cadence while a clock is ticking (tenths are shown under 10 s).
+const CLOCK_REPAINT: Duration = Duration::from_millis(100);
+
+/// Result of a background AI search; the engine travels back with it.
+struct SearchDone {
+    engine: Engine,
+    best: Option<((String, String), u32)>,
+    elapsed: Duration,
+    generation: u64,
+}
+
+fn clone_game(game: &Game) -> Game {
+    Game {
+        board: game.board.clone(),
+        current_turn: game.current_turn,
+        history: game.history.clone(),
+        hash_history: game.hash_history.clone(),
+        hash_counts: game.hash_counts.clone(),
+        result: game.result,
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum TimePreset {
@@ -161,7 +185,11 @@ impl ChessClock {
 
 pub struct GuiApp {
     game: Game,
-    engine: Engine,
+    /// `None` while the engine is lent to the search thread.
+    engine: Option<Engine>,
+    search_rx: Option<Receiver<SearchDone>>,
+    /// Bumped on restart so results of a search from a previous game are dropped.
+    generation: u64,
     vs_ai: bool,
     ai_color: Color,
     dragging: Option<(usize, usize, Piece)>,
@@ -187,8 +215,10 @@ impl GuiApp {
                 if let Ok(Some(path)) = eng.load_syzygy_from_env() {
                     println!("Loaded Syzygy tablebases from {}", path);
                 }
-                eng
+                Some(eng)
             },
+            search_rx: None,
+            generation: 0,
             vs_ai: false,
             ai_color: Color::Black,
             dragging: None,
@@ -223,7 +253,52 @@ impl GuiApp {
         }
     }
 
-    fn check_ai_move(&mut self) {
+    fn is_ai_turn(&self) -> bool {
+        self.vs_ai && self.game.result.is_none() && self.game.current_turn == self.ai_color
+    }
+
+    /// Collects a finished background search, if any, and plays its move when
+    /// it still applies to the current position.
+    fn poll_search(&mut self) {
+        let Some(rx) = &self.search_rx else {
+            return;
+        };
+        let done = match rx.try_recv() {
+            Ok(done) => done,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                eprintln!("AI search thread died; recreating the engine");
+                self.search_rx = None;
+                self.engine = Some(Engine::from_env(8, num_cpus::get()));
+                return;
+            }
+        };
+        self.search_rx = None;
+        self.engine = Some(done.engine);
+
+        if done.generation != self.generation || self.flag_winner.is_some() || !self.is_ai_turn() {
+            return;
+        }
+        if let Some(((s, e), depth)) = done.best {
+            self.game.make_move(&s, &e);
+            self.last_ai_time = Some(done.elapsed);
+
+            if self.use_clock && self.game_started {
+                let next_color = if self.ai_color == Color::White {
+                    Color::Black
+                } else {
+                    Color::White
+                };
+                self.clock.switch(next_color);
+            }
+
+            println!("AI move {s}{e} in {:?} (depth {})", done.elapsed, depth);
+        }
+    }
+
+    fn check_ai_move(&mut self, ctx: &egui::Context) {
+        self.poll_search();
+
         if self.flag_winner.is_some() {
             return;
         }
@@ -242,28 +317,30 @@ impl GuiApp {
             }
         }
 
-        if self.vs_ai && self.game.result.is_none() && self.game.current_turn == self.ai_color {
-            let time_config = self.get_time_config();
-            let start = Instant::now();
-
-            if let Some(((s, e), depth)) = self.engine.best_move_timed(&mut self.game, &time_config)
-            {
-                let duration = start.elapsed();
-                self.game.make_move(&s, &e);
-                self.last_ai_time = Some(duration);
-
-                if self.use_clock && self.game_started {
-                    let next_color = if self.ai_color == Color::White {
-                        Color::Black
-                    } else {
-                        Color::White
-                    };
-                    self.clock.switch(next_color);
-                }
-
-                println!("AI move {s}{e} in {:?} (depth {})", duration, depth);
-            }
+        if self.search_rx.is_some() || !self.is_ai_turn() {
+            return;
         }
+        let Some(mut engine) = self.engine.take() else {
+            return;
+        };
+
+        let time_config = self.get_time_config();
+        let mut game = clone_game(&self.game);
+        let generation = self.generation;
+        let ctx = ctx.clone();
+        let (tx, rx) = mpsc::channel();
+        self.search_rx = Some(rx);
+        thread::spawn(move || {
+            let start = Instant::now();
+            let best = engine.best_move_timed(&mut game, &time_config);
+            let _ = tx.send(SearchDone {
+                engine,
+                best,
+                elapsed: start.elapsed(),
+                generation,
+            });
+            ctx.request_repaint();
+        });
     }
 
     fn on_player_move(&mut self) {
@@ -277,7 +354,9 @@ impl GuiApp {
         }
     }
 
-    fn restart_game(&mut self) {
+    fn restart_game(&mut self, ctx: &egui::Context) {
+        // A search still running for the old game is ignored when it returns.
+        self.generation += 1;
         self.game = Game::new();
         self.dragging = None;
         self.game_started = false;
@@ -293,7 +372,7 @@ impl GuiApp {
             );
         }
 
-        self.check_ai_move();
+        self.check_ai_move(ctx);
     }
 
     fn piece_char(piece: &Piece) -> char {
@@ -317,15 +396,15 @@ impl GuiApp {
 impl App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
         if self.use_clock && self.game_started && self.clock.running {
-            ctx.request_repaint();
+            ctx.request_repaint_after(CLOCK_REPAINT);
         }
 
-        self.check_ai_move();
+        self.check_ai_move(ctx);
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("🔄 Restart").clicked() {
-                    self.restart_game();
+                    self.restart_game(ctx);
                 }
 
                 ui.separator();
@@ -476,11 +555,12 @@ impl App for GuiApp {
                                         Board::index_to_algebraic(sx, sy),
                                         Board::index_to_algebraic(fx as usize, fy as usize),
                                     ) {
-                                        if !self.game.make_move(&start, &end) {
+                                        // The AI is thinking: its pieces are not ours to move.
+                                        if self.is_ai_turn() || !self.game.make_move(&start, &end) {
                                             self.game.board.set_index(sx, sy, Some(piece));
                                         } else {
                                             self.on_player_move();
-                                            self.check_ai_move();
+                                            self.check_ai_move(ctx);
                                         }
                                     }
                                 } else {

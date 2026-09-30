@@ -8,7 +8,27 @@ use egui::Color32;
 use num_cpus;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::{Duration, Instant};
+
+/// Result of a background engine search; the engine travels back with it.
+struct SearchDone {
+    engine: Engine,
+    mv: Option<(String, String)>,
+    generation: u64,
+}
+
+fn clone_game(game: &Game) -> Game {
+    Game {
+        board: game.board.clone(),
+        current_turn: game.current_turn,
+        history: game.history.clone(),
+        hash_history: game.hash_history.clone(),
+        hash_counts: game.hash_counts.clone(),
+        result: game.result,
+    }
+}
 
 #[derive(PartialEq)]
 enum Opponent {
@@ -17,7 +37,11 @@ enum Opponent {
 }
 
 pub struct ArenaApp {
-    engine: Engine,
+    /// `None` while the engine is lent to the search thread.
+    engine: Option<Engine>,
+    search_rx: Option<Receiver<SearchDone>>,
+    /// Bumped on reset so a search from a previous run is ignored.
+    generation: u64,
     game: Game,
     opponent: Opponent,
     num_games: u32,
@@ -37,8 +61,10 @@ impl ArenaApp {
                 if let Ok(Some(path)) = eng.load_syzygy_from_env() {
                     println!("Loaded Syzygy tablebases from {}", path);
                 }
-                eng
+                Some(eng)
             },
+            search_rx: None,
+            generation: 0,
             game: Game::new(),
             opponent: Opponent::AiVsAi,
             num_games: 10,
@@ -52,6 +78,7 @@ impl ArenaApp {
     }
 
     fn reset(&mut self) {
+        self.generation += 1;
         self.game = Game::new();
         self.games_played = 0;
         self.wins = 0;
@@ -59,7 +86,54 @@ impl ArenaApp {
         self.last_move = Instant::now();
     }
 
-    fn step(&mut self) {
+    /// Plays the move of a finished background search, if any.
+    fn poll_search(&mut self) {
+        let Some(rx) = &self.search_rx else {
+            return;
+        };
+        let done = match rx.try_recv() {
+            Ok(done) => done,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                eprintln!("Engine search thread died; recreating the engine");
+                self.search_rx = None;
+                self.engine = Some(Engine::from_env(6, num_cpus::get()));
+                return;
+            }
+        };
+        self.search_rx = None;
+        self.engine = Some(done.engine);
+        if !self.running || done.generation != self.generation {
+            return;
+        }
+        if let Some((s, e)) = done.mv {
+            self.game.make_move(&s, &e);
+        }
+        self.last_move = Instant::now();
+    }
+
+    /// Starts the engine search for the side to move on a worker thread.
+    fn spawn_search(&mut self, ctx: &egui::Context) {
+        let Some(mut engine) = self.engine.take() else {
+            return;
+        };
+        let mut game = clone_game(&self.game);
+        let generation = self.generation;
+        let ctx = ctx.clone();
+        let (tx, rx) = mpsc::channel();
+        self.search_rx = Some(rx);
+        thread::spawn(move || {
+            let mv = engine.best_move(&mut game);
+            let _ = tx.send(SearchDone {
+                engine,
+                mv,
+                generation,
+            });
+            ctx.request_repaint();
+        });
+    }
+
+    fn step(&mut self, ctx: &egui::Context) {
         let legal = self.game.legal_moves();
         if legal.is_empty() {
             if self.game.board.in_check(self.game.current_turn) {
@@ -77,24 +151,25 @@ impl ArenaApp {
                 return;
             }
             self.game = Game::new();
+            self.last_move = Instant::now();
             return;
         }
 
-        let mv = match self.opponent {
-            Opponent::AiVsAi => self.engine.best_move(&mut self.game),
-            Opponent::AiVsRandom => {
-                if self.game.current_turn == Color::White {
-                    self.engine.best_move(&mut self.game)
-                } else {
-                    let mut rng = thread_rng();
-                    legal.choose(&mut rng).cloned()
-                }
-            }
+        let engine_to_move = match self.opponent {
+            Opponent::AiVsAi => true,
+            Opponent::AiVsRandom => self.game.current_turn == Color::White,
         };
+        if engine_to_move {
+            // The move is played by `poll_search` once the worker returns.
+            self.spawn_search(ctx);
+            return;
+        }
 
-        if let Some((s, e)) = mv {
+        let mut rng = thread_rng();
+        if let Some((s, e)) = legal.choose(&mut rng).cloned() {
             self.game.make_move(&s, &e);
         }
+        self.last_move = Instant::now();
     }
 
     fn piece_char(piece: &Piece) -> char {
@@ -196,12 +271,21 @@ impl App for ArenaApp {
             }
         });
 
-        if self.running && self.last_move.elapsed() >= self.move_delay {
-            self.step();
-            self.last_move = Instant::now();
-        }
+        self.poll_search();
 
-        ctx.request_repaint();
+        // Idle or waiting on a search: no repaint needed (the search thread
+        // wakes the UI when it is done).
+        if self.running && self.search_rx.is_none() {
+            let elapsed = self.last_move.elapsed();
+            if elapsed >= self.move_delay {
+                self.step(ctx);
+                if self.search_rx.is_none() {
+                    ctx.request_repaint_after(self.move_delay);
+                }
+            } else {
+                ctx.request_repaint_after(self.move_delay - elapsed);
+            }
+        }
     }
 }
 

@@ -232,6 +232,14 @@ impl MoveList {
         self.count = 0;
     }
 
+    /// Keeps only the first `len` moves (no-op if `len >= self.len()`).
+    #[inline(always)]
+    pub fn truncate(&mut self, len: usize) {
+        if len < self.count {
+            self.count = len;
+        }
+    }
+
     #[inline(always)]
     pub fn swap(&mut self, i: usize, j: usize) {
         self.moves.swap(i, j);
@@ -362,6 +370,10 @@ pub struct UndoState {
     pub prev_ep: u8,
     pub prev_castling: u8,
     pub prev_hash: u64,
+    pub prev_eval_mg: i32,
+    pub prev_eval_eg: i32,
+    pub prev_eval_phase: i32,
+    pub prev_halfmove: u16,
 }
 
 impl UndoState {
