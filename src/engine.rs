@@ -358,6 +358,52 @@ const MAX_TRIED_QUIETS: usize = 64;
 const MAX_TRIED_CAPTURES: usize = 32;
 const LMP_LIMITS: [usize; 5] = [0, 5, 7, 10, 14];
 const MATE_VALUE: i32 = 10000;
+
+/// Score of a finished search, from the point of view of the side to move.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchScore {
+    Centipawns(i32),
+    /// Mate in this many moves; negative when the side to move gets mated.
+    /// Syzygy wins and losses are reported as mates too.
+    Mate(i32),
+}
+
+impl SearchScore {
+    fn from_raw(score: i32) -> Self {
+        let plies_to_mate = MATE_VALUE - score.abs();
+        if plies_to_mate <= MAX_PLY as i32 {
+            let moves = (plies_to_mate + 1) / 2;
+            SearchScore::Mate(if score > 0 { moves } else { -moves })
+        } else {
+            SearchScore::Centipawns(score)
+        }
+    }
+
+    /// Estimated chance of winning for the side to move, in percent (0..=100).
+    ///
+    /// Uses Lichess's logistic curve (cp clamped to +-1000). It is not calibrated
+    /// on this engine, so it is an estimate.
+    pub fn win_percent(self) -> f64 {
+        match self {
+            SearchScore::Mate(n) if n > 0 => 100.0,
+            SearchScore::Mate(_) => 0.0,
+            SearchScore::Centipawns(cp) => {
+                let cp = cp.clamp(-1000, 1000) as f64;
+                50.0 + 50.0 * (2.0 / (1.0 + (-0.003_682_08 * cp).exp()) - 1.0)
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for SearchScore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            SearchScore::Centipawns(cp) => write!(f, "{:+.2}", cp as f64 / 100.0),
+            SearchScore::Mate(n) => write!(f, "#{n}"),
+        }
+    }
+}
+
 /// Halfmove clock value at which the fifty-move rule makes the game a draw.
 const FIFTY_MOVE_PLIES: u16 = 100;
 const MAX_PLY: usize = 128;
@@ -426,6 +472,8 @@ pub struct Engine {
     search_history: Vec<u64>,
     ponder: Option<PonderState>,
     last_nodes: u64,
+    /// Root score of the most recent search (None for book moves or no search).
+    last_score: Option<i32>,
     /// Nodes searched by this engine instance not yet added to the shared
     /// `TimeManager::node_count` (flushed every `NODE_FLUSH_INTERVAL` nodes).
     local_nodes: u64,
@@ -450,6 +498,7 @@ impl Clone for Engine {
             search_history: self.search_history.clone(),
             ponder: None,
             last_nodes: 0,
+            last_score: None,
             local_nodes: 0,
             rep_floor: self.rep_floor,
         }
@@ -488,6 +537,7 @@ impl Engine {
             search_history: Vec::new(),
             ponder: None,
             last_nodes: 0,
+            last_score: None,
             local_nodes: 0,
             rep_floor: 0,
         }
@@ -571,6 +621,7 @@ impl Engine {
         allow_book: bool,
     ) -> Option<((String, String), u32)> {
         self.tt.next_age();
+        self.last_score = None;
 
         if allow_book {
             if let Some(book_mv) = book_move(&game.history, &game.board, game.current_turn) {
@@ -597,6 +648,12 @@ impl Engine {
     /// Number of nodes visited by the most recent search.
     pub fn last_search_nodes(&self) -> u64 {
         self.last_nodes
+    }
+
+    /// Score of the most recent search for the side that was to move, or None
+    /// when the move came from the opening book or no iteration finished.
+    pub fn last_search_score(&self) -> Option<SearchScore> {
+        self.last_score.map(SearchScore::from_raw)
     }
 
     fn ponder_matches(&self, game: &Game, actual_move: Move) -> bool {
@@ -1979,6 +2036,7 @@ impl Engine {
             }
         }
 
+        self.last_score = best_move.and(last_score);
         best_move.map(|m| (Self::move_to_strings(m), reached_depth))
     }
 
@@ -2064,6 +2122,7 @@ impl Engine {
             self.cont_history = std::mem::take(&mut lead.cont_history);
         }
 
+        self.last_score = best_move.and(last_score);
         best_move.map(|m| (Self::move_to_strings(m), reached_depth))
     }
 
@@ -2104,6 +2163,42 @@ fn opposite(c: Color) -> Color {
 mod tests {
     use super::*;
     use crate::pieces::Piece;
+
+    #[test]
+    fn search_score_win_percent() {
+        assert_eq!(SearchScore::from_raw(0), SearchScore::Centipawns(0));
+        assert_eq!(SearchScore::from_raw(MATE_VALUE - 1), SearchScore::Mate(1));
+        assert_eq!(SearchScore::from_raw(MATE_VALUE - 5), SearchScore::Mate(3));
+        assert_eq!(
+            SearchScore::from_raw(-MATE_VALUE + 4),
+            SearchScore::Mate(-2)
+        );
+        assert!((SearchScore::Centipawns(0).win_percent() - 50.0).abs() < 1e-9);
+        let p100 = SearchScore::Centipawns(100).win_percent();
+        let m100 = SearchScore::Centipawns(-100).win_percent();
+        assert!((p100 - 59.1).abs() < 0.1, "{p100}");
+        assert!((p100 + m100 - 100.0).abs() < 1e-9);
+        assert_eq!(SearchScore::Mate(2).win_percent(), 100.0);
+        assert_eq!(SearchScore::Mate(-2).win_percent(), 0.0);
+        assert_eq!(SearchScore::Mate(-2).to_string(), "#-2");
+        assert_eq!(SearchScore::Centipawns(35).to_string(), "+0.35");
+    }
+
+    #[test]
+    fn last_search_score_is_reported() {
+        let mut engine = Engine::new(4);
+        let mut game = Game::new();
+        game.make_move("e2", "e4");
+        game.make_move("a7", "a5");
+        engine.best_move_timed_opts(
+            &mut game,
+            &TimeConfig::fixed_depth(4),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let score = engine.last_search_score().expect("score after a search");
+        assert!((0.0..=100.0).contains(&score.win_percent()));
+    }
 
     fn setup_game() -> Game {
         Game::new()

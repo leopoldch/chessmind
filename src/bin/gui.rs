@@ -1,6 +1,6 @@
 use chessmind::{
     board::Board,
-    engine::{Engine, TimeConfig},
+    engine::{Engine, SearchScore, TimeConfig},
     game::Game,
     pieces::{Color, Piece, PieceType},
 };
@@ -195,6 +195,8 @@ pub struct GuiApp {
     dragging: Option<(usize, usize, Piece)>,
     drag_pos: egui::Pos2,
     last_ai_time: Option<Duration>,
+    /// Score of the AI's last search, from the AI's point of view.
+    last_ai_score: Option<SearchScore>,
 
     clock: ChessClock,
     time_preset: TimePreset,
@@ -224,6 +226,7 @@ impl GuiApp {
             dragging: None,
             drag_pos: egui::Pos2::ZERO,
             last_ai_time: None,
+            last_ai_score: None,
 
             clock: ChessClock::new(300, 0), // 5+0 default
             time_preset: TimePreset::Blitz5,
@@ -274,6 +277,7 @@ impl GuiApp {
             }
         };
         self.search_rx = None;
+        let score = done.engine.last_search_score();
         self.engine = Some(done.engine);
 
         if done.generation != self.generation || self.flag_winner.is_some() || !self.is_ai_turn() {
@@ -282,6 +286,7 @@ impl GuiApp {
         if let Some(((s, e), depth)) = done.best {
             self.game.make_move(&s, &e);
             self.last_ai_time = Some(done.elapsed);
+            self.last_ai_score = score;
 
             if self.use_clock && self.game_started {
                 let next_color = if self.ai_color == Color::White {
@@ -292,7 +297,16 @@ impl GuiApp {
                 self.clock.switch(next_color);
             }
 
-            println!("AI move {s}{e} in {:?} (depth {})", done.elapsed, depth);
+            match score {
+                Some(score) => println!(
+                    "AI move {s}{e} in {:?} (depth {}) eval {} win {:.1}%",
+                    done.elapsed,
+                    depth,
+                    score,
+                    score.win_percent()
+                ),
+                None => println!("AI move {s}{e} in {:?} (book)", done.elapsed),
+            }
         }
     }
 
@@ -519,6 +533,10 @@ impl App for GuiApp {
                     if let Some(t) = self.last_ai_time {
                         ui.separator();
                         ui.label(format!("AI: {:.2?}", t));
+                    }
+                    if let Some(score) = self.last_ai_score {
+                        ui.separator();
+                        ui.label(format!("AI win: {:.0}% ({})", score.win_percent(), score));
                     }
                 }
             });

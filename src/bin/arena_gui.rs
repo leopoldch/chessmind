@@ -102,11 +102,20 @@ impl ArenaApp {
             }
         };
         self.search_rx = None;
+        let score = done.engine.last_search_score();
         self.engine = Some(done.engine);
         if !self.running || done.generation != self.generation {
             return;
         }
         if let Some((s, e)) = done.mv {
+            let mover = self.game.current_turn;
+            match score {
+                Some(score) => println!(
+                    "{mover:?} plays {s}{e} eval {score} win {:.1}%",
+                    score.win_percent()
+                ),
+                None => println!("{mover:?} plays {s}{e} (book)"),
+            }
             self.game.make_move(&s, &e);
         }
         self.last_move = Instant::now();

@@ -10,7 +10,7 @@
 //! Usage: cargo run --release --bin uci
 
 use chessmind::board::Board;
-use chessmind::engine::{Engine, TimeConfig};
+use chessmind::engine::{Engine, SearchScore, TimeConfig};
 use chessmind::game::Game;
 use chessmind::pieces::{Color, Piece, PieceType};
 use std::collections::HashMap;
@@ -217,9 +217,17 @@ impl Uci {
             if let Some((_, depth)) = &result {
                 let nodes = engine.last_search_nodes();
                 let nps = nodes * 1000 / elapsed_ms.max(1);
+                let score = match engine.last_search_score() {
+                    Some(SearchScore::Centipawns(cp)) => format!(" score cp {cp}"),
+                    Some(SearchScore::Mate(n)) => format!(" score mate {n}"),
+                    None => String::new(),
+                };
                 send(&format!(
-                    "info depth {depth} nodes {nodes} time {elapsed_ms} nps {nps}"
+                    "info depth {depth}{score} nodes {nodes} time {elapsed_ms} nps {nps}"
                 ));
+                if let Some(score) = engine.last_search_score() {
+                    send(&format!("info string win {:.1}%", score.win_percent()));
+                }
             }
             drop(engine);
 
