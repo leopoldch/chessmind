@@ -72,6 +72,22 @@ fn pinned_away_from(bbs: &[[u64; 6]; 2], occ: u64, color: Color, target: u8) -> 
 /// The attacker set is computed once; after each exchange only the used
 /// attacker is removed and sliders are re-scanned for x-ray attackers.
 pub fn static_exchange_eval(board: &Board, mv: Move) -> i32 {
+    if !mv.is_capture() && !mv.is_promotion() {
+        return 0;
+    }
+    exchange_eval(board, mv)
+}
+
+/// SEE of a quiet move: what the mover loses (a value <= 0) when the piece is
+/// captured on its destination square. Castling is never losing.
+pub fn static_exchange_eval_quiet(board: &Board, mv: Move) -> i32 {
+    if mv.is_castle() {
+        return 0;
+    }
+    exchange_eval(board, mv)
+}
+
+fn exchange_eval(board: &Board, mv: Move) -> i32 {
     let from_sq = mv.from_sq();
     let to_sq = mv.to_sq();
     let Some((moving_piece, color)) = board.piece_at_sq(from_sq) else {
@@ -84,10 +100,6 @@ pub fn static_exchange_eval(board: &Board, mv: Move) -> i32 {
     } else {
         board.piece_at_sq(to_sq).map(|(piece_type, _)| piece_type)
     };
-
-    if captured_piece.is_none() && !mv.is_promotion() {
-        return 0;
-    }
 
     let bbs = &board.bitboards;
     let sq = (to_sq & 63) as usize;

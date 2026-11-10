@@ -7,7 +7,8 @@
 //!
 //! The resulting `Game` has its repetition history seeded with the start
 //! position only, so threefold repetition counts from the FEN onwards.
-//! `Game` has no halfmove clock: it is returned next to it in `FenPosition`.
+//! The halfmove clock is stored in `Board::halfmove` (used by the search for the
+//! fifty-move rule) and also returned in `FenPosition`.
 
 use crate::board::Board;
 use crate::game::Game;
@@ -154,6 +155,7 @@ pub fn parse_fen(text: &str) -> Result<FenPosition, String> {
     if board.in_check(opposite(turn)) {
         return Err("side not to move is in check".into());
     }
+    board.halfmove = halfmove.min(u16::MAX as u32) as u16;
 
     let hash = board.hash(turn);
     let mut hash_counts = HashMap::new();

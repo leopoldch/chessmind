@@ -156,6 +156,11 @@ pub(crate) fn is_move_pseudo_legal(board: &Board, mv: Move, color: Color) -> boo
     let to_x = to_sq % 8;
     let to_y = to_sq / 8;
 
+    // Flag values 6 and 7 encode nothing.
+    if matches!(mv.flags(), 0b0110 | 0b0111) {
+        return false;
+    }
+
     let piece = match board.get_index(from_x, from_y) {
         Some(piece) if piece.color == color => piece,
         _ => return false,
@@ -178,6 +183,9 @@ pub(crate) fn is_move_pseudo_legal(board: &Board, mv: Move, color: Color) -> boo
 
     match piece.piece_type {
         PieceType::Pawn => {
+            if mv.is_castle() {
+                return false;
+            }
             let promotion_rank = if color == Color::White { 7 } else { 0 };
             if (to_y == promotion_rank) != mv.is_promotion() {
                 return false;
@@ -195,6 +203,10 @@ pub(crate) fn is_move_pseudo_legal(board: &Board, mv: Move, color: Color) -> boo
         PieceType::King => {
             let is_castle = from_y == to_y && from_x.abs_diff(to_x) == 2;
             if mv.is_castle() != is_castle {
+                return false;
+            }
+            // The flag must name the side the king actually moves to.
+            if is_castle && (mv.flags() == Move::FLAG_KING_CASTLE) != (to_x == 6) {
                 return false;
             }
             if mv.is_double_push() || mv.is_ep() || mv.is_promotion() {

@@ -4,7 +4,10 @@
 //! The total node count is a behaviour signature: a pure speed optimisation must
 //! leave it unchanged, while a search change is expected to modify it.
 //!
-//! Usage: cargo run --release --bin bench -- [depth]
+//! Usage: cargo run --release --bin bench -- [depth] [threads]
+//!
+//! With more than one thread the node count is no longer deterministic: use it
+//! to measure the time to depth of the parallel search.
 
 use chessmind::engine::{Engine, TimeConfig};
 use chessmind::game::Game;
@@ -42,6 +45,10 @@ fn main() {
         .nth(1)
         .and_then(|a| a.parse().ok())
         .unwrap_or(10);
+    let threads: usize = std::env::args()
+        .nth(2)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(1);
 
     let mut total_nodes = 0u64;
     let start = Instant::now();
@@ -54,7 +61,7 @@ fn main() {
         }
 
         // A fresh engine per position keeps results independent of order.
-        let mut engine = Engine::new(depth);
+        let mut engine = Engine::with_threads(depth, threads.max(1));
         let t = Instant::now();
         let result = engine.best_move_timed(&mut game, &TimeConfig::fixed_depth(depth));
         let ms = t.elapsed().as_millis();
@@ -69,7 +76,7 @@ fn main() {
 
     let elapsed = start.elapsed().as_secs_f64();
     println!("---");
-    println!("depth {depth}");
+    println!("depth {depth}  threads {threads}");
     println!("total nodes {total_nodes}");
     println!("time {:.2} s", elapsed);
     println!("nps {:.0}", total_nodes as f64 / elapsed.max(1e-9));

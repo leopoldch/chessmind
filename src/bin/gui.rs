@@ -303,7 +303,7 @@ impl GuiApp {
                     done.elapsed,
                     depth,
                     score,
-                    score.win_percent()
+                    score.win_percent_at(chessmind::eval::game_phase(&self.game.board))
                 ),
                 None => println!("AI move {s}{e} in {:?} (book)", done.elapsed),
             }
@@ -536,7 +536,7 @@ impl App for GuiApp {
                     }
                     if let Some(score) = self.last_ai_score {
                         ui.separator();
-                        ui.label(format!("AI win: {:.0}% ({})", score.win_percent(), score));
+                        ui.label(format!("AI win: {:.0}% ({})", score.win_percent_at(chessmind::eval::game_phase(&self.game.board)), score));
                     }
                 }
             });
