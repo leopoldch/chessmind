@@ -9,11 +9,9 @@
 //!
 //! Usage: cargo run --release --bin uci
 
-use chessmind::board::Board;
 use chessmind::engine::{Engine, SearchScore, TimeConfig};
+use chessmind::fen::game_from_fen;
 use chessmind::game::Game;
-use chessmind::pieces::{Color, Piece, PieceType};
-use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -225,8 +223,15 @@ impl Uci {
                 send(&format!(
                     "info depth {depth}{score} nodes {nodes} time {elapsed_ms} nps {nps}"
                 ));
-                if let Some(score) = engine.last_search_score() {
-                    send(&format!("info string win {:.1}%", score.win_percent()));
+                if let (Some(percent), Some((win, draw, loss))) =
+                    (engine.last_search_win_percent(), engine.last_search_wdl())
+                {
+                    send(&format!(
+                        "info string win {percent:.1}% (W {:.0}% D {:.0}% L {:.0}%)",
+                        100.0 * win,
+                        100.0 * draw,
+                        100.0 * loss
+                    ));
                 }
             }
             drop(engine);
@@ -297,82 +302,6 @@ impl Uci {
         }
         self.stop_search();
     }
-}
-
-/// Build a `Game` from a FEN string (halfmove/fullmove counters are ignored).
-fn game_from_fen(fen: &str) -> Option<Game> {
-    let parts: Vec<&str> = fen.split_whitespace().collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    let mut board = Board::new();
-    let ranks: Vec<&str> = parts[0].split('/').collect();
-    if ranks.len() != 8 {
-        return None;
-    }
-    for (i, rank) in ranks.iter().enumerate() {
-        let y = 7 - i;
-        let mut x = 0usize;
-        for c in rank.chars() {
-            if let Some(d) = c.to_digit(10) {
-                x += d as usize;
-                continue;
-            }
-            let color = if c.is_ascii_uppercase() {
-                Color::White
-            } else {
-                Color::Black
-            };
-            let piece_type = match c.to_ascii_lowercase() {
-                'p' => PieceType::Pawn,
-                'n' => PieceType::Knight,
-                'b' => PieceType::Bishop,
-                'r' => PieceType::Rook,
-                'q' => PieceType::Queen,
-                'k' => PieceType::King,
-                _ => return None,
-            };
-            if x > 7 {
-                return None;
-            }
-            board.set_index(x, y, Some(Piece { piece_type, color }));
-            x += 1;
-        }
-        if x != 8 {
-            return None;
-        }
-    }
-    let turn = match parts[1] {
-        "w" => Color::White,
-        "b" => Color::Black,
-        _ => return None,
-    };
-    let castling = parts.get(2).copied().unwrap_or("-");
-    board.castling = [
-        [castling.contains('K'), castling.contains('Q')],
-        [castling.contains('k'), castling.contains('q')],
-    ];
-    board.en_passant = parts.get(3).and_then(|ep| {
-        if *ep == "-" {
-            None
-        } else {
-            Board::algebraic_to_index(ep)
-        }
-    });
-    board.find_king(Color::White)?;
-    board.find_king(Color::Black)?;
-
-    let hash = board.hash(turn);
-    let mut hash_counts = HashMap::new();
-    hash_counts.insert(hash, 1);
-    Some(Game {
-        board,
-        current_turn: turn,
-        history: Vec::new(),
-        hash_history: vec![hash],
-        hash_counts,
-        result: None,
-    })
 }
 
 fn main() {

@@ -112,7 +112,7 @@ impl ArenaApp {
             match score {
                 Some(score) => println!(
                     "{mover:?} plays {s}{e} eval {score} win {:.1}%",
-                    score.win_percent()
+                    score.win_percent_at(chessmind::eval::game_phase(&self.game.board))
                 ),
                 None => println!("{mover:?} plays {s}{e} (book)"),
             }

@@ -1,6 +1,22 @@
 use crate::board::Board;
 use crate::pieces::Color;
 
+/// Why a game ended in a draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrawReason {
+    Stalemate,
+    FiftyMoveRule,
+    ThreefoldRepetition,
+    InsufficientMaterial,
+}
+
+/// Final result of a game.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Win(Color),
+    Draw(DrawReason),
+}
+
 pub struct Game {
     pub board: Board,
     pub current_turn: Color,
@@ -74,6 +90,60 @@ impl Game {
     pub fn repetition_count(&self, hash: u64) -> usize {
         *self.hash_counts.get(&hash).unwrap_or(&0)
     }
+
+    /// Result of the game in the current position, draws included (`result`
+    /// only records checkmates). `None` while the game is still going.
+    pub fn outcome(&mut self) -> Option<Outcome> {
+        let side = self.current_turn;
+        if !self.board.has_legal_move(side) {
+            return Some(if self.board.in_check_fast(side) {
+                Outcome::Win(match side {
+                    Color::White => Color::Black,
+                    Color::Black => Color::White,
+                })
+            } else {
+                Outcome::Draw(DrawReason::Stalemate)
+            });
+        }
+        if self.board.halfmove >= 100 {
+            return Some(Outcome::Draw(DrawReason::FiftyMoveRule));
+        }
+        if self.repetition_count(self.board.hash(side)) >= 3 {
+            return Some(Outcome::Draw(DrawReason::ThreefoldRepetition));
+        }
+        if self.insufficient_material() {
+            return Some(Outcome::Draw(DrawReason::InsufficientMaterial));
+        }
+        None
+    }
+
+    /// Neither side can ever mate: bare kings, a single minor piece, or only
+    /// bishops that all stand on squares of the same colour.
+    fn insufficient_material(&self) -> bool {
+        use crate::pieces::PieceType;
+        let count = |pt| self.board.piece_count(pt);
+        if count(PieceType::Pawn) + count(PieceType::Rook) + count(PieceType::Queen) > 0 {
+            return false;
+        }
+        let knights = count(PieceType::Knight);
+        let bishops = count(PieceType::Bishop);
+        if knights + bishops <= 1 {
+            return true;
+        }
+        if knights > 0 {
+            return false;
+        }
+        let mut colours = [false; 2];
+        for y in 0..8 {
+            for x in 0..8 {
+                if matches!(self.board.get_index(x, y), Some(p) if p.piece_type == PieceType::Bishop)
+                {
+                    colours[(x + y) % 2] = true;
+                }
+            }
+        }
+        !(colours[0] && colours[1])
+    }
 }
 
 #[cfg(test)]
@@ -95,6 +165,56 @@ mod tests {
             },
             result: None,
         }
+    }
+
+    fn game_with(pieces: &[(&str, PieceType, Color)], turn: Color) -> Game {
+        let mut board = Board::new();
+        for &(sq, piece_type, color) in pieces {
+            board.set(sq, Some(Piece { piece_type, color }));
+        }
+        board.castling = [[false, false], [false, false]];
+        game_from_board(board, turn)
+    }
+
+    #[test]
+    fn outcome_reports_mate_and_every_kind_of_draw() {
+        use PieceType::*;
+        let mut fresh = Game::new();
+        assert_eq!(fresh.outcome(), None);
+
+        let mut mate = game_with(
+            &[("h8", King, Color::Black), ("g7", Queen, Color::White), ("g6", King, Color::White)],
+            Color::Black,
+        );
+        assert_eq!(mate.outcome(), Some(Outcome::Win(Color::White)));
+
+        let mut stalemate = game_with(
+            &[("h8", King, Color::Black), ("g6", Queen, Color::White), ("f7", King, Color::White)],
+            Color::Black,
+        );
+        assert_eq!(stalemate.outcome(), Some(Outcome::Draw(DrawReason::Stalemate)));
+
+        let mut bare = game_with(
+            &[("h8", King, Color::Black), ("a1", King, Color::White), ("c3", Bishop, Color::White)],
+            Color::White,
+        );
+        assert_eq!(bare.outcome(), Some(Outcome::Draw(DrawReason::InsufficientMaterial)));
+
+        let mut fifty = game_with(
+            &[("h8", King, Color::Black), ("a1", King, Color::White), ("c3", Rook, Color::White)],
+            Color::White,
+        );
+        assert_eq!(fifty.outcome(), None);
+        fifty.board.halfmove = 100;
+        assert_eq!(fifty.outcome(), Some(Outcome::Draw(DrawReason::FiftyMoveRule)));
+
+        let mut rep = Game::new();
+        for _ in 0..2 {
+            for (from, to) in [("g1", "f3"), ("g8", "f6"), ("f3", "g1"), ("f6", "g8")] {
+                assert!(rep.make_move(from, to));
+            }
+        }
+        assert_eq!(rep.outcome(), Some(Outcome::Draw(DrawReason::ThreefoldRepetition)));
     }
 
     #[test]
