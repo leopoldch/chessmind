@@ -13,6 +13,53 @@
   let reconnectTimer = null;
   let boardEl = null;
   let scanScheduled = false;
+  let winIndicator = null;
+  let winValue = null;
+
+  function showWinIndicator() {
+    if (winIndicator) return;
+    winIndicator = document.createElement('div');
+    winIndicator.id = 'chessmind-win-indicator';
+    winIndicator.style.cssText = 'position:fixed;bottom:16px;left:16px;z-index:2147483647;';
+    const shadow = winIndicator.attachShadow({ mode: 'open' });
+    shadow.innerHTML = `
+      <style>
+        :host { all: initial; }
+        .badge {
+          display: flex; align-items: center; gap: 8px;
+          padding: 8px 12px; border: 1px solid #565950; border-radius: 20px;
+          background: #252720; color: #f5f5ef;
+          box-shadow: 0 2px 8px #0003;
+          font: 12px/1.2 system-ui, sans-serif;
+        }
+        strong { color: #c4e59a; font-size: 14px; font-variant-numeric: tabular-nums; }
+        .badge[data-offline] strong { color: #c9c9c2; }
+      </style>
+      <div class="badge" role="status" aria-live="polite" aria-atomic="true">
+        <span>Win chance</span><strong>50%</strong>
+      </div>`;
+    winValue = shadow.querySelector('strong');
+    document.body.appendChild(winIndicator);
+    setIndicatorConnection(false);
+  }
+
+  function setIndicatorConnection(connected) {
+    if (!winIndicator) return;
+    const badge = winIndicator.shadowRoot.querySelector('.badge');
+    badge.toggleAttribute('data-offline', !connected);
+    badge.title = connected
+      ? 'ChessMind · Latest estimate, updated with each engine reply.'
+      : 'ChessMind · Connecting. Showing the last estimate.';
+  }
+
+  function updateWinIndicator(percent) {
+    if (!winValue || !Number.isFinite(percent)) return;
+    winValue.textContent = `${Math.max(0, Math.min(100, percent)).toLocaleString('en-US', {
+      minimumFractionDigits: 1,
+      maximumFractionDigits: 1
+    })}%`;
+    setIndicatorConnection(true);
+  }
 
   // requestAnimationFrame is paused in hidden tabs; fall back to a timer there.
   function nextFrame(cb) {
@@ -43,7 +90,7 @@
     return '';
   }
 
-  // Le listener reste actif en permanence pour la SPA
+  // The listener stays active for the whole SPA session
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg.action === 'start_game') {
       startGame();
@@ -52,7 +99,7 @@
     }
   });
 
-  // Utilitaire pour attendre qu'un élément apparaisse dans le DOM
+  // Waits for an element to appear in the DOM
   function waitForElement(selector, timeout = 10000) {
     return new Promise((resolve, reject) => {
       const existing = document.querySelector(selector);
@@ -80,7 +127,7 @@
   }
 
   async function startGame() {
-    // Vérification de l'URL à chaque démarrage (SPA)
+    // Check the URL on every start (SPA)
     if (!/^\/game\/[^\/]+$/.test(window.location.pathname)) {
       console.log('[ChessMind] Not on a game page, ignoring start_game');
       return;
@@ -89,15 +136,16 @@
     if (gameStarted) return;
     gameStarted = true;
     shouldReconnect = true;
+    showWinIndicator();
 
-    // Réinitialiser l'état pour permettre l'envoi de l'historique
+    // Reset state so the move history is sent again
     lastMoves = [];
     myColor = null;
     boardEl = null;
     reconnectDelay = RECONNECT_MIN_MS;
 
     try {
-      // Attendre que le plateau et la liste des coups soient chargés
+      // Wait for the board and the move list to load
       await Promise.all([
         waitForElement('svg.coordinates'),
         waitForElement('.timestamps-with-base-time')
@@ -105,8 +153,7 @@
       connect();
     } catch (err) {
       console.error('[ChessMind] Failed to find board elements:', err);
-      gameStarted = false;
-      shouldReconnect = false;
+      stopGame();
       return;
     }
 
@@ -116,6 +163,9 @@
   function stopGame() {
     shouldReconnect = false;
     gameStarted = false;
+    if (winIndicator) winIndicator.remove();
+    winIndicator = null;
+    winValue = null;
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
@@ -149,6 +199,7 @@
     const socket = new WebSocket(WS_URL);
     ws = socket;
     socket.addEventListener('open', () => {
+      setIndicatorConnection(true);
       reconnectDelay = RECONNECT_MIN_MS;
       myColor = detectColor();
       socket.send(JSON.stringify({ type: 'color', color: myColor }));
@@ -159,7 +210,10 @@
     });
     socket.addEventListener('message', onMessage);
     socket.addEventListener('close', () => {
-      if (ws === socket) ws = null;
+      if (ws === socket) {
+        ws = null;
+        setIndicatorConnection(false);
+      }
       scheduleReconnect();
     });
     socket.addEventListener('error', () => {
@@ -330,7 +384,7 @@
     const target = document.elementFromPoint(x, y);
 
     if (!target) {
-      console.warn("Rien sous le point", x, y);
+      console.warn("Nothing under point", x, y);
       return;
     }
 
@@ -373,8 +427,15 @@
     }
 
     if (typeof data === 'object' && data !== null) {
+      updateWinIndicator(data.win_percent);
+      if (data.next_move && !Number.isFinite(data.win_percent) && winValue) {
+        winValue.textContent = '—';
+        winIndicator.shadowRoot.querySelector('.badge').title =
+          'ChessMind · No score in the reply. Rebuild and restart the WebSocket server.';
+      }
       if (data.result) {
-        alert(`Partie terminée : ${data.result}`);
+        updateWinIndicator(data.result === myColor ? 100 : 0);
+        alert(`Game over: ${data.result}`);
         return;
       }
       if (data.next_move && /^[a-h][1-8][a-h][1-8]$/.test(data.next_move)) {
@@ -383,7 +444,7 @@
         simulateMove(from, to);
         return;
       }
-      alert(`Prochain coup reçu : ${evt.data}`);
+      alert(`Next move received: ${evt.data}`);
       return;
     }
 
@@ -392,7 +453,7 @@
       const to = data.slice(2, 4);
       simulateMove(from, to);
     } else {
-      alert(`Prochain coup reçu : ${evt.data}`);
+      alert(`Next move received: ${evt.data}`);
     }
   }
 
