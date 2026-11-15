@@ -65,6 +65,16 @@ cargo run --release --bin ws_server
 Then load the browser extension.
 Important: please do not test against real players.
 
+The WebSocket move response includes `next_move`, `time_ms`, and `win_percent`:
+
+```json
+{"next_move":"e2e4","time_ms":125,"win_percent":54.6}
+```
+
+`win_percent` is the engine's estimated winning chance (0–100) for the side
+playing `next_move`. It defaults to `50.0` when no search score is available,
+including opening-book and forced opening moves.
+
 ## Graphical interface
 
 If you prefer playing locally without the WebSocket server, a simple GUI is
@@ -74,9 +84,13 @@ available. Launch it with:
 cargo run --release --bin gui
 ```
 
-The board appears in a new window and you can move pieces by dragging them from
-one square to another. A checkbox at the top lets you enable a simple AI
-opponent and choose whether it plays White or Black.
+Play against the engine or against a friend on the same screen. Move pieces by
+dragging them or by clicking the piece and then its target square; legal moves,
+the last move and checks are highlighted, and promotions ask which piece to
+take. The board turns to your side when you play Black. The side panels hold
+the time control, both clocks, the move list in algebraic notation and the
+engine's win estimate. Shortcuts: `F` flips the board, `Ctrl/Cmd+Z` takes back
+a move, `Ctrl/Cmd+N` starts a new game.
 
 ## Measuring strength
 

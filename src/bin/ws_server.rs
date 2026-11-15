@@ -204,6 +204,7 @@ fn ponder_hit_config(tc: &TimeControl, color: Color) -> Option<TimeConfig> {
 
 struct SearchOutcome {
     best: Option<((String, String), u32)>,
+    win_percent: Option<f64>,
     ponder: Option<(String, String)>,
     elapsed: Duration,
 }
@@ -234,16 +235,21 @@ fn spawn_search(
         if !is_current() {
             return SearchOutcome {
                 best: None,
+                win_percent: None,
                 ponder: None,
                 elapsed: start_time.elapsed(),
             };
         }
-        let best = match forced {
+        let (best, win_percent) = match forced {
             Some(mv) => {
                 engine.stop_ponder();
-                Some((mv, 0))
+                (Some((mv, 0)), None)
             }
-            None => engine.best_move_timed_opts(&mut game, &config, true, stop),
+            None => {
+                let best = engine.best_move_timed_opts(&mut game, &config, true, stop);
+                let win_percent = engine.last_search_score().map(|score| score.win_percent());
+                (best, win_percent)
+            }
         };
         let mut ponder = None;
         if let Some(((s, e), _)) = &best {
@@ -253,6 +259,7 @@ fn spawn_search(
         }
         SearchOutcome {
             best,
+            win_percent,
             ponder,
             elapsed: start_time.elapsed(),
         }
@@ -548,7 +555,8 @@ impl Conn {
         out.push(
             serde_json::json!({
                 "next_move": format!("{}{}", s, e),
-                "time_ms": outcome.elapsed.as_millis()
+                "time_ms": outcome.elapsed.as_millis(),
+                "win_percent": outcome.win_percent.unwrap_or(50.0)
             })
             .to_string(),
         );
