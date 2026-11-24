@@ -8,3 +8,6 @@ build/
 # Added by cargo
 
 /target
+
+# Editor settings
+.vscode/
