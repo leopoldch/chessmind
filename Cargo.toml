@@ -16,6 +16,7 @@ num_cpus = "1"
 shakmaty = "0.28"
 shakmaty-syzygy = "0.26"
 rand = "0.8"
+ureq = { version = "2", default-features = false, features = ["tls"] }
 
 [profile.release]
 opt-level = 3
