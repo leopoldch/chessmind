@@ -75,6 +75,65 @@ The WebSocket move response includes `next_move`, `time_ms`, and `win_percent`:
 playing `next_move`. It defaults to `50.0` when no search score is available,
 including opening-book and forced opening moves.
 
+## Playing on Lichess
+
+The `lichess` binary connects the engine to a Lichess BOT account through the
+[Bot API](https://lichess.org/api#tag/Bot). It accepts the challenges that match
+its settings and plays them on the real clock. Engines are allowed on Lichess
+only on accounts marked as bots, so the setup needs a dedicated account. The
+step-by-step guide, with troubleshooting, is in
+[docs/lichess-bot.md](docs/lichess-bot.md). In short:
+
+1. Create a new Lichess account for the bot and do not play any game with it:
+   only an account without games can become a bot.
+2. Logged in as that account, create a personal API token with the
+   `bot:play` scope (this link preselects it):
+   <https://lichess.org/account/oauth/token/create?scopes[]=bot:play&description=chessmind>.
+   Keep it secret; anyone holding it can play with the account.
+3. Put the token in the `LICHESS_TOKEN` environment variable:
+
+   ```bash
+   export LICHESS_TOKEN=lip_...          # bash
+   $env:LICHESS_TOKEN = "lip_..."        # PowerShell
+   ```
+
+4. Turn the account into a bot. This step is irreversible:
+
+   ```bash
+   cargo run --release --bin lichess -- upgrade        # explains what happens
+   cargo run --release --bin lichess -- upgrade --yes  # does it
+   ```
+
+5. Start the bot and challenge it from another account (the bot's profile
+   page has a challenge button):
+
+   ```bash
+   cargo run --release --bin lichess -- --threads 4 --hash 256
+   ```
+
+Bots cannot join the lobby, so games start from challenges only. The bot
+declines variants other than standard (from-position games are accepted),
+correspondence and unlimited games, and speeds it is not set to play; it
+answers with the matching Lichess decline reason. Options:
+
+| Option | Description | Default |
+| --- | --- | --- |
+| `--threads N` | Search threads per game. | All logical cores |
+| `--hash MB` | Transposition table per game. | `256` |
+| `--max-games N` | Games played at the same time. | `1` |
+| `--move-overhead MS` | Time kept back on each move for network lag. Raise it if the bot loses on time. | `300` |
+| `--speeds LIST` | Accepted speeds among `bullet,blitz,rapid,classical` (Lichess bans UltraBullet for bots). | All four |
+| `--casual-only` | Decline rated challenges. | Off |
+| `--opponents KIND` | `all`, `humans` or `bots`. | `all` |
+| `--no-book` | Do not use the opening book. | Off |
+| `--challenge USER` | Challenge `USER` once connected, e.g. another bot. | None |
+| `--tc MIN+INC` | Clock of `--challenge`, such as `3+2` or `0.5+0`. | `3+2` |
+| `--rated` | Make the `--challenge` rated. | Off |
+
+`SYZYGY_PATH` enables tablebases as for the other front-ends. Only one bot
+process can run per token: starting a second one closes the first one's event
+stream. If an opponent leaves, the bot claims the win when Lichess allows it.
+
 ## Graphical interface
 
 If you prefer playing locally without the WebSocket server, a simple GUI is
