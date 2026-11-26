@@ -91,6 +91,12 @@ Useful options (all of them are listed by `--help` and in the README):
 cargo run --release --bin lichess -- --threads 4 --hash 512 --speeds blitz,rapid --casual-only
 ```
 
+`--threads` and `--hash` are per game. With `--max-games 2` the bot gives each
+game half of the cores by default, and uses twice the hash memory. If you set
+`--threads` yourself, keep `threads x max-games` within the number of cores:
+the bot warns at startup when it is not, because games thinking at the same
+time would then search less deep than their clock management expects.
+
 ## 6. Play a game
 
 Bots cannot look for opponents in the lobby: every game starts from a
@@ -129,5 +135,5 @@ progress when the bot reconnects.
 | `... is not a BOT account` | Run step 4. |
 | `Upgrade refused` | The account has already played a game. Create a new account. |
 | `Event stream closed ... reconnecting` repeatedly | Another bot process uses the same token. Only one can run at a time. |
-| The bot loses on time | Raise `--move-overhead` (milliseconds kept back per move for network lag, 300 by default). |
+| The bot loses on time | Raise `--move-overhead` (milliseconds kept back per move for network lag, 300 by default). With several games at once, also check the startup warning about threads. |
 | `Rate limited by Lichess` | Too many requests in a short time. The bot waits one minute and carries on. |

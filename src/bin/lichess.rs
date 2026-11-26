@@ -11,7 +11,7 @@
 //!
 //! Run with `--help` for the options.
 
-use chessmind::engine::{Engine, SearchScore, TimeConfig};
+use chessmind::engine::{Engine, SearchScore, SyzygyTables, TimeConfig};
 use chessmind::fen::game_from_fen;
 use chessmind::game::Game;
 use chessmind::pieces::{Color, PieceType};
@@ -20,10 +20,10 @@ use serde::de::DeserializeOwned;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fmt;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 use std::process::ExitCode;
 use std::str::FromStr;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -53,6 +53,11 @@ const NO_CLOCK_MOVE_MS: u64 = 10_000;
 /// The engine always gets at least this much time, even after the overhead.
 const MIN_THINK_MS: u64 = 20;
 const MOVE_POST_ATTEMPTS: u32 = 3;
+/// A request that fails this fast on the network never waited for Lichess: it
+/// ran into a kept-alive connection that had been closed in the meantime.
+const STALE_CONNECTION_WINDOW: Duration = Duration::from_secs(2);
+/// Answers to the bot's requests are a few bytes of JSON; reading stops here.
+const MAX_ANSWER_BYTES: u64 = 64 * 1024;
 const GAME_STREAM_ATTEMPTS: u32 = 10;
 
 /// Lichess speed categories, fastest first.
@@ -79,7 +84,8 @@ The personal API token is read from the LICHESS_TOKEN environment variable.
 It needs the bot:play scope.
 
 OPTIONS:
-    --threads N          search threads per game (default: all logical cores)
+    --threads N          search threads per game (default: the logical cores
+                         shared between the --max-games games)
     --hash MB            transposition table per game in MB (default: 256)
     --max-games N        games played at the same time (default: 1)
     --move-overhead MS   time kept back on each move for network lag (default: 300)
@@ -123,10 +129,30 @@ struct Config {
     challenge: Option<ChallengeRequest>,
 }
 
+/// Search threads per game when `--threads` is not given: the cores are shared
+/// between the games, because the time management of each game counts on its
+/// threads running at full speed.
+fn default_threads(cores: usize, max_games: usize) -> usize {
+    (cores / max_games.max(1)).clamp(1, MAX_THREADS)
+}
+
+/// Warning for settings that let the games slow each other down.
+fn oversubscription_warning(cfg: &Config, cores: usize) -> Option<String> {
+    let wanted = cfg.threads.saturating_mul(cfg.max_games);
+    (wanted > cores).then(|| {
+        format!(
+            "Warning: {} game(s) with {} thread(s) each want {wanted} threads on {cores} \
+             logical cores. Games thinking at the same time will search less deep; \
+             lower --threads or --max-games.",
+            cfg.max_games, cfg.threads
+        )
+    })
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
-            threads: num_cpus::get().clamp(1, MAX_THREADS),
+            threads: default_threads(num_cpus::get(), 1),
             hash_mb: 256,
             max_games: 1,
             move_overhead_ms: 300,
@@ -218,6 +244,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     }
 
     let mut cfg = Config::default();
+    let mut threads: Option<usize> = None;
     let mut challenge_user: Option<String> = None;
     let mut time_control = (180, 2);
     let mut rated = false;
@@ -230,7 +257,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         match flag {
             "-h" | "--help" => return Ok(Command::Help),
             "--threads" => {
-                cfg.threads = parse_number::<usize>(flag, value)?.clamp(1, MAX_THREADS);
+                threads = Some(parse_number::<usize>(flag, value)?.clamp(1, MAX_THREADS));
             }
             "--hash" => cfg.hash_mb = parse_number::<usize>(flag, value)?.clamp(1, MAX_HASH_MB),
             "--max-games" => cfg.max_games = parse_number::<usize>(flag, value)?.max(1),
@@ -271,6 +298,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
         i += if takes_value { 2 } else { 1 };
     }
 
+    cfg.threads = threads.unwrap_or_else(|| default_threads(num_cpus::get(), cfg.max_games));
     cfg.challenge = challenge_user.map(|username| ChallengeRequest {
         username,
         limit_s: time_control.0,
@@ -317,11 +345,16 @@ impl From<ureq::Error> for ApiError {
 #[derive(Clone)]
 struct Lichess {
     agent: ureq::Agent,
+    base_url: String,
     auth: String,
 }
 
 impl Lichess {
     fn new(token: &str) -> Self {
+        Self::with_base_url(LICHESS_URL, token)
+    }
+
+    fn with_base_url(base_url: &str, token: &str) -> Self {
         let agent = ureq::AgentBuilder::new()
             .user_agent(USER_AGENT)
             .timeout_connect(REQUEST_TIMEOUT)
@@ -329,6 +362,7 @@ impl Lichess {
             .build();
         Self {
             agent,
+            base_url: base_url.to_string(),
             auth: format!("Bearer {token}"),
         }
     }
@@ -336,7 +370,7 @@ impl Lichess {
     fn get(&self, path: &str) -> Result<ureq::Response, ApiError> {
         let response = self
             .agent
-            .get(&format!("{LICHESS_URL}{path}"))
+            .get(&format!("{}{path}", self.base_url))
             .set("Authorization", &self.auth)
             .call()?;
         Ok(response)
@@ -362,12 +396,37 @@ impl Lichess {
             .filter(|line| !matches!(line, Ok(text) if text.trim().is_empty())))
     }
 
+    /// Sends a POST and keeps its connection alive for the next one, so that a
+    /// move does not pay for a new TCP and TLS handshake on the game clock.
     fn post(&self, path: &str, form: &[(&str, &str)]) -> Result<(), ApiError> {
-        self.agent
-            .post(&format!("{LICHESS_URL}{path}"))
-            .set("Authorization", &self.auth)
-            .timeout(REQUEST_TIMEOUT)
-            .send_form(form)?;
+        let url = format!("{}{path}", self.base_url);
+        let started = Instant::now();
+        let mut retried = false;
+        let response = loop {
+            let result = self
+                .agent
+                .post(&url)
+                .set("Authorization", &self.auth)
+                .timeout(REQUEST_TIMEOUT)
+                .send_form(form);
+            match result {
+                // The kept-alive connection was closed while it sat idle. ureq
+                // only retries requests that are safe to repeat; a POST is
+                // retried here, once, on a new connection.
+                Err(ureq::Error::Transport(err))
+                    if !retried
+                        && err.kind() == ureq::ErrorKind::Io
+                        && started.elapsed() < STALE_CONNECTION_WINDOW =>
+                {
+                    retried = true;
+                }
+                other => break other?,
+            }
+        };
+        // ureq puts a connection back in its pool only once the answer has been
+        // read to the end.
+        let mut body = response.into_reader().take(MAX_ANSWER_BYTES);
+        let _ = io::copy(&mut body, &mut io::sink());
         Ok(())
     }
 }
@@ -659,6 +718,44 @@ struct Session {
     answered_ply: Option<usize>,
 }
 
+/// The win claimed from an opponent who left a game. Lichess repeats the
+/// `opponentGone` event while its countdown runs; one claim is enough.
+#[derive(Default)]
+struct VictoryClaim {
+    /// Set once the claim was sent or called off.
+    settled: Option<Arc<AtomicBool>>,
+}
+
+impl VictoryClaim {
+    /// Starts a claim and returns its flag, or `None` when one is already
+    /// waiting for its countdown.
+    fn start(&mut self) -> Option<Arc<AtomicBool>> {
+        let waiting = self
+            .settled
+            .as_ref()
+            .is_some_and(|settled| !settled.load(Ordering::Acquire));
+        if waiting {
+            return None;
+        }
+        let settled = Arc::new(AtomicBool::new(false));
+        self.settled = Some(Arc::clone(&settled));
+        Some(settled)
+    }
+
+    /// Calls off the waiting claim: the opponent is back, or the game is over.
+    fn cancel(&mut self) {
+        if let Some(settled) = self.settled.take() {
+            settled.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for VictoryClaim {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
 /// Game slots: games in progress and accepted challenges not started yet.
 #[derive(Default)]
 struct Slots {
@@ -680,6 +777,8 @@ struct Bot {
     /// Lowercase Lichess id of the bot account.
     me: String,
     slots: Mutex<Slots>,
+    /// Syzygy tablebases, opened once and shared by every game.
+    tablebases: Option<SyzygyTables>,
 }
 
 impl Bot {
@@ -849,6 +948,8 @@ impl Bot {
     fn play_game(&self, game_id: &str) {
         println!("[{game_id}] started: {LICHESS_URL}/{game_id}");
         let mut session: Option<Session> = None;
+        // Dropped, and so called off, whichever way the game ends.
+        let mut claim = VictoryClaim::default();
         let mut failures = 0;
         loop {
             let path = format!("/api/bot/game/stream/{game_id}");
@@ -916,7 +1017,7 @@ impl Bot {
                         gone,
                         claim_win_in_seconds,
                     } => {
-                        self.on_opponent_gone(game_id, gone, claim_win_in_seconds);
+                        self.on_opponent_gone(game_id, &mut claim, gone, claim_win_in_seconds);
                         continue;
                     }
                     GameEvent::Other => continue,
@@ -959,9 +1060,7 @@ impl Bot {
 
         let entries = (self.cfg.hash_mb * 1024 * 1024) / TT_ENTRY_BYTES;
         let mut engine = Engine::with_threads_and_table(MAX_DEPTH, self.cfg.threads, entries);
-        if let Err(err) = engine.load_syzygy_from_env() {
-            eprintln!("[{game_id}] could not load the Syzygy tablebases: {err}");
-        }
+        engine.set_syzygy(self.tablebases.clone());
 
         let rated = if full.rated.unwrap_or(false) {
             "rated"
@@ -1072,13 +1171,23 @@ impl Bot {
         }
     }
 
-    fn on_opponent_gone(&self, game_id: &str, gone: bool, claim_in_seconds: Option<u64>) {
+    fn on_opponent_gone(
+        &self,
+        game_id: &str,
+        claim: &mut VictoryClaim,
+        gone: bool,
+        claim_in_seconds: Option<u64>,
+    ) {
         if !gone {
+            claim.cancel();
             println!("[{game_id}] the opponent is back");
             return;
         }
         let Some(seconds) = claim_in_seconds else {
             println!("[{game_id}] the opponent left the game");
+            return;
+        };
+        let Some(settled) = claim.start() else {
             return;
         };
         println!(
@@ -1089,6 +1198,10 @@ impl Bot {
         let game_id = game_id.to_string();
         thread::spawn(move || {
             thread::sleep(Duration::from_secs(seconds + 1));
+            // Already set when the opponent came back or the game ended.
+            if settled.swap(true, Ordering::AcqRel) {
+                return;
+            }
             if api.post(&path, &[]).is_ok() {
                 println!("[{game_id}] claimed the win");
             }
@@ -1138,6 +1251,18 @@ fn upgrade(api: &Lichess, account: &Account, confirmed: bool) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Opens the Syzygy tablebases named by `SYZYGY_PATH`, once for all the games.
+fn open_tablebases() -> Option<SyzygyTables> {
+    // The smallest engine: it never searches, it only opens the files.
+    let mut loader = Engine::with_threads_and_table(1, 1, 1);
+    match loader.load_syzygy_from_env() {
+        Ok(Some(path)) => println!("Syzygy tablebases loaded from {path}"),
+        Ok(None) => {}
+        Err(err) => eprintln!("Could not load the Syzygy tablebases, playing without: {err}"),
+    }
+    loader.syzygy()
 }
 
 fn main() -> ExitCode {
@@ -1194,9 +1319,14 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    let tablebases = open_tablebases();
+    if let Some(warning) = oversubscription_warning(&cfg, num_cpus::get()) {
+        eprintln!("{warning}");
+    }
+
     println!(
-        "Logged in as BOT {}: {} thread(s), {} MB hash, up to {} game(s), speeds {}, \
-         move overhead {} ms",
+        "Logged in as BOT {}: {} thread(s) and {} MB hash per game, up to {} game(s), \
+         speeds {}, move overhead {} ms",
         account.username,
         cfg.threads,
         cfg.hash_mb,
@@ -1210,6 +1340,7 @@ fn main() -> ExitCode {
         cfg,
         me: account.id.to_ascii_lowercase(),
         slots: Mutex::new(Slots::default()),
+        tablebases,
     });
     match bot.run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -1490,5 +1621,139 @@ mod tests {
         assert!(parse_args(&args(&["--speeds", "ultraBullet"])).is_err());
         assert!(parse_args(&args(&["--challenge", "../x"])).is_err());
         assert!(parse_args(&args(&["--bogus"])).is_err());
+    }
+
+    #[test]
+    fn shares_the_cores_between_the_games() {
+        assert_eq!(default_threads(8, 1), 8);
+        assert_eq!(default_threads(8, 2), 4);
+        assert_eq!(default_threads(8, 3), 2);
+        assert_eq!(default_threads(2, 8), 1);
+        assert_eq!(default_threads(1024, 1), MAX_THREADS);
+
+        let cores = num_cpus::get();
+        let Command::Run(cfg) = parse_args(&args(&["--max-games", "2"])).unwrap() else {
+            panic!("expected run");
+        };
+        assert_eq!(cfg.threads, default_threads(cores, 2));
+        assert_eq!(oversubscription_warning(&cfg, cores), None);
+
+        // An explicit --threads is kept wherever it is on the command line,
+        // and reported when the games would fight for the cores.
+        for line in [
+            ["--threads", "6", "--max-games", "2"],
+            ["--max-games", "2", "--threads", "6"],
+        ] {
+            let Command::Run(cfg) = parse_args(&args(&line)).unwrap() else {
+                panic!("expected run");
+            };
+            assert_eq!(cfg.threads, 6);
+            assert!(oversubscription_warning(&cfg, 8).is_some());
+            assert_eq!(oversubscription_warning(&cfg, 12), None);
+        }
+    }
+
+    #[test]
+    fn claims_the_win_once_per_absence() {
+        let mut claim = VictoryClaim::default();
+        let first = claim.start().expect("the first event starts a claim");
+        assert!(
+            claim.start().is_none(),
+            "a repeated event must not start another"
+        );
+
+        // The opponent comes back: the waiting claim is called off, and a new
+        // absence starts a new one.
+        claim.cancel();
+        assert!(first.load(Ordering::Acquire));
+        let second = claim.start().expect("a new absence starts a new claim");
+
+        // The timer thread marks the claim as sent; a later event may retry.
+        assert!(!second.swap(true, Ordering::AcqRel));
+        let third = claim.start().expect("a sent claim does not block the next");
+
+        // The game ends: the claim is dropped with it.
+        drop(claim);
+        assert!(third.load(Ordering::Acquire));
+    }
+
+    /// A local HTTP server answering every request like Lichess answers a move:
+    /// a chunked `{"ok":true}` on a kept-alive connection. Returns its URL and
+    /// the number of connections it has accepted. With `requests_per_connection`,
+    /// a connection that has given that many answers is closed when its next
+    /// request arrives, like a server dropping a keep-alive it no longer wants.
+    fn local_server(requests_per_connection: Option<usize>) -> (String, Arc<Mutex<usize>>) {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let connections = Arc::new(Mutex::new(0));
+        let accepted = Arc::clone(&connections);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                *accepted.lock().unwrap() += 1;
+                thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut answered = 0;
+                    loop {
+                        let expired = requests_per_connection == Some(answered);
+                        // Request line and headers, up to the empty line.
+                        let mut content_length = 0;
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            let line = line.trim().to_ascii_lowercase();
+                            if line.is_empty() {
+                                break;
+                            }
+                            if let Some(length) = line.strip_prefix("content-length:") {
+                                content_length = length.trim().parse().unwrap();
+                            }
+                        }
+                        let mut body = vec![0; content_length];
+                        if reader.read_exact(&mut body).is_err() {
+                            return;
+                        }
+                        if expired {
+                            return;
+                        }
+                        let answer = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                      Transfer-Encoding: chunked\r\n\r\n\
+                                      b\r\n{\"ok\":true}\r\n0\r\n\r\n";
+                        if stream.write_all(answer.as_bytes()).is_err() {
+                            return;
+                        }
+                        answered += 1;
+                    }
+                });
+            }
+        });
+        (url, connections)
+    }
+
+    #[test]
+    fn posts_reuse_one_connection() {
+        let (url, connections) = local_server(None);
+        let api = Lichess::with_base_url(&url, "token");
+        for _ in 0..5 {
+            api.post("/api/bot/game/Abc12345/move/e2e4", &[]).unwrap();
+        }
+        api.post("/api/challenge/Abc12345/decline", &[("reason", "later")])
+            .unwrap();
+        assert_eq!(*connections.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn posts_survive_a_connection_dropped_by_the_server() {
+        let (url, connections) = local_server(Some(1));
+        let api = Lichess::with_base_url(&url, "token");
+        for _ in 0..4 {
+            api.post("/api/bot/game/Abc12345/move/e2e4", &[]).unwrap();
+        }
+        assert_eq!(*connections.lock().unwrap(), 4);
     }
 }

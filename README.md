@@ -118,9 +118,9 @@ answers with the matching Lichess decline reason. Options:
 
 | Option | Description | Default |
 | --- | --- | --- |
-| `--threads N` | Search threads per game. | All logical cores |
+| `--threads N` | Search threads per game. | Logical cores divided by `--max-games` |
 | `--hash MB` | Transposition table per game. | `256` |
-| `--max-games N` | Games played at the same time. | `1` |
+| `--max-games N` | Games played at the same time. Each game has its own threads and hash table. | `1` |
 | `--move-overhead MS` | Time kept back on each move for network lag. Raise it if the bot loses on time. | `300` |
 | `--speeds LIST` | Accepted speeds among `bullet,blitz,rapid,classical` (Lichess bans UltraBullet for bots). | All four |
 | `--casual-only` | Decline rated challenges. | Off |
