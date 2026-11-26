@@ -517,6 +517,9 @@ const CONT_HISTORY_SIZE: usize = CONT_HISTORY_PIECE_TYPES
 
 type ContinuationHistory = Vec<i32>;
 
+/// Syzygy tablebases opened by an engine. Cloning shares the open files.
+pub type SyzygyTables = Arc<Tablebase<Chess>>;
+
 pub struct Engine {
     pub depth: u32,
     pub threads: usize,
@@ -525,7 +528,7 @@ pub struct Engine {
     quiet_history: [[i32; 64]; 64],
     capture_history: [[i32; 64]; 64],
     cont_history: ContinuationHistory,
-    tb: Option<Arc<Tablebase<Chess>>>,
+    tb: Option<SyzygyTables>,
     stop_flag: Arc<AtomicBool>,
     time_manager: Option<Arc<TimeManager>>,
     search_history: Vec<u64>,
@@ -662,6 +665,16 @@ impl Engine {
             return Ok(Some(path));
         }
         Ok(None)
+    }
+
+    /// The tablebases this engine probes, to hand to another engine.
+    pub fn syzygy(&self) -> Option<SyzygyTables> {
+        self.tb.clone()
+    }
+
+    /// Probes tablebases that another engine has already opened.
+    pub fn set_syzygy(&mut self, tables: Option<SyzygyTables>) {
+        self.tb = tables;
     }
 
     pub fn stop(&self) {
