@@ -94,6 +94,7 @@ OPTIONS:
     --casual-only        decline rated challenges
     --opponents KIND     who may challenge the bot: all, humans or bots (default: all)
     --no-book            do not use the opening book
+    --no-ponder          do not think on the opponent's time
     --challenge USER     challenge USER once connected
     --tc MIN+INC         time control of --challenge, e.g. 3+2 or 0.5+0 (default: 3+2)
     --rated              make the --challenge rated
@@ -126,6 +127,7 @@ struct Config {
     casual_only: bool,
     opponents: Opponents,
     use_book: bool,
+    ponder: bool,
     challenge: Option<ChallengeRequest>,
 }
 
@@ -160,6 +162,7 @@ impl Default for Config {
             casual_only: false,
             opponents: Opponents::All,
             use_book: true,
+            ponder: true,
             challenge: None,
         }
     }
@@ -287,6 +290,10 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             }
             "--no-book" => {
                 cfg.use_book = false;
+                takes_value = false;
+            }
+            "--no-ponder" => {
+                cfg.ponder = false;
                 takes_value = false;
             }
             "--rated" => {
@@ -680,6 +687,22 @@ fn clock_config(state: &GameState, color: Color, overhead_ms: u64) -> TimeConfig
     }
 }
 
+/// Starts thinking on the opponent's time, after the bot played `our_move` in
+/// `game`: the engine picks the reply it expects and searches the position
+/// that follows until it is stopped. Returns the hash of that position, or
+/// `None` when there is nothing to search (the game is over).
+fn start_pondering(engine: &mut Engine, mut game: Game, our_move: &str) -> Option<u64> {
+    if !apply_uci_move(&mut game, our_move) {
+        return None;
+    }
+    let (from, to) = engine.start_ponder(&game)?;
+    if !game.make_move(&from, &to) {
+        engine.stop_ponder();
+        return None;
+    }
+    Some(game.board.hash(game.current_turn))
+}
+
 fn is_running(status: &str) -> bool {
     matches!(status, "created" | "started")
 }
@@ -716,6 +739,9 @@ struct Session {
     /// Number of moves on the board when the bot last moved, so that a state
     /// sent twice (draw offer, reconnection) is not answered twice.
     answered_ply: Option<usize>,
+    /// Hash of the position the engine is thinking about on the opponent's
+    /// time: the one after the reply it expects.
+    pondered: Option<u64>,
 }
 
 /// The win claimed from an opponent who left a game. Lichess repeats the
@@ -1080,6 +1106,7 @@ impl Bot {
             has_clock: full.clock.is_some(),
             engine,
             answered_ply: None,
+            pondered: None,
         })
     }
 
@@ -1100,6 +1127,14 @@ impl Bot {
         if legal.is_empty() {
             return;
         }
+
+        // The opponent has moved: the search on their time ends here. What it
+        // found stays in the transposition table for the search that follows.
+        let ponder_hit = session
+            .pondered
+            .take()
+            .map(|expected| expected == game.board.hash(game.current_turn));
+        session.engine.stop_ponder();
 
         let config = if session.has_clock {
             clock_config(state, session.color, self.cfg.move_overhead_ms)
@@ -1138,6 +1173,11 @@ impl Bot {
         if let Some(percent) = session.engine.last_search_win_percent() {
             details.push_str(&format!(", win {percent:.0}%"));
         }
+        match ponder_hit {
+            Some(true) => details.push_str(", expected reply"),
+            Some(false) => details.push_str(", unexpected reply"),
+            None => {}
+        }
 
         // On a network failure the ply stays unanswered, so the state that
         // follows the reconnection triggers a new attempt.
@@ -1147,6 +1187,11 @@ impl Bot {
                 Ok(()) => {
                     println!("[{}] played {uci} ({details})", session.id);
                     session.answered_ply = Some(ply);
+                    // A book move (depth 0) leaves nothing to build on, and the
+                    // reply to it is most often answered from the book too.
+                    if self.cfg.ponder && depth.is_some_and(|depth| depth > 0) {
+                        session.pondered = start_pondering(&mut session.engine, game, &uci);
+                    }
                     return;
                 }
                 // Lichess refused the move: the game moved on in the meantime.
@@ -1326,13 +1371,14 @@ fn main() -> ExitCode {
 
     println!(
         "Logged in as BOT {}: {} thread(s) and {} MB hash per game, up to {} game(s), \
-         speeds {}, move overhead {} ms",
+         speeds {}, move overhead {} ms, thinking on the opponent's time {}",
         account.username,
         cfg.threads,
         cfg.hash_mb,
         cfg.max_games,
         cfg.speeds.join(","),
-        cfg.move_overhead_ms
+        cfg.move_overhead_ms,
+        if cfg.ponder { "on" } else { "off" }
     );
     println!("Profile: {LICHESS_URL}/@/{}", account.username);
     let bot = Arc::new(Bot {
@@ -1582,7 +1628,7 @@ mod tests {
             panic!("expected run");
         };
         assert_eq!(cfg.max_games, 1);
-        assert!(cfg.use_book);
+        assert!(cfg.use_book && cfg.ponder);
         assert_eq!(cfg.speeds, ["bullet", "blitz", "rapid", "classical"]);
 
         let Command::Run(cfg) = parse_args(&args(&[
@@ -1597,13 +1643,14 @@ mod tests {
             "5+3",
             "--rated",
             "--no-book",
+            "--no-ponder",
         ]))
         .unwrap() else {
             panic!("expected run");
         };
         assert_eq!(cfg.threads, 4);
         assert_eq!(cfg.speeds, ["blitz", "rapid"]);
-        assert!(cfg.casual_only && !cfg.use_book);
+        assert!(cfg.casual_only && !cfg.use_book && !cfg.ponder);
         assert_eq!(
             cfg.challenge,
             Some(ChallengeRequest {
@@ -1621,6 +1668,39 @@ mod tests {
         assert!(parse_args(&args(&["--speeds", "ultraBullet"])).is_err());
         assert!(parse_args(&args(&["--challenge", "../x"])).is_err());
         assert!(parse_args(&args(&["--bogus"])).is_err());
+    }
+
+    #[test]
+    fn thinks_on_the_opponents_time_about_the_expected_reply() {
+        let mut engine = Engine::with_threads_and_table(MAX_DEPTH, 1, 1 << 16);
+        let before = build_game(None, "e2e4 e7e5").unwrap();
+        let pondered = start_pondering(&mut engine, before, "g1f3").expect("a reply to expect");
+        assert!(engine.is_pondering());
+
+        // The expected reply leads to the pondered position, another one does not.
+        let (from, to) = engine.current_ponder_move().unwrap();
+        let hash_after = |reply: &str| {
+            let game = build_game(None, &format!("e2e4 e7e5 g1f3 {reply}")).unwrap();
+            game.board.hash(game.current_turn)
+        };
+        assert_eq!(hash_after(&format!("{from}{to}")), pondered);
+        let other = if from == "a7" { "h7h6" } else { "a7a6" };
+        assert_ne!(hash_after(other), pondered);
+
+        engine.stop_ponder();
+        assert!(!engine.is_pondering());
+    }
+
+    #[test]
+    fn does_not_think_once_the_game_is_over() {
+        let mut engine = Engine::with_threads_and_table(MAX_DEPTH, 1, 1 << 16);
+        let before_mate = build_game(None, "f2f3 e7e5 g2g4").unwrap();
+        assert_eq!(start_pondering(&mut engine, before_mate, "d8h4"), None);
+        assert!(!engine.is_pondering());
+
+        let game = build_game(None, "e2e4").unwrap();
+        assert_eq!(start_pondering(&mut engine, game, "e2e4"), None);
+        assert!(!engine.is_pondering());
     }
 
     #[test]

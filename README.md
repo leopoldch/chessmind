@@ -126,6 +126,7 @@ answers with the matching Lichess decline reason. Options:
 | `--casual-only` | Decline rated challenges. | Off |
 | `--opponents KIND` | `all`, `humans` or `bots`. | `all` |
 | `--no-book` | Do not use the opening book. | Off |
+| `--no-ponder` | Do not think on the opponent's time. | Off |
 | `--challenge USER` | Challenge `USER` once connected, e.g. another bot. | None |
 | `--tc MIN+INC` | Clock of `--challenge`, such as `3+2` or `0.5+0`. | `3+2` |
 | `--rated` | Make the `--challenge` rated. | Off |

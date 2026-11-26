@@ -91,6 +91,11 @@ Useful options (all of them are listed by `--help` and in the README):
 cargo run --release --bin lichess -- --threads 4 --hash 512 --speeds blitz,rapid --casual-only
 ```
 
+The bot thinks on the opponent's time: after each of its moves it searches
+the reply it expects, and keeps what it found when the opponent plays. It
+therefore uses its threads during the whole game, not only on its own turns.
+`--no-ponder` turns this off, for example on a laptop running on battery.
+
 `--threads` and `--hash` are per game. With `--max-games 2` the bot gives each
 game half of the cores by default, and uses twice the hash memory. If you set
 `--threads` yourself, keep `threads x max-games` within the number of cores:
